@@ -10,17 +10,22 @@ analysis for this game. The agent is the instrument. The insight is the delivera
 
 ## Status
 
-**Phase 1 complete.** The engine plays the full game to spec, with 190 tests named after the
-rule sections they check, PyO3 bindings, a text CLI, and baseline statistics over 1.2M
-random games. No agent yet — that is Phase 2.
+**Phase 2 complete.** The engine plays the full game to spec, with 228 Rust tests named after
+the rule sections they check, 43 Python tests, PyO3 bindings, and a text CLI. On top of it
+there is now a frozen five-rung Elo ladder — random, greedy, flat Monte Carlo, PIMC and
+SO-ISMCTS — built on determinization, so every search agent reasons from its own information
+set rather than from the engine's ground truth. Next is Phase 3: neural self-play.
 
 ## Try it
 
 ```bash
 cargo build --release
-./target/release/duel52 play --seed 1     # play the engine in your terminal
-./target/release/duel52 powers            # what every card does
-./target/release/duel52 stats --all       # the Phase 1 numbers
+./target/release/duel52 play --seed 1                 # play the engine in your terminal
+./target/release/duel52 play --opponent ismcts:2000   # play something that resists
+./target/release/duel52 powers                        # what every card does
+./target/release/duel52 stats --all                   # the Phase 1 numbers
+./target/release/duel52 ladder --games 400            # the Phase 2 Elo table
+./target/release/duel52 probe  --games 400            # how each agent actually plays
 ```
 
 Every prompt names the rule it is applying, so if the engine does something that looks
@@ -43,6 +48,31 @@ Details and provenance in [FINDINGS.md](FINDINGS.md). Random play characterises 
 - The mutual-lane-win draw the rules call "astronomically rare" happens in **1 game in
   220** at this level of play. `duel52 demo --seed 86` replays one.
 
+## What Phase 2 found
+
+Now with agents that actually try. Full provenance in [FINDINGS.md](FINDINGS.md) F2.
+
+- **The first-player advantage disappears.** Phase 1's +1.4 points was an artifact of random
+  play. Once both sides can defend, P0 scores 0.492–0.510 across all three variants over
+  4,000 games each — every interval covers even.
+- **PIMC is beaten by an agent with no evaluation function and no tree.** Flat Monte Carlo
+  scores 0.689 against a compute-matched PIMC. And for PIMC, eight-fold more sampled worlds
+  buys nothing measurable while one extra ply of search is worth +0.28 — the signature of
+  strategy fusion, which is bias rather than variance. This is the phase's main result, and
+  it says belief modelling in Phase 3 is buying something real.
+- **The stalemate rule finally fires** — 0.7–1.7% of greedy self-play games, most often in
+  the mirrored variant, where symmetric decks make neither side want to attack first. It sat
+  at exactly zero across 1.2M random games.
+- **Hoarding cards does not appear to win games.** Within a single agent's self-play, the
+  side holding more cards when the draw pile empties wins no more often, at any rung. That is
+  the project's headline hypothesis, and it is unsupported so far — though no Phase 2 agent
+  is capable of hoarding deliberately, so it is not yet a fair test.
+- **Nor does concentrating on two lanes.** No rung puts a larger share of its cards into its
+  busiest two lanes than a uniformly random player does.
+- **Phase 1's encoding bound was backwards.** Competent play tops out at 8–12 cards on one
+  side of a lane; it is *random* play that sprawls to 17–20. Random play is not a
+  conservative upper bound on real play — it is a different distribution.
+
 ## The game, briefly
 
 Three lanes, three actions per turn, every card has a power tied to its rank. Cards are
@@ -61,8 +91,9 @@ Two properties make it interesting as an AI problem:
 **Phase 1: Engine.** ✅ Rust core with exact rules, PyO3 bindings, one test per ruling, and a
 text CLI to play against. Ends with random vs random statistics.
 
-**Phase 2: Baselines.** Random, greedy, flat Monte Carlo, PIMC, and ISMCTS with random
-rollouts. Frozen as a permanent Elo ladder. This phase alone should reveal a lot.
+**Phase 2: Baselines.** ✅ Random, greedy, flat Monte Carlo, PIMC, and ISMCTS with random
+rollouts, on determinized worlds. Frozen as a permanent Elo ladder, plus instrumented
+self-play for the first strategic measurements.
 
 **Phase 3: Neural self-play.** AlphaZero style loop using information set MCTS, validated
 against exact CFR on a scaled down variant before being trusted on the full game.

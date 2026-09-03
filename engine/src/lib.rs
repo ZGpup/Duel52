@@ -39,7 +39,10 @@
 //! | `legal` | Legal-action enumeration (`impl GameState`) |
 //! | `apply` | Powers, combat, and the turn machinery (`impl GameState`) |
 //! | [`display`] | Rendering a board for a specific observer, without leaking |
-//! | [`agents`] | A random agent, and the trait a Phase 2 agent implements |
+//! | [`agents`] | The five-rung Phase 2 ladder, and the trait an agent implements |
+//! | [`elo`] | Fitting ratings to a round-robin result table |
+//! | [`ladder`] | Running the round-robin, in parallel |
+//! | [`probe`] | Strategic measurement — the Phase 2 deliverable |
 //! | [`stats`] | Random-vs-random measurement — the Phase 1 deliverable |
 //! | [`testkit`] | Building positions by hand, for the rules tests and Phase 4 probes |
 //!
@@ -69,8 +72,11 @@ pub mod agents;
 pub mod card;
 pub mod config;
 pub mod display;
+pub mod elo;
+pub mod ladder;
 pub mod outcome;
 pub mod player;
+pub mod probe;
 pub mod rank;
 pub mod rng;
 pub mod state;
@@ -80,11 +86,14 @@ pub mod testkit;
 // These modules are `impl GameState` blocks rather than new types, so they have nothing to
 // export. They stay private and their contents surface as methods on `GameState`.
 mod apply;
+mod determinize;
 mod legal;
 mod setup;
 
 pub use action::{Action, IllegalAction, Phase, Side};
-pub use agents::{Agent, RandomAgent};
+pub use agents::{
+    Agent, AgentSpec, FlatMcAgent, GreedyAgent, IsmctsAgent, PimcAgent, RandomAgent,
+};
 pub use card::{Card, CardId, PairId};
 pub use config::{GameConfig, TwoPower, Variant};
 pub use outcome::{DrawReason, Outcome};

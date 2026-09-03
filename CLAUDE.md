@@ -59,10 +59,11 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 190 tests: rules, determinism, information hiding
+cargo test                               # 228 tests: rules, determinism, information hiding
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
+./target/release/duel52 play --opponent ismcts:2000        # vs the strongest rung
 ./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
 ./target/release/duel52 play --opponent human              # hotseat
 ./target/release/duel52 powers                             # card-power reference
@@ -71,6 +72,12 @@ cargo test                               # 190 tests: rules, determinism, inform
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
 ./target/release/duel52 config configs/split.toml          # validate a config file
+
+# Phase 2 agents. Budgets are part of the agent name, so a result row names the agent that
+# produced it: random · greedy · flatmc:600 · pimc:32x1 · ismcts:800.
+./target/release/duel52 ladder --games 400 --markdown      # the frozen Elo table (~26 min)
+./target/release/duel52 match --a ismcts:800 --b pimc:32x1 --games 400
+./target/release/duel52 probe --games 300 --markdown       # self-play behaviour per rung
 
 # Python. Needs a venv; `maturin develop` drops the extension into py/duel52/.
 python3 -m venv .venv && .venv/bin/pip install -q maturin pytest
@@ -90,10 +97,24 @@ Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.t
 | `engine/src/legal.rs` | Legal-action enumeration |
 | `engine/src/config.rs` | Every tunable; the three variant presets |
 | `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 4 probes |
+| `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
+| `engine/src/agents/` | The five ladder rungs, and the hand-written evaluation in `eval.rs` |
+| `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit |
+| `engine/src/probe.rs` | Instrumented play — where the Phase 2 findings come from |
 | `engine/tests/` | One named test per ruling, named for its rule section |
 | `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
 
-Two structural points that are easy to undo by accident:
+Three structural points that are easy to undo by accident:
+
+- **An agent must decide from a determinized world, not from the state it is handed.**
+  `Agent::choose` receives engine-side ground truth because the engine is the authority on
+  legality, so nothing structural stops an agent reading the opponent's hand. The guard is
+  `phase2_no_agent_reads_hidden_information`: a sampled world is in the same information set
+  as the real one, so an honest agent must return the same action from either. This is not
+  only about search — it caught the *greedy* agent, because applying a candidate action to
+  the real state reveals ranks (flipping your own base card, killing a face-down card into
+  the public discard). If you add an agent, that test covers it automatically; if it fails,
+  the agent is cheating, not the test.
 
 - **Sub-decisions are separate zero-cost decision nodes on a stack** (`DESIGN.md` §4). A 5
   that flips a King that re-empowers the lane resolves correctly because of this. Collapsing

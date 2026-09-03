@@ -32,8 +32,13 @@ equilibrium**, validated by best-response probes rather than proven.
 Canonical, engine-side:
 
 - **Lanes**: 3, each with two sides. Slots ordered by play order, compacted on death.
-  Encoding cap of **8 slots per side per lane** (rules impose no limit; 8 is far beyond
-  observed play — the engine asserts rather than silently truncating).
+  Encoding cap of **16 slots per side per lane** (rules impose no limit; the engine asserts
+  rather than silently truncating).
+  - This started at 8, which `FINDINGS.md` F1.7 rejected on random-play evidence (20 cards on
+    one side) and F2.7 then partly restored: competent self-play peaks at 8–12, and it is
+    *random* play that sprawls. 16 sits above every value any agent has produced and well
+    under the theoretical 21. Re-measure the **distribution** — not the maximum, which only
+    grows with the sample — against the Phase 3 agent before tightening it.
 - **Card instance**: `rank` (0–12), `face_up`, `is_base`, `entered_as_base`, `damage`,
   `frozen_until_turn`, `attacks_used`, `attack_allowance`, `pair_id`.
   - `is_base` vs `entered_as_base`: a Queen-moved base card stops being a base card but
@@ -102,6 +107,18 @@ Per-observer, ~1300 floats:
 - **Bottomed-card features** — for each pile, whether this observer knows the bottom card and
   its rank. Cheap to encode and strictly private; without it the net cannot value a 2 correctly.
 
+**Known gap, base variant only.** A hand is modelled as a multiset of ranks, so when a card
+leaves a pile for a hand its `known_to` mask is dropped (`apply.rs::draw_one`). In the split
+variants that loses nothing — you only ever draw from your own pile, so a bottomed card can
+only return to the player who bottomed it. In the **base** game the pile is shared, so an
+opponent can draw a card you bottomed and you should know a rank they hold; the engine
+forgets it. Closing this needs per-rank "the opponent knows I hold this" counters on the
+hand *and* a way to carry that knowledge onto the card when it is played face-down, which is
+a real chunk of state for a case that arises only in the non-default variant. Left open
+deliberately. It costs a base-variant agent a sliver of strength and nothing else — it
+cannot make one illegal — and `GameState::determinize` documents the same limitation from
+the sampling side.
+
 Foresight knowledge is folded into the board tensor: a card whose rank this observer knows
 gets its real one-hot; everything else gets `rank_unknown`.
 
@@ -123,6 +140,26 @@ gets its real one-hot; everything else gets `rank_unknown`.
 
 Baseline to beat: **PIMC** (perfect-information Monte Carlo) — cheaper, and known to suffer
 strategy fusion, which makes it a useful control rather than a target.
+
+**Built in Phase 2.** Step 1 is `GameState::determinize` (`engine/src/determinize.rs`), steps
+2–3 are `agents/ismcts.rs`. Three things that came out of implementing it, all of which the
+design above did not anticipate:
+
+- **The legal action set is a function of the information set, not of the hidden cards.**
+  Every legality predicate reads a face-up rank, a slot position, the acting player's own
+  hand, or a global flag — never a hidden rank. So an agent can enumerate actions on the real
+  state and evaluate them on sampled worlds, and determinization can be checked for
+  correctness by asserting the action list does not move.
+- **That property makes "does this agent cheat?" a test rather than a comment.** A sampled
+  world is in the same information set as the real state, so an honest agent handed either
+  must return the same action. It is an exact assertion, and it immediately caught a leak in
+  the greedy agent that had nothing to do with search: *applying* a candidate action to the
+  real state reveals hidden ranks, because flipping your own base card turns it face-up and
+  killing a face-down card sends its rank to the public discard. Even one-ply lookahead has
+  to happen inside a sampled world.
+- **Search cost is dominated by the branching factor, which this game does not bound.** PIMC
+  at depth `d` costs `b^(d+1)`, and §3's note about lane width is the same problem seen from
+  the other side. It carries an explicit node budget for that reason.
 
 ## 7. Validation strategy
 

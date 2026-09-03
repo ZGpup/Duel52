@@ -16,7 +16,8 @@ use std::io::{self, BufRead, Write};
 use duel52_engine::agents::Agent;
 use duel52_engine::display::{describe_action, power_reference, render};
 use duel52_engine::{
-    stats, GameConfig, GameState, Outcome, Player, RandomAgent, TwoPower, Variant, VERSION,
+    ladder, stats, AgentSpec, GameConfig, GameState, Outcome, Player, Rank, RandomAgent,
+    TwoPower, Variant, VERSION,
 };
 
 fn main() {
@@ -27,6 +28,9 @@ fn main() {
         "play" => cmd_play(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "demo" => cmd_demo(&args[1..]),
+        "ladder" => cmd_ladder(&args[1..]),
+        "match" => cmd_match(&args[1..]),
+        "probe" => cmd_probe(&args[1..]),
         "powers" => {
             print!("{}", power_reference());
             Ok(())
@@ -57,9 +61,19 @@ USAGE
   duel52 play    [options]        play against the engine in the terminal
   duel52 demo    [options]        watch one random-vs-random game, ply by ply
   duel52 stats   [options]        random-vs-random statistics (Phase 1 deliverable)
+  duel52 ladder  [options]        round-robin Elo over the agent ladder (Phase 2)
+  duel52 match   [options]        one head-to-head, with behavioural statistics
+  duel52 probe   [options]        self-play instrumentation per agent (Phase 2 findings)
   duel52 powers                   print the card-power reference
   duel52 config  <file>           validate a config file and print what it resolves to
   duel52 version
+
+AGENTS
+  random            uniform over legal actions
+  greedy            one-ply lookahead over a hand-written evaluation
+  flatmc[:playouts] random playouts per action, no tree            (default 600)
+  pimc[:worldsxdepth]  alpha-beta per sampled world                (default 8x1)
+  ismcts[:iters]    information-set MCTS, random rollouts          (default 800)
 
 OPTIONS
   --variant <base|split|mirrored> which configuration (default: split — the project default)
@@ -70,19 +84,29 @@ OPTIONS
 
   play only:
   --as <p0|p1>                    which side you take (default: p0, who moves first)
-  --opponent <random|human>       `human` is hotseat: both sides played at the keyboard
+  --opponent <agent|human>        an agent name, or `human` for hotseat (default: random)
   --reveal                        DEBUG: show all hidden information (both hands, base
                                   cards, pile order). Do not use while genuinely playing.
 
   stats only:
-  --games <n>                     games per configuration (default: 2000)
   --all                           run all three variants, and both settings of the 2
-  --markdown                      emit a Markdown table row, for pasting into FINDINGS.md
+
+  ladder / match / probe / stats:
+  --games <n>                     games per pairing (rounded up to even; default: 2000
+                                  for stats, 400 for ladder/match/probe)
+  --threads <n>                   worker threads (default: all cores). Results are
+                                  identical whatever this is set to.
+  --agents <a,b,...>              roster for ladder/probe (default: the frozen ladder)
+  --a <agent> --b <agent>         the two sides of a `match`
+  --markdown                      emit Markdown, for pasting into FINDINGS.md
 
 EXAMPLES
   duel52 play --seed 1                     play the default variant as first player
-  duel52 play --variant base --as p1       play the rules-as-written game, second
+  duel52 play --opponent ismcts:2000       play against a stronger search
   duel52 stats --all --games 5000
+  duel52 ladder --games 600 --markdown     the Phase 2 Elo table
+  duel52 match --a ismcts:800 --b pimc:8x1 --games 400
+  duel52 probe --games 400                 hand size, lane and flip statistics per agent
 "
     )
 }
@@ -94,11 +118,19 @@ struct Options {
     config: GameConfig,
     seed: u64,
     human: Player,
-    hotseat: bool,
+    /// `None` means hotseat — both sides played at the keyboard.
+    opponent: Option<AgentSpec>,
     reveal: bool,
-    games: usize,
+    /// `None` means "the command's own default", which differs between `stats` (cheap) and
+    /// the Phase 2 commands (expensive).
+    games: Option<usize>,
     all: bool,
     markdown: bool,
+    threads: usize,
+    /// `None` means [`AgentSpec::LADDER`], the frozen benchmark.
+    roster: Option<Vec<AgentSpec>>,
+    agent_a: Option<AgentSpec>,
+    agent_b: Option<AgentSpec>,
 }
 
 impl Default for Options {
@@ -107,13 +139,37 @@ impl Default for Options {
             config: GameConfig::default(),
             seed: 1,
             human: Player::P0,
-            hotseat: false,
+            opponent: Some(AgentSpec::Random),
             reveal: false,
-            games: 2000,
+            games: None,
             all: false,
             markdown: false,
+            threads: default_threads(),
+            roster: None,
+            agent_a: None,
+            agent_b: None,
         }
     }
+}
+
+impl Options {
+    fn games_or(&self, fallback: usize) -> usize {
+        self.games.unwrap_or(fallback)
+    }
+
+    fn roster(&self) -> Vec<AgentSpec> {
+        self.roster
+            .clone()
+            .unwrap_or_else(|| AgentSpec::LADDER.to_vec())
+    }
+}
+
+/// One worker per core. A ladder is minutes of work and the shards are independent, so
+/// there is no reason to leave cores idle by default.
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Fetch the value that follows a `--flag`, advancing the cursor.
@@ -166,7 +222,24 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--stalemate" => stalemate = Some(next_number(args, &mut i, "--stalemate")?),
             "--seed" => opts.seed = next_number(args, &mut i, "--seed")?,
-            "--games" => opts.games = next_number(args, &mut i, "--games")?,
+            "--games" => opts.games = Some(next_number(args, &mut i, "--games")?),
+            "--threads" => {
+                let n: usize = next_number(args, &mut i, "--threads")?;
+                opts.threads = n.max(1);
+            }
+            "--agents" => {
+                let v = next_value(args, &mut i, "--agents")?;
+                let mut roster = Vec::new();
+                for name in v.split(',').filter(|s| !s.trim().is_empty()) {
+                    roster.push(AgentSpec::parse(name)?);
+                }
+                if roster.len() < 2 {
+                    return Err("--agents needs at least two agents".to_string());
+                }
+                opts.roster = Some(roster);
+            }
+            "--a" => opts.agent_a = Some(AgentSpec::parse(&next_value(args, &mut i, "--a")?)?),
+            "--b" => opts.agent_b = Some(AgentSpec::parse(&next_value(args, &mut i, "--b")?)?),
             "--config" => {
                 let path = next_value(args, &mut i, "--config")?;
                 let text = std::fs::read_to_string(&path)
@@ -185,12 +258,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--opponent" => {
                 let v = next_value(args, &mut i, "--opponent")?;
-                opts.hotseat = match v.to_ascii_lowercase().as_str() {
-                    "random" | "bot" => false,
-                    "human" | "hotseat" => true,
-                    other => {
-                        return Err(format!("--opponent expects random or human, got `{other}`"))
-                    }
+                opts.opponent = match v.to_ascii_lowercase().as_str() {
+                    "human" | "hotseat" => None,
+                    other => Some(AgentSpec::parse(other)?),
                 };
             }
             "--reveal" => opts.reveal = true,
@@ -243,11 +313,12 @@ fn cmd_config(args: &[String]) -> Result<(), String> {
 
 fn cmd_stats(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
+    let games = opts.games_or(2000);
 
     let runs = if opts.all {
-        stats::phase1_sweep(opts.seed, opts.games)
+        stats::phase1_sweep(opts.seed, games)
     } else {
-        vec![stats::run_random_games(opts.config, opts.seed, opts.games)]
+        vec![stats::run_random_games(opts.config, opts.seed, games)]
     };
 
     if opts.markdown {
@@ -259,6 +330,172 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
         for run in &runs {
             print!("{}", run.report());
             println!();
+        }
+    }
+    Ok(())
+}
+
+/// The Phase 2 deliverable: a round-robin over the agent ladder, and the Elo table fitted
+/// to it.
+fn cmd_ladder(args: &[String]) -> Result<(), String> {
+    let opts = parse_options(args)?;
+    let roster = opts.roster();
+    let games = opts.games_or(400);
+
+    if !opts.markdown {
+        eprintln!(
+            "Round robin: {} agents, {} games per pairing, {} thread(s).",
+            roster.len(),
+            games + (games % 2),
+            opts.threads
+        );
+    }
+    let result = ladder::run_ladder(
+        opts.config,
+        &roster,
+        opts.seed,
+        games,
+        opts.threads,
+        "random",
+        !opts.markdown,
+    );
+
+    if opts.markdown {
+        print!("{}", result.markdown());
+    } else {
+        print!("{}", result.report());
+        println!("Per-pairing detail:\n");
+        for m in &result.matches {
+            print!("{}", m.report());
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// One head-to-head, reported in full. `--a` and `--b` default to the two ends of the
+/// ladder, which is the comparison worth running if you did not say.
+fn cmd_match(args: &[String]) -> Result<(), String> {
+    let opts = parse_options(args)?;
+    let a = opts.agent_a.unwrap_or(AgentSpec::Ismcts {
+        iterations: duel52_engine::IsmctsAgent::DEFAULT_ITERATIONS,
+    });
+    let b = opts.agent_b.unwrap_or(AgentSpec::Random);
+    let games = opts.games_or(400);
+
+    let result = ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads);
+    print!("{}", result.report());
+    Ok(())
+}
+
+/// Self-play instrumentation, one row per agent.
+///
+/// `PLAN.md` Phase 2's deliverable is "first real strategic observations", and the way to
+/// get them is to watch each rung play *itself* — a mixed pairing measures how an agent
+/// copes with a weaker opponent, which is a different and less interesting question than how
+/// it plays when the opposition is competent.
+fn cmd_probe(args: &[String]) -> Result<(), String> {
+    let opts = parse_options(args)?;
+    let roster = opts.roster();
+    let games = opts.games_or(400);
+
+    let mut rows = Vec::new();
+    for spec in &roster {
+        if !opts.markdown {
+            eprintln!("  {} self-play …", spec.name());
+        }
+        rows.push(ladder::run_match(
+            opts.config,
+            *spec,
+            *spec,
+            opts.seed,
+            games,
+            opts.threads,
+        ));
+    }
+
+    println!("Self-play instrumentation — {} games each", games + (games % 2));
+    println!("  config: {}\n", opts.config.summary());
+    if opts.markdown {
+        println!(
+            "| agent | P0 score (95% CI) | draws | stalemate | mean plies | hand@unlock | \
+             won − lost | flip rate | lane conc | attack conc | passes/game | max lane |"
+        );
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for m in &rows {
+            let b = &m.behaviour[0];
+            let (won, lost) = b.hand_at_unlock_by_result();
+            println!(
+                "| {} | {:.4} ± {:.4} | {:.1}% | {:.1}% | {:.1} | {:.2} | {:+.2} ± {:.2} | {:.3} | {:.3} | {:.3} | {:.2} | {} |",
+                m.agents[0].name(),
+                m.first_player_score(),
+                m.first_player_score_ci95(),
+                100.0 * m.draw_rate(),
+                100.0 * m.stalemate_rate(),
+                m.mean_plies(),
+                b.mean_hand_at_unlock(),
+                won - lost,
+                b.hand_at_unlock_gap_ci95(),
+                b.flip_rate(),
+                b.mean_lane_concentration(),
+                b.mean_attack_concentration(),
+                b.passes_per_game(),
+                m.max_side_occupancy,
+            );
+        }
+        let rank_header = || {
+            print!("| agent |");
+            for r in Rank::ALL {
+                print!(" {r} |");
+            }
+            println!();
+            print!("|---|");
+            for _ in Rank::ALL {
+                print!("---:|");
+            }
+            println!();
+        };
+
+        println!("\nMean ply at which each rank is turned face-up\n");
+        rank_header();
+        for m in &rows {
+            print!("| {} |", m.agents[0].name());
+            for r in Rank::ALL {
+                match m.behaviour[0].mean_flip_ply(r) {
+                    Some(ply) => print!(" {ply:.1} |"),
+                    None => print!(" — |"),
+                }
+            }
+            println!();
+        }
+
+        println!(
+            "\nFraction of each rank played from hand that was then turned face-up\n\
+             (base-card flips excluded; a 3 that springs its Trap is counted nowhere)\n"
+        );
+        rank_header();
+        for m in &rows {
+            print!("| {} |", m.agents[0].name());
+            for r in Rank::ALL {
+                match m.behaviour[0].flip_rate_for(r) {
+                    Some(rate) => print!(" {rate:.2} |"),
+                    None => print!(" — |"),
+                }
+            }
+            println!();
+        }
+    } else {
+        for m in &rows {
+            print!("{}", m.report());
+            let b = &m.behaviour[0];
+            print!("  flip ply by rank:");
+            for r in Rank::ALL {
+                match b.mean_flip_ply(r) {
+                    Some(ply) => print!(" {r}={ply:.1}"),
+                    None => print!(" {r}=—"),
+                }
+            }
+            println!("\n");
         }
     }
     Ok(())
@@ -305,18 +542,20 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
 fn cmd_play(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
     let mut state = GameState::new(opts.config, opts.seed);
-    let mut bot = RandomAgent::derived(opts.seed ^ 0xBEEF, 99);
+    let mut bot = opts
+        .opponent
+        .map(|spec| spec.build(opts.seed ^ 0xBEEF, 99));
 
     println!("duel52 engine {VERSION}");
     println!("config: {}", state.config.summary());
     println!("seed:   {} (replay this exact game with --seed {})", state.seed, state.seed);
-    if opts.hotseat {
-        println!("mode:   hotseat — both sides played at this keyboard");
-    } else {
-        println!(
-            "mode:   you are {}, the opponent plays uniformly at random",
-            opts.human
-        );
+    match opts.opponent {
+        None => println!("mode:   hotseat — both sides played at this keyboard"),
+        Some(spec) => println!(
+            "mode:   you are {}, the opponent is `{}`",
+            opts.human,
+            spec.name()
+        ),
     }
     if opts.reveal {
         println!("REVEAL MODE IS ON — hidden information is being printed.");
@@ -328,9 +567,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
     while !state.outcome.is_over() {
         let acting = state.acting_player();
-        let human_turn = opts.hotseat || acting == opts.human;
+        let human_turn = bot.is_none() || acting == opts.human;
 
-        if !human_turn {
+        if let (false, Some(bot)) = (human_turn, bot.as_mut()) {
             let legal = state.legal_actions();
             let action = bot.choose(&state, &legal);
             println!(
@@ -400,8 +639,8 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     println!("{}", render(&state, None));
     println!("=== {} ===", state.outcome);
     match state.outcome {
-        Outcome::Win(w) if !opts.hotseat && w == opts.human => println!("You win."),
-        Outcome::Win(_) if !opts.hotseat => println!("You lose."),
+        Outcome::Win(w) if opts.opponent.is_some() && w == opts.human => println!("You win."),
+        Outcome::Win(_) if opts.opponent.is_some() => println!("You lose."),
         _ => {}
     }
     println!(

@@ -29,7 +29,9 @@ use duel52_engine::outcome::{DrawReason, Outcome};
 use duel52_engine::player::Player;
 use duel52_engine::rank::Rank;
 use duel52_engine::state::GameState;
-use duel52_engine::Action;
+// `Agent` is not imported: `AgentSpec::build` hands back a `Box<dyn Agent>`, and calling a
+// trait object's own method does not need the trait in scope.
+use duel52_engine::{Action, AgentSpec, Rng};
 
 // ============================================================ small conversions ==
 
@@ -543,6 +545,116 @@ impl PyGame {
         };
         Ok(display::render(&self.state, obs))
     }
+
+    // ------------------------------------------------------------ search support --
+
+    /// Sample a world consistent with what `observer` knows (`DESIGN.md` §6, step 1).
+    ///
+    /// Returns a new `Game` in which every rank `observer` is entitled to know is unchanged
+    /// and every rank they are not — the opponent's hand, face-down cards including
+    /// `observer`'s **own base cards**, unknown pile positions, and the removed-unseen pool —
+    /// has been redealt at random subject to the deck composition.
+    ///
+    /// This is the honest way for a Python-side search to reach hidden state, and the only
+    /// one these bindings offer: there is deliberately no accessor for the opponent's hand or
+    /// the pile order. The legal action list is identical in the sampled world, so actions
+    /// enumerated on the real game can be applied to it directly.
+    ///
+    /// ```python
+    /// world = g.determinize("p0", seed=1)
+    /// assert world.legal_actions() == g.legal_actions()
+    /// ```
+    #[pyo3(signature = (observer, seed=0))]
+    fn determinize(&self, observer: &str, seed: u64) -> PyResult<PyGame> {
+        let p = parse_player(observer)?;
+        let mut rng = Rng::new(seed);
+        Ok(PyGame {
+            state: self.state.determinize(p, &mut rng),
+        })
+    }
+
+    /// Ask a **freshly built** ladder agent what it would do here, as an index into
+    /// `legal_actions()`.
+    ///
+    /// A one-shot probe: "what does greedy think of this position?". Because the agent is
+    /// rebuilt from `seed` every call, the answer is a pure function of the position and the
+    /// seed — which is what you want for a probe and *not* what you want for playing a game.
+    /// To play, use [`Agent`], which carries its random stream forward across decisions.
+    #[pyo3(signature = (agent, seed=0))]
+    fn agent_action_index(&self, agent: &str, seed: u64) -> PyResult<usize> {
+        let spec = AgentSpec::parse(agent).map_err(PyValueError::new_err)?;
+        PyAgent {
+            spec,
+            inner: spec.build(seed, 0),
+        }
+        .choose_index(self)
+    }
+}
+
+// ========================================================================= agents ==
+
+/// One of the frozen Phase 2 ladder agents, with its random stream.
+///
+/// `name` is a ladder name — `"random"`, `"greedy"`, `"flatmc:600"`, `"pimc:32x1"`,
+/// `"ismcts:800"` — see `duel52.ladder_agents()` for the frozen roster and `duel52 help`
+/// for the budget syntax.
+///
+/// **Keep one agent for a whole game.** An agent carries its random stream, and rebuilding
+/// it before every decision restarts that stream: tie-breaks stop being independent and a
+/// search agent samples the same first world at every node. It measurably weakens play.
+///
+/// ```python
+/// from duel52 import Game
+/// from duel52._engine import Agent
+///
+/// g, bot = Game(seed=1), Agent("ismcts:800", seed=7)
+/// while not g.is_over:
+///     g.apply_index(bot.choose_index(g))
+/// ```
+#[pyclass(name = "Agent")]
+pub struct PyAgent {
+    spec: AgentSpec,
+    inner: Box<dyn duel52_engine::Agent + Send + Sync>,
+}
+
+#[pymethods]
+impl PyAgent {
+    #[new]
+    #[pyo3(signature = (name, seed=0))]
+    fn new(name: &str, seed: u64) -> PyResult<PyAgent> {
+        let spec = AgentSpec::parse(name).map_err(PyValueError::new_err)?;
+        Ok(PyAgent {
+            spec,
+            inner: spec.build(seed, 0),
+        })
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.spec.name()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<Agent {}>", self.spec.name())
+    }
+
+    /// Choose a move in `game`, as an index into its `legal_actions()`.
+    ///
+    /// The agent sees only its own information set: the search agents reach hidden state
+    /// through `Game.determinize`, never by reading the position's private fields.
+    fn choose_index(&mut self, game: &PyGame) -> PyResult<usize> {
+        let legal = game.state.legal_actions();
+        if legal.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "the game is over, so there is no move to make",
+            ));
+        }
+        let action = self.inner.choose(&game.state, &legal);
+        legal
+            .iter()
+            .position(|&a| a == action)
+            .ok_or_else(|| PyRuntimeError::new_err("agent returned an action it was not offered"))
+    }
 }
 
 // =================================================================== module init ==
@@ -597,12 +709,23 @@ fn power_reference() -> String {
     display::power_reference()
 }
 
+/// The frozen Phase 2 benchmark ladder, weakest first.
+///
+/// `PLAN.md` Phase 2 froze these exact configurations as the permanent benchmark, so Phase 3
+/// should read the list from here rather than hard-coding names that could drift.
+#[pyfunction]
+fn ladder_agents() -> Vec<String> {
+    AgentSpec::LADDER.iter().map(|s| s.name()).collect()
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", "Rust engine for Duel 52. Imported via the `duel52` package.")?;
     m.add("VERSION", duel52_engine::VERSION)?;
     m.add_class::<PyGame>()?;
+    m.add_class::<PyAgent>()?;
     m.add_function(wrap_pyfunction!(random_play_stats, m)?)?;
     m.add_function(wrap_pyfunction!(power_reference, m)?)?;
+    m.add_function(wrap_pyfunction!(ladder_agents, m)?)?;
     Ok(())
 }

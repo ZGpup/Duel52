@@ -1,36 +1,63 @@
-//! Agents.
+//! Agents, and the frozen Phase 2 ladder.
 //!
-//! Phase 1 needs exactly one: a uniform random player, for the random-vs-random statistics
-//! that are this phase's deliverable and for the CLI's practice opponent. The [`Agent`]
-//! trait is the seam Phase 2's greedy / flat-MC / PIMC / ISMCTS players will slot into
-//! (`PLAN.md` Phase 2), and it is deliberately minimal: an agent sees the state and the
-//! legal actions and returns one of them.
+//! `PLAN.md` Phase 2 names five rungs, in increasing order of what they are allowed to
+//! think with:
+//!
+//! | Rung | Module | Sees | Spends |
+//! |---|---|---|---|
+//! | [`RandomAgent`] | here | nothing | nothing |
+//! | [`greedy::GreedyAgent`] | [`greedy`] | its own information set | one ply, a hand-written evaluation |
+//! | [`flat_mc::FlatMcAgent`] | [`flat_mc`] | sampled worlds | random playouts, no tree |
+//! | [`pimc::PimcAgent`] | [`pimc`] | sampled worlds, *fully* | alpha–beta per world |
+//! | [`ismcts::IsmctsAgent`] | [`ismcts`] | sampled worlds | a tree over information sets |
+//!
+//! The rungs are chosen so that each pair differs in exactly one thing, which is what makes
+//! the Elo table in [`crate::ladder`] readable as an experiment rather than a leaderboard:
+//! greedy over random isolates a hand-written evaluation, flat MC over greedy isolates
+//! playouts, ISMCTS over flat MC isolates the tree, and ISMCTS over PIMC isolates
+//! information-set reasoning from strategy fusion.
 //!
 //! # A note on what an agent is allowed to see
 //!
-//! `choose` receives the full [`GameState`], which is engine-side ground truth — it
+//! [`Agent::choose`] receives the full [`GameState`], which is engine-side ground truth — it
 //! contains the opponent's hand and the draw pile order. A *correct* agent must not read
-//! those fields. Phase 3's search will be handed a per-observer view instead
-//! (`DESIGN.md` §6, determinization), but until that exists the honour system plus this
-//! comment is the guard. `RandomAgent` reads nothing at all, so it cannot cheat.
+//! those fields; the search agents here reach hidden state only through
+//! [`GameState::determinize`], which resamples it from the acting player's information set.
+//!
+//! This used to be an honour system. It is now a test: because a determinized state is by
+//! construction in the same information set as the real one, an honest agent handed either
+//! must make the same decision. `engine/tests/agents.rs` checks exactly that for every rung.
+
+pub mod eval;
+pub mod flat_mc;
+pub mod greedy;
+pub mod ismcts;
+pub mod pimc;
 
 use crate::action::Action;
 use crate::rng::Rng;
 use crate::state::GameState;
+
+pub use flat_mc::FlatMcAgent;
+pub use greedy::GreedyAgent;
+pub use ismcts::IsmctsAgent;
+pub use pimc::PimcAgent;
 
 /// Something that picks an action.
 pub trait Agent {
     /// Pick one of `legal`. `legal` is never empty when the game is still running.
     fn choose(&mut self, state: &GameState, legal: &[Action]) -> Action;
 
-    /// Name for Elo tables and logs.
+    /// Name for Elo tables and logs. Includes the search budget where there is one, so a
+    /// result row identifies the agent that produced it rather than just its family.
     fn name(&self) -> String;
 }
 
 /// Picks uniformly at random from the legal actions.
 ///
-/// The reference baseline for the Phase 2 ladder, and the source of the Phase 1
-/// statistics. Seeded, so a random-vs-random game is as reproducible as any other.
+/// The reference baseline for the Phase 2 ladder, the source of the Phase 1 statistics, and
+/// the rollout policy inside [`flat_mc`] and [`ismcts`]. Seeded, so a random-vs-random game
+/// is as reproducible as any other.
 ///
 /// One consequence worth keeping in mind when reading Phase 1 numbers: `Pass` is one legal
 /// action among typically dozens, so a random agent forfeits the rest of its turn a few
@@ -67,6 +94,175 @@ impl Agent for RandomAgent {
 
     fn name(&self) -> String {
         "random".to_string()
+    }
+}
+
+/// Play out a position to the end with uniformly random moves on both sides.
+///
+/// The rollout policy for [`flat_mc`] and [`ismcts`]. `PLAN.md` Phase 2 specifies "SO-ISMCTS
+/// with random rollouts" deliberately: a heuristic rollout policy would fold the
+/// hand-written evaluation back into the two rungs that are supposed to be free of it, and
+/// the ladder would stop measuring what it is built to measure.
+pub fn random_playout(state: &mut GameState, rng: &mut Rng) {
+    while !state.outcome.is_over() {
+        let legal = state.legal_actions();
+        let action = *rng
+            .choose(&legal)
+            .expect("legal_actions is non-empty while the game is running");
+        state.apply_trusted(action);
+    }
+}
+
+/// Index of the highest score, breaking ties uniformly at random.
+///
+/// Random tie-breaking is not cosmetic. Duel 52 positions are full of exactly-equivalent
+/// actions — three lanes that are mirror images early, two identical face-down cards — and
+/// a first-index tie-break makes a deterministic agent play the same game against itself
+/// every time, which would quietly turn a self-play measurement into a sample of one.
+pub(crate) fn pick_best(scores: &[f32], rng: &mut Rng) -> usize {
+    debug_assert!(!scores.is_empty(), "pick_best on an empty score list");
+    let mut best = f32::NEG_INFINITY;
+    for &s in scores {
+        if s > best {
+            best = s;
+        }
+    }
+    // Reservoir sampling over the tied maxima: one pass, no allocation.
+    let mut chosen = 0usize;
+    let mut seen = 0u64;
+    for (i, &s) in scores.iter().enumerate() {
+        if s >= best {
+            seen += 1;
+            if rng.below(seen) == 0 {
+                chosen = i;
+            }
+        }
+    }
+    chosen
+}
+
+/// A named agent configuration, parseable from the command line.
+///
+/// Exists so that the ladder, the `probe` command and `play --opponent` all name agents the
+/// same way, and so a result row in `FINDINGS.md` can be re-run by pasting its agent name
+/// back into the CLI.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgentSpec {
+    Random,
+    Greedy,
+    FlatMc { playouts: usize },
+    Pimc { worlds: usize, depth: u32 },
+    Ismcts { iterations: usize },
+}
+
+impl AgentSpec {
+    /// **The frozen Phase 2 benchmark ladder.**
+    ///
+    /// `PLAN.md`: "Round-robin Elo ladder, frozen as the permanent benchmark." Every later
+    /// phase measures against *these* configurations, so changing a budget here invalidates
+    /// every Elo number already recorded. Add a rung rather than editing one.
+    pub const LADDER: [AgentSpec; 5] = [
+        AgentSpec::Random,
+        AgentSpec::Greedy,
+        AgentSpec::FlatMc {
+            playouts: FlatMcAgent::DEFAULT_PLAYOUTS,
+        },
+        AgentSpec::Pimc {
+            worlds: PimcAgent::DEFAULT_WORLDS,
+            depth: PimcAgent::DEFAULT_DEPTH,
+        },
+        AgentSpec::Ismcts {
+            iterations: IsmctsAgent::DEFAULT_ITERATIONS,
+        },
+    ];
+
+    /// Parse `family` or `family:budget`, e.g. `greedy`, `flatmc:600`, `pimc:8x2`,
+    /// `ismcts:1600`.
+    pub fn parse(text: &str) -> Result<AgentSpec, String> {
+        let text = text.trim().to_ascii_lowercase();
+        let (family, budget) = match text.split_once(':') {
+            Some((f, b)) => (f, Some(b)),
+            None => (text.as_str(), None),
+        };
+
+        fn number(what: &str, value: &str) -> Result<usize, String> {
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("{what}: `{value}` is not a number"))
+        }
+
+        match family {
+            "random" => Ok(AgentSpec::Random),
+            "greedy" => Ok(AgentSpec::Greedy),
+            "flatmc" | "flat" | "mc" => Ok(AgentSpec::FlatMc {
+                playouts: match budget {
+                    Some(b) => number("flatmc playouts", b)?,
+                    None => FlatMcAgent::DEFAULT_PLAYOUTS,
+                },
+            }),
+            "pimc" => {
+                let (worlds, depth) = match budget {
+                    None => (PimcAgent::DEFAULT_WORLDS, PimcAgent::DEFAULT_DEPTH),
+                    Some(b) => match b.split_once('x') {
+                        Some((w, d)) => (number("pimc worlds", w)?, number("pimc depth", d)? as u32),
+                        None => (number("pimc worlds", b)?, PimcAgent::DEFAULT_DEPTH),
+                    },
+                };
+                if worlds == 0 {
+                    return Err("pimc needs at least one world".into());
+                }
+                Ok(AgentSpec::Pimc { worlds, depth })
+            }
+            "ismcts" | "is" => Ok(AgentSpec::Ismcts {
+                iterations: match budget {
+                    Some(b) => number("ismcts iterations", b)?,
+                    None => IsmctsAgent::DEFAULT_ITERATIONS,
+                },
+            }),
+            other => Err(format!(
+                "unknown agent `{other}` — expected random, greedy, flatmc, pimc or ismcts"
+            )),
+        }
+    }
+
+    /// The name this configuration reports, without building it.
+    pub fn name(&self) -> String {
+        match *self {
+            AgentSpec::Random => "random".to_string(),
+            AgentSpec::Greedy => "greedy".to_string(),
+            AgentSpec::FlatMc { playouts } => format!("flatmc:{playouts}"),
+            AgentSpec::Pimc { worlds, depth } => format!("pimc:{worlds}x{depth}"),
+            AgentSpec::Ismcts { iterations } => format!("ismcts:{iterations}"),
+        }
+    }
+
+    /// Build an instance whose randomness is derived from `(seed, stream)`, so a whole
+    /// match is reproducible from the game seed alone.
+    ///
+    /// `Send + Sync` so an agent can be owned by a ladder worker thread or by a Python
+    /// object without the caller having to prove it. Every agent here is plain data plus an
+    /// [`Rng`], so both hold trivially; an agent that needed interior mutability would have
+    /// to use a lock rather than a `RefCell`, which is the right trade for this project.
+    pub fn build(&self, seed: u64, stream: u64) -> Box<dyn Agent + Send + Sync> {
+        match *self {
+            AgentSpec::Random => Box::new(RandomAgent::derived(seed, stream)),
+            AgentSpec::Greedy => Box::new(GreedyAgent::derived(seed, stream)),
+            AgentSpec::FlatMc { playouts } => {
+                Box::new(FlatMcAgent::derived(seed, stream, playouts))
+            }
+            AgentSpec::Pimc { worlds, depth } => {
+                Box::new(PimcAgent::derived(seed, stream, worlds, depth))
+            }
+            AgentSpec::Ismcts { iterations } => {
+                Box::new(IsmctsAgent::derived(seed, stream, iterations))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AgentSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
     }
 }
 

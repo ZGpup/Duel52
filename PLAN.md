@@ -2,9 +2,13 @@
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Current phase: 1 (complete, pending the owner's rules review).** The engine, the CLI, the
-PyO3 bindings and the baseline statistics all exist. The one remaining item is the exit
-criterion itself: the owner plays a few games and confirms the rules are right.
+**Current phase: 3 (not started).** Phase 2 is complete: five agents, determinization, a
+frozen Elo ladder and the first strategic measurements are in `FINDINGS.md` F2.
+
+**Still open from Phase 1, and it is the owner's:** the exit criterion. Nobody has played
+the engine yet and confirmed the rules by hand. That is now a better-value hour than it was
+— `duel52 play --opponent ismcts:2000` gives an opponent that actually resists, so a rules
+error is likelier to show up as something that looks *wrong* rather than as noise.
 
 ---
 
@@ -78,19 +82,50 @@ which is a cleaner premise for the belief modeling in Phase 3.
 
 ---
 
-## Phase 2 — Baselines, no learning `[ ]`
+## Phase 2 — Baselines, no learning `[x]`
 
-- [ ] Random agent
-- [ ] Greedy heuristic agent (hand-written evaluation)
-- [ ] Flat Monte Carlo
-- [ ] PIMC (perfect-information Monte Carlo) — the control
-- [ ] SO-ISMCTS with random rollouts
-- [ ] Round-robin Elo ladder, frozen as the permanent benchmark
-- [ ] **Deliverable:** first real strategic observations logged to `FINDINGS.md`
+- [x] **Determinization** (`engine/src/determinize.rs`) — not on the original list, and the
+      prerequisite for everything below it. `DESIGN.md` §6 step 1: sample a world consistent
+      with the acting player's information set, including *which cards were removed*.
+- [x] Random agent
+- [x] Greedy heuristic agent (hand-written evaluation) — `agents/greedy.rs`, `agents/eval.rs`
+- [x] Flat Monte Carlo — `agents/flat_mc.rs`, paired sweeps over sampled worlds
+- [x] PIMC (perfect-information Monte Carlo) — the control — `agents/pimc.rs`
+- [x] SO-ISMCTS with random rollouts — `agents/ismcts.rs`
+- [x] Round-robin Elo ladder, frozen as the permanent benchmark — `AgentSpec::LADDER`,
+      `engine/src/ladder.rs`, `engine/src/elo.rs`. Ratings are a batch Bradley–Terry fit,
+      not the incremental update, so the table is order-independent and reproducible.
+- [x] **Deliverable:** first real strategic observations logged to `FINDINGS.md` — F2
 
-**Worth flagging:** this phase may already answer a large share of the original question.
-A competent ISMCTS bot with zero training will expose lane-allocation patterns, flip
-timing, and the first-player edge. Do not rush past it to get to the neural net.
+**Run it with:**
+
+```bash
+./target/release/duel52 ladder --games 400 --markdown   # the frozen Elo table
+./target/release/duel52 probe  --games 400 --markdown   # self-play behaviour per rung
+./target/release/duel52 match  --a ismcts:800 --b pimc:32x1 --games 400
+./target/release/duel52 play   --opponent ismcts:2000   # play the strongest rung
+```
+
+### What Phase 2 turned up that the plan did not anticipate
+
+1. **"Does this agent cheat?" is a test, not a comment.** A determinized world is in the
+   same information set as the real state, so an honest agent handed either must return the
+   same action — an exact assertion. It immediately caught a leak in the *greedy* agent,
+   which does no search at all: applying a candidate action to the real state reveals hidden
+   ranks, because flipping your own base card turns it face-up and killing a face-down card
+   sends its rank to the public discard. Even one-ply lookahead has to happen inside a
+   sampled world. See `phase2_no_agent_reads_hidden_information`.
+2. **The legal action set is a function of the information set alone.** Every legality
+   predicate reads a face-up rank, a slot position, the mover's own hand, or a global flag —
+   never a hidden rank. That is what lets an agent enumerate actions on the real state and
+   evaluate them on sampled worlds, and it is now pinned by a test so a future rule cannot
+   quietly break it.
+3. **Search cost is unbounded because the branching factor is.** PIMC at depth `d` costs
+   `b^(d+1)`, and `b` reaches several hundred on the sprawling boards random play produces.
+   PIMC carries an explicit node budget as a result. This is the same problem as F1.7's
+   encoding bound, seen from the search side, and Phase 3 will meet it again.
+4. **The stalemate rule finally fires** — see `FINDINGS.md` F2.4. F1.2 could not test it,
+   because random agents attack constantly. It is no longer untested.
 
 ---
 

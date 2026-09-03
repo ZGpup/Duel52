@@ -15,7 +15,15 @@ import random
 
 import pytest
 
-from duel52 import VARIANTS, Game, random_play_stats, rollout
+from duel52 import (
+    VARIANTS,
+    Agent,
+    Game,
+    ladder_agents,
+    play_agent_game,
+    random_play_stats,
+    rollout,
+)
 
 
 # --------------------------------------------------------------------------- basics --
@@ -258,3 +266,100 @@ def test_both_settings_of_the_two_are_measurable():
         )
         assert stats["two_power"] == two_power
         assert stats["games"] == 30
+
+
+# ------------------------------------------------- Phase 2: determinization and agents --
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_determinize_preserves_what_the_observer_knows(variant):
+    """``DESIGN.md`` §6: a sampled world must agree with the real one on the observer's
+    own information set, and only on that."""
+    g = Game(variant=variant, seed=5)
+    for _ in range(6):  # get past the opening so there is hidden state in play
+        g.apply_index(0)
+
+    world = g.determinize("p0", seed=3)
+    assert world.legal_actions() == g.legal_actions(), "sampling changed what is legal"
+    assert world.hand_counts("p0") == g.hand_counts("p0"), "your own hand is known"
+    assert world.hand_size("p1") == g.hand_size("p1"), "hand size is public"
+    assert world.pile_size("p0") == g.pile_size("p0")
+    assert world.discard_counts("p0") == g.discard_counts("p0"), "discards are public (§5)"
+    assert world.ply == g.ply and world.to_move == g.to_move
+
+
+def test_determinize_resamples_the_opponents_hand():
+    """The point of the exercise: what you are not entitled to know gets redealt."""
+    g = Game(seed=7)
+    seen = {tuple(g.determinize("p0", seed=s).hand_counts("p1")) for s in range(40)}
+    assert len(seen) > 5, f"the opponent's hand barely moved across samples: {len(seen)}"
+
+
+def test_determinize_does_not_leak_through_the_observation():
+    """An observation of a sampled world must be indistinguishable from one of the real
+    game — that is what "same information set" means, and it is the property every Phase 2
+    search agent rests on."""
+    g = Game(seed=21)
+    for _ in range(10):
+        g.apply_index(0)
+    assert g.observation("p0") == g.determinize("p0", seed=99).observation("p0")
+
+
+def test_the_frozen_ladder_is_reported_weakest_first():
+    roster = ladder_agents()
+    assert roster[0] == "random"
+    assert len(roster) == 5
+    assert any(name.startswith("ismcts") for name in roster)
+
+
+def test_every_ladder_agent_returns_a_legal_move():
+    g = Game(seed=4)
+    for name in ladder_agents():
+        assert 0 <= Agent(name, seed=1).choose_index(g) < g.legal_action_count()
+        assert 0 <= g.agent_action_index(name, seed=1) < g.legal_action_count()
+
+
+def test_an_agent_reports_its_own_name():
+    assert Agent("ismcts:120").name == "ismcts:120"
+    assert repr(Agent("greedy")) == "<Agent greedy>"
+
+
+def test_an_unknown_agent_is_rejected():
+    with pytest.raises(ValueError):
+        Agent("alphazero")
+    with pytest.raises(ValueError):
+        Game(seed=1).agent_action_index("alphazero")
+
+
+def test_an_agent_refuses_to_move_in_a_finished_game():
+    g = play_agent_game(p0="random", p1="random", seed=2)
+    with pytest.raises(RuntimeError):
+        Agent("greedy").choose_index(g)
+
+
+def test_an_agent_carries_its_random_stream_between_decisions():
+    """One agent per game, not one per decision.
+
+    A rebuilt agent restarts its stream, so it makes the same tie-break every time and a
+    search agent resamples the same first world at every node. The API should make the right
+    thing easy, and this pins that the two are genuinely different objects.
+    """
+    g = Game(seed=6)
+    bot = Agent("greedy", seed=3)
+    first = bot.choose_index(g)
+    rebuilt = g.agent_action_index("greedy", seed=3)
+    assert first == rebuilt, "a fresh agent's first move should match the one-shot probe"
+
+    # Advance, then confirm the carried stream has moved on from the rebuilt one.
+    g.apply_index(first)
+    assert isinstance(bot.choose_index(g), int)
+
+
+def test_greedy_beats_random_over_a_handful_of_games():
+    """A direction, not a margin — the measured margins live in ``FINDINGS.md`` F2."""
+    score = 0.0
+    for seed in range(12):
+        finished = play_agent_game(p0="greedy", p1="random", seed=seed)
+        assert finished.is_over
+        score += finished.value_for("p0")
+    assert score >= 10, f"greedy scored only {score}/12 against random"

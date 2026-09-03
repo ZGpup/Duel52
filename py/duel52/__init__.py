@@ -37,15 +37,18 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable
 
 from ._engine import VERSION as ENGINE_VERSION
-from ._engine import Game, power_reference, random_play_stats
+from ._engine import Agent, Game, ladder_agents, power_reference, random_play_stats
 
 __all__ = [
     "ENGINE_VERSION",
+    "Agent",
     "Game",
     "VARIANTS",
     "TWO_POWERS",
+    "ladder_agents",
     "power_reference",
     "random_play_stats",
+    "play_agent_game",
     "play_random_game",
     "rollout",
 ]
@@ -104,6 +107,32 @@ def play_random_game(
     rng = _random.Random(seed)
     game = Game(variant=variant, seed=seed, two_power=two_power)
     return rollout(game, lambda _g, actions: rng.randrange(len(actions)))
+
+
+def play_agent_game(
+    *,
+    p0: str = "random",
+    p1: str = "random",
+    variant: str = "split",
+    seed: int = 0,
+    two_power: str | None = None,
+) -> Game:
+    """Play one game between two of the frozen Phase 2 ladder agents.
+
+    ``p0`` and ``p1`` are ladder names — see :func:`ladder_agents` for the frozen roster,
+    and ``duel52 help`` for the budget syntax (``"ismcts:1600"``, ``"pimc:32x1"``).
+
+    The agents run in Rust, so this is a thin driver rather than an implementation: Phase 3's
+    gated evaluation can use it to play a checkpoint against the permanent benchmark without
+    reimplementing a baseline in Python.
+
+    Each side gets **one** :class:`Agent`, built once and carried through the game. Rebuilding
+    an agent per decision restarts its random stream and measurably weakens it.
+    """
+    game = Game(variant=variant, seed=seed, two_power=two_power)
+    # Distinct streams per seat, so the two sides never draw the same random numbers.
+    agents = {"p0": Agent(p0, seed=seed * 2), "p1": Agent(p1, seed=seed * 2 + 1)}
+    return rollout(game, lambda g, _actions: agents[g.to_move].choose_index(g))
 
 
 def sweep(

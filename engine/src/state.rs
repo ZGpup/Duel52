@@ -84,6 +84,23 @@ impl Pile {
         self.cards.iter().copied()
     }
 
+    /// Every position top-first, as `(rank, known_to mask)`.
+    ///
+    /// Engine-side ground truth in the rank; the mask, by contrast, is **public** — that a
+    /// player fired a 2 and put *something* on the bottom is visible to both. Determinization
+    /// relies on exactly that split: it resamples the ranks it is not entitled to and leaves
+    /// every mask alone (see [`GameState::determinize`]).
+    pub fn entries(&self) -> impl Iterator<Item = (Rank, u8)> + '_ {
+        self.cards.iter().copied().zip(self.known_to.iter().copied())
+    }
+
+    /// Overwrite the rank at `index`, counted from the top, leaving its `known_to` mask
+    /// untouched. Only determinization does this: it is how a sampled world gets a pile
+    /// order consistent with the observer's information set.
+    pub(crate) fn set_rank(&mut self, index: usize, rank: Rank) {
+        self.cards[index] = rank;
+    }
+
     /// What `observer` knows about this pile, bottom-most first: `Some(rank)` for a card
     /// they put there, `None` for a card they cannot see. Feeds the "bottomed-card
     /// features" of `DESIGN.md` §5.
