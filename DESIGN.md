@@ -34,9 +34,22 @@ Canonical, engine-side:
 - **Lanes**: 3, each with two sides. Slots ordered by play order, compacted on death.
   Encoding cap of **8 slots per side per lane** (rules impose no limit; 8 is far beyond
   observed play — the engine asserts rather than silently truncating).
-- **Card instance**: `rank` (0–12), `face_up`, `is_base`, `damage`, `frozen_until_turn`,
-  `attacked_this_turn`, `pair_id`.
+- **Card instance**: `rank` (0–12), `face_up`, `is_base`, `entered_as_base`, `damage`,
+  `frozen_until_turn`, `attacks_used`, `attack_allowance`, `pair_id`.
+  - `is_base` vs `entered_as_base`: a Queen-moved base card stops being a base card but
+    stays unreadable by its owner (`game_rules.md` §3). `entered_as_base` is what gates the
+    owner's free look; `is_base` gates targeting and lane bookkeeping. Collapsing them into
+    one flag silently grants a repeatable 1-action peek at your own base — the wrong game.
+  - `attacks_used` / `attack_allowance` rather than an `attacked_this_turn` bool: a freshly
+    flipped Ace has allowance 2, and a King reactivation **resets** `attacks_used` to 0
+    (§6). A bool cannot represent either.
+  - `frozen_until_turn` is per card, not per lane — freeze does not catch later arrivals and
+    travels with a Queen-moved card (§8).
 - **Per player**: hand (rank multiset), draw pile, discard, known-hidden-info map.
+  - The draw pile is **ordered**, not a multiset: the 2's scry (`game_rules.md` §10a) puts a
+    known card at a known position — the bottom — and the player who put it there knows both.
+    That is persistent private information about a *future draw*, and in the base game about a
+    card the **opponent** may draw instead. A multiset pile cannot represent it.
 - **Global**: turn number, actions remaining, base-cards-unlocked flag, quiet-turn counter.
 - **Knowledge tracking**: which hidden cards each player has seen (own played face-down
   cards; anything revealed by a 4). This is *per-observer* and must be part of the state,
@@ -57,12 +70,17 @@ Fixed policy head, legality-masked, phase-conditioned:
 |---|---|---|
 | `PLAY(rank, lane)` | 13 × 3 = 39 | Hand is a multiset; rank is the correct key. |
 | `FLIP(rank, lane)` | 13 × 3 = 39 | Your played face-down cards are known to you by rank; same-rank duplicates are interchangeable. |
-| `FLIP_BASE(lane)` | 3 | Base card rank is unknown to its owner, so it cannot be rank-keyed. |
+| `FLIP_UNKNOWN(lane, slot)` | 3 × 8 = 24 | Face-down cards whose rank the *owner* does not know, so they cannot be rank-keyed: the base card in its own slot, plus any Queen-moved base card now sitting in a normal slot. |
 | `ATTACK(lane, atk_slot, tgt_slot)` | 3 × 8 × 8 = 192 | Slot-indexed: opposing face-down targets have no known rank. |
 | `PAIR(lane, rank)` | 39 | A pair requires two same-rank face-up cards, both known. |
 | `PASS` | 1 | Forfeit remaining actions. |
-| **Sub-choices** | 61 | `CHOOSE_SLOT` (3 × 2 × 8 = 48) for a 4's peek, a Queen's move source, a 10's second target, and 5/King resolution ordering; `CHOOSE_RANK` (13) for a 2's discard. |
-| **Total** | **374** | |
+| **Sub-choices** | 61 | `CHOOSE_SLOT` (3 × 2 × 8 = 48) for a 4's peek, a Queen's move source, a 10's second target, and 5/King resolution ordering; `CHOOSE_RANK` (13) for the card a 2 bottoms (or discards, under `two_power: discard`). |
+| **Total** | **395** | |
+
+Resolution ordering is **adaptive** (`game_rules.md` §8): a 5 that flips four cards is four
+successive `CHOOSE_SLOT` nodes, each chosen after seeing the previous power land — not one
+permutation choice. That keeps the branching linear in cards flipped instead of factorial,
+and it is also the correct information model, since each resolution can reveal a rank.
 
 The observation carries a **phase** field so the head knows which mask applies.
 
@@ -79,7 +97,10 @@ Per-observer, ~1300 floats:
 - **Belief features** — unseen-card rank counts from this observer's perspective. Note
   these **never reach zero uncertainty**: the 10 removed cards are permanently
   indistinguishable from cards in the opponent's hand or base. Encode the removed-pool size
-  explicitly so the net can reason about it.
+  explicitly so the net can reason about it. Exception: in variant 9b the removed set is
+  revealed at setup, so the unseen pool there is exactly opponent-hand + the six base cards.
+- **Bottomed-card features** — for each pile, whether this observer knows the bottom card and
+  its rank. Cheap to encode and strictly private; without it the net cannot value a 2 correctly.
 
 Foresight knowledge is folded into the board tensor: a card whose rank this observer knows
 gets its real one-hot; everything else gets `rank_unknown`.
@@ -94,7 +115,9 @@ gets its real one-hot; everything else gets `rank_unknown`.
 1. Sample a **determinization** — a concrete hidden state consistent with the acting
    player's information set: opponent hand, hidden base cards, draw pile order, *and which
    10 cards were removed*. The removed pool must be sampled; treating it as known is the
-   classic way to get a subtly wrong agent here.
+   classic way to get a subtly wrong agent here. Any **bottomed card this observer knows**
+   is a hard constraint on the sampled pile order, not something to resample — the whole
+   value of a 2 is that one pile position stops being uncertain.
 2. Run PUCT on the sampled world.
 3. Share visit statistics **at the information-set level** across determinizations.
 

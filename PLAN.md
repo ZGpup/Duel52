@@ -21,12 +21,19 @@ The only phase that needs meaningful owner input.
 
 - [ ] Rust crate: state, legal-action enumeration, action application, terminal detection
 - [ ] All three configurations behind one config flag: base / split-deck / mirrored-removal
+- [ ] `two_power: bottom | discard` flag for the §10a house rule, so the parity claim behind
+      it is measurable rather than assumed
 - [ ] Seeded determinism — same seed + config produces an identical game
 - [ ] One named test per ruling in `game_rules.md` (e.g. `rule_6_king_reactivates_ace_grants_one_action`)
 - [ ] Edge-case tests: 8 × 9 interaction, 10 blocked by 9/J, pair vs 8 double retaliate, 3-trap resurrection, Queen breaking a pair, 5 and 7 reaching base cards post-unlock
+- [ ] Edge-case tests, second batch (all settled 2026-09-03): 10 vs two Jacks is 1+1 but 10 vs
+      two 9s is 1 to one; 9-pair deals 4 to a Jack and takes no retaliate from an 8; 10-pair
+      splits 1+1 and consolidates to 2 when blocked; a 5 skips frozen cards but a King still
+      reactivates them; King resets an Ace's attack counter rather than stacking it; the 2 is
+      pile-neutral so turns-to-unlock is invariant; mutual lane win via retaliate is a draw
 - [ ] PyO3 bindings
 - [ ] Text CLI so the owner can play the engine and spot-check rules
-- [ ] Resolve outstanding items in `OPEN_QUESTIONS.md` by testing the online implementation
+- [x] Resolve outstanding items in `OPEN_QUESTIONS.md` — done 2026-09-03, nothing open
 - [ ] **Deliverable:** random-vs-random statistics — game length distribution, first-player
       win rate, how often games reach the stalemate cutoff, across all three variants
 
