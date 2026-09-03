@@ -12,6 +12,12 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+# The compiled Rust extension, dropped into the package by `maturin develop`.
+# Rebuild it with `maturin develop --release`; never commit it.
+*.so
+*.pyd
+*.dylib
+
 # Training artifacts — never commit these, they belong in object storage
 /runs/
 /checkpoints/

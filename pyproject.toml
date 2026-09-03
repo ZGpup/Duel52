@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "duel52"
+version = "0.1.0"
+description = "Rules-exact engine and self-play research for the card game Duel 52"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+# Phase 1 needs nothing but the compiled engine. PyTorch and the rest arrive in Phase 3,
+# so they are optional extras rather than hard requirements — the engine and the Phase 1
+# statistics must stay installable on a machine with no ML stack.
+dependencies = []
+
+[project.optional-dependencies]
+train = ["torch>=2.2", "numpy>=1.24"]
+dev = ["pytest>=8.0", "maturin>=1.5"]
+
+[tool.maturin]
+# The Rust extension is built from the `bindings` crate and installed as `duel52._engine`;
+# the pure-Python wrapper lives in py/duel52 and is what users import.
+manifest-path = "bindings/Cargo.toml"
+module-name = "duel52._engine"
+python-source = "py"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["py/tests"]

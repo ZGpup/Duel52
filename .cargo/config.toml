@@ -1,0 +1,16 @@
+# macOS linker settings for the PyO3 extension module.
+#
+# `pyo3/extension-module` deliberately does NOT link against libpython: a Python extension
+# gets its CPython symbols from the interpreter that loads it, which is what makes one
+# build work across Python installations. Apple's linker rejects unresolved symbols by
+# default, so `cargo build -p duel52-py` fails at link time with a wall of
+# "_PyList_New, referenced from ..." unless it is told to defer them.
+#
+# `maturin` passes these flags itself, so this file only matters for a plain `cargo build`.
+# It is a no-op for the engine crate and its tests, which link nothing.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

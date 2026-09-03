@@ -135,13 +135,19 @@ fn action_to_dict<'py>(py: Python<'py>, action: Action) -> PyResult<Bound<'py, P
     Ok(d)
 }
 
+/// Read a required key out of an action dict, with a message that names the missing key
+/// rather than raising a bare `KeyError`.
 fn get<'py, T>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<T>
 where
-    T: FromPyObject<'py>,
+    // `for<'a>`: the extracted value must not borrow from the temporary `Bound` below, so
+    // it has to be extractable from a borrow of any lifetime. Every type used here is
+    // owned (integers, String), which satisfies that.
+    T: for<'a> FromPyObject<'a, 'py, Error = PyErr>,
 {
-    d.get_item(key)?
-        .ok_or_else(|| PyValueError::new_err(format!("action dict is missing key {key:?}")))?
-        .extract()
+    let item = d
+        .get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("action dict is missing key {key:?}")))?;
+    item.extract()
 }
 
 fn rank_from(index: usize) -> PyResult<Rank> {
@@ -217,7 +223,10 @@ fn action_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Action> {
 /// Deal one with `Game(variant=..., seed=...)`, read `legal_actions()`, and advance it with
 /// `apply()` or `apply_index()`. `clone()` is cheap enough for search — a position is a few
 /// hundred bytes (`DESIGN.md` §1).
-#[pyclass(name = "Game", module = "duel52._engine")]
+// `skip_from_py_object`: a Game is only ever *returned* to Python, never accepted as an
+// argument, so it needs no FromPyObject impl. Opting out silences PyO3's deprecation
+// warning about the automatic impl for Clone types.
+#[pyclass(name = "Game", module = "duel52._engine", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyGame {
     state: GameState,
