@@ -39,6 +39,7 @@
 //! | `legal` | Legal-action enumeration (`impl GameState`) |
 //! | `apply` | Powers, combat, and the turn machinery (`impl GameState`) |
 //! | [`display`] | Rendering a board for a specific observer, without leaking |
+//! | [`menu`] | Reshaping the legal-action list into the CLI's pick-a-card-then-act tree |
 //! | [`agents`] | The five-rung Phase 2 ladder, and the trait an agent implements |
 //! | [`elo`] | Fitting ratings to a round-robin result table |
 //! | [`ladder`] | Running the round-robin, in parallel |
@@ -74,6 +75,7 @@ pub mod config;
 pub mod display;
 pub mod elo;
 pub mod ladder;
+pub mod menu;
 pub mod outcome;
 pub mod player;
 pub mod probe;

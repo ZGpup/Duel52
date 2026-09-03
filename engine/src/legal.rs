@@ -234,6 +234,8 @@ impl GameState {
     // ------------------------------------------------------------------------ diagnostics --
 
     /// Human-readable description of the current decision, for the CLI.
+    ///
+    /// The lane is numbered the way a human reads it — see [`crate::display::lane_label`].
     pub fn prompt(&self) -> String {
         match self.pending.last() {
             None => format!(
@@ -244,7 +246,7 @@ impl GameState {
                 "{} — {} in lane {}: {} card(s) left to resolve",
                 self.to_move,
                 kind.label(),
-                lane,
+                crate::display::lane_label(*lane),
                 remaining.len()
             ),
             Some(other) => format!("{} — {}", self.to_move, other.phase()),

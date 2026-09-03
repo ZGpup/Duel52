@@ -11,13 +11,13 @@
 //!
 //! Run `duel52 help` for usage.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use duel52_engine::agents::Agent;
-use duel52_engine::display::{describe_action, power_reference, render};
+use duel52_engine::display::{describe_action, describe_move, power_reference, render};
 use duel52_engine::{
-    ladder, stats, AgentSpec, GameConfig, GameState, Outcome, Player, Rank, RandomAgent,
-    TwoPower, Variant, VERSION,
+    ladder, menu, stats, Action, AgentSpec, GameConfig, GameState, Outcome, Player, Rank,
+    RandomAgent, TwoPower, Variant, VERSION,
 };
 
 fn main() {
@@ -87,6 +87,8 @@ OPTIONS
   --opponent <agent|human>        an agent name, or `human` for hotseat (default: random)
   --reveal                        DEBUG: show all hidden information (both hands, base
                                   cards, pile order). Do not use while genuinely playing.
+  --no-clear                      do not redraw over the screen; keep every prompt in the
+                                  scrollback, which is what you want when checking a rule
 
   stats only:
   --all                           run all three variants, and both settings of the 2
@@ -121,6 +123,8 @@ struct Options {
     /// `None` means hotseat — both sides played at the keyboard.
     opponent: Option<AgentSpec>,
     reveal: bool,
+    /// Keep the transcript instead of redrawing over it. `play` only.
+    no_clear: bool,
     /// `None` means "the command's own default", which differs between `stats` (cheap) and
     /// the Phase 2 commands (expensive).
     games: Option<usize>,
@@ -141,6 +145,7 @@ impl Default for Options {
             human: Player::P0,
             opponent: Some(AgentSpec::Random),
             reveal: false,
+            no_clear: false,
             games: None,
             all: false,
             markdown: false,
@@ -264,6 +269,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 };
             }
             "--reveal" => opts.reveal = true,
+            "--no-clear" => opts.no_clear = true,
             "--all" => opts.all = true,
             "--markdown" | "--md" => opts.markdown = true,
             other => return Err(format!("unknown option `{other}`")),
@@ -538,6 +544,90 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// One line of the move log.
+///
+/// Rendered once per point of view, at the moment the move is made. It has to be eager:
+/// the position the line describes is gone by the time the line is printed, and the slots
+/// it names may have shifted. Keeping all three views is what makes the log safe in a
+/// hotseat game, where the screen it lands on belongs to whichever player is now at the
+/// keyboard — and that player is not entitled to the other's view.
+struct Note {
+    prefix: String,
+    /// Indexed by [`Player::idx`].
+    per_player: [String; 2],
+    revealed: String,
+}
+
+impl Note {
+    fn line(&self, observer: Option<Player>) -> String {
+        let body = match observer {
+            None => &self.revealed,
+            Some(p) => &self.per_player[p.idx()],
+        };
+        format!(" {}{body}", self.prefix)
+    }
+}
+
+/// The play screen: a banner, the recent moves, the board, and the decision being asked —
+/// redrawn in that order after every selection, so what you are choosing between is always
+/// directly under the board it applies to.
+struct Screen {
+    /// Clear the terminal before each redraw. Off when stdout is not a terminal (a pipe
+    /// gets a plain transcript instead of escape codes) and off under `--no-clear`.
+    clear: bool,
+    banner: String,
+    log: Vec<Note>,
+}
+
+impl Screen {
+    /// How many past moves stay on screen above the board. Enough for the opponent's whole
+    /// turn plus your own, which is what you need to see to make sense of the position.
+    const LOG_LINES: usize = 10;
+
+    /// Record a move. `state` must still be the position the move was chosen in.
+    fn note(&mut self, state: &GameState, prefix: String, action: Action) {
+        self.log.push(Note {
+            prefix,
+            per_player: [
+                describe_move(state, action, Some(Player::P0)),
+                describe_move(state, action, Some(Player::P1)),
+            ],
+            revealed: describe_move(state, action, None),
+        });
+        if self.log.len() > Screen::LOG_LINES {
+            self.log.drain(..self.log.len() - Screen::LOG_LINES);
+        }
+    }
+
+    /// Redraw everything, ending with `menu` immediately below the board.
+    fn draw(&self, board: &str, menu: &str, observer: Option<Player>) {
+        if self.clear {
+            // Home the cursor, then erase. Deliberately not `\x1b[3J`, which would throw
+            // away the scrollback along with the screen.
+            print!("\x1b[H\x1b[2J");
+        }
+        println!(" {}", self.banner);
+        for note in &self.log {
+            println!("{}", note.line(observer));
+        }
+        print!("{board}{menu}");
+    }
+
+    /// Show something that is not the board — the help, the power reference — and wait, so
+    /// that the next redraw does not wipe it before it has been read.
+    fn interlude(&self, text: &str, lines: &mut impl Iterator<Item = io::Result<String>>) {
+        if self.clear {
+            print!("\x1b[H\x1b[2J");
+        }
+        print!("{text}");
+        if self.clear {
+            print!("\n(press Enter to go back to the board) ");
+            io::stdout().flush().ok();
+            lines.next();
+        }
+    }
+}
+
 /// Interactive play.
 fn cmd_play(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
@@ -546,21 +636,24 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         .opponent
         .map(|spec| spec.build(opts.seed ^ 0xBEEF, 99));
 
-    println!("duel52 engine {VERSION}");
-    println!("config: {}", state.config.summary());
-    println!("seed:   {} (replay this exact game with --seed {})", state.seed, state.seed);
-    match opts.opponent {
-        None => println!("mode:   hotseat — both sides played at this keyboard"),
-        Some(spec) => println!(
-            "mode:   you are {}, the opponent is `{}`",
-            opts.human,
-            spec.name()
+    let mode = match opts.opponent {
+        None => "hotseat".to_string(),
+        Some(spec) => format!("you are {} vs `{}`", opts.human, spec.name()),
+    };
+    let mut screen = Screen {
+        // Clearing only makes sense on a terminal. Piped output — the way the CLI is
+        // scripted in tests — stays a readable transcript.
+        clear: !opts.no_clear && io::stdout().is_terminal(),
+        // The board's own header already carries the config and the engine version, so the
+        // banner adds only what the board does not: how to replay this game, who is who,
+        // and how to get help.
+        banner: format!(
+            "seed {} · {mode}{} · `help` for commands, `q` to quit",
+            state.seed,
+            if opts.reveal { " · REVEALED" } else { "" },
         ),
-    }
-    if opts.reveal {
-        println!("REVEAL MODE IS ON — hidden information is being printed.");
-    }
-    println!("Type `help` at any prompt. Type `q` to quit.\n");
+        log: Vec::new(),
+    };
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -572,65 +665,95 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         if let (false, Some(bot)) = (human_turn, bot.as_mut()) {
             let legal = state.legal_actions();
             let action = bot.choose(&state, &legal);
-            println!(
-                "-- {acting} (bot): {}",
-                describe_action(&state, action, Some(acting))
-            );
+            screen.note(&state, format!("-- {acting} (bot): "), action);
             state.apply_trusted(action);
             continue;
         }
 
-        // The board is always rendered from the acting player's point of view, so hotseat
-        // play does not leak either side's hand to the other.
+        // The board and the menu are always built from the acting player's point of view,
+        // so hotseat play does not leak either side's hand to the other.
         let observer = if opts.reveal { None } else { Some(acting) };
-        println!("{}", render(&state, observer));
-
         let legal = state.legal_actions();
-        for (i, action) in legal.iter().enumerate() {
-            println!("  {:>3}. {}", i, describe_action(&state, *action, observer));
-        }
-        print!("\n{acting}> ");
-        io::stdout().flush().ok();
+        let root = menu::build(&state, &legal, observer);
+        let board = render(&state, observer);
 
-        let Some(line) = lines.next() else {
-            println!("\n(end of input)");
-            return Ok(());
-        };
-        let input = line.map_err(|e| format!("cannot read input: {e}"))?;
-        let input = input.trim();
+        // Walk the tree: pick a card, then pick what it does. `path` is where we are in it.
+        // The state cannot change while we navigate, so the tree stays valid throughout —
+        // and every step redraws the whole screen rather than printing under the last menu.
+        let mut path: Vec<usize> = Vec::new();
+        let mut complaint = String::new();
+        let action = loop {
+            let node = root.at(&path);
+            let mut menu_text = node.render();
+            if !path.is_empty() {
+                menu_text.push_str("     0. back\n");
+            }
+            if !complaint.is_empty() {
+                menu_text.push_str(&format!("\n !! {complaint}\n"));
+                complaint.clear();
+            }
+            screen.draw(&board, &menu_text, observer);
+            print!("\n{acting}> ");
+            io::stdout().flush().ok();
 
-        match input {
-            "" => continue,
-            "q" | "quit" | "exit" => {
-                println!("Quitting. Replay this game with --seed {}", state.seed);
+            let Some(line) = lines.next() else {
+                println!("\n(end of input)");
                 return Ok(());
-            }
-            "help" | "?" => {
-                println!("{}", play_help());
-                continue;
-            }
-            "powers" => {
-                print!("{}", power_reference());
-                continue;
-            }
-            "board" => continue, // the loop re-renders
-            "rules" => {
-                println!("{}", rules_reminder());
-                continue;
-            }
-            _ => {}
-        }
+            };
+            let input = line.map_err(|e| format!("cannot read input: {e}"))?;
+            let input = input.trim();
 
-        let Ok(index) = input.parse::<usize>() else {
-            println!("!! `{input}` is not a number. Type the number of an action, or `help`.");
-            continue;
-        };
-        let Some(&action) = legal.get(index) else {
-            println!("!! {index} is out of range (0..{})", legal.len() - 1);
-            continue;
+            match input {
+                "" => continue,
+                "q" | "quit" | "exit" => {
+                    println!("Quitting. Replay this game with --seed {}", state.seed);
+                    return Ok(());
+                }
+                "help" | "?" => {
+                    screen.interlude(&play_help(), &mut lines);
+                    continue;
+                }
+                "powers" => {
+                    screen.interlude(&power_reference(), &mut lines);
+                    continue;
+                }
+                "rules" => {
+                    screen.interlude(&rules_reminder(), &mut lines);
+                    continue;
+                }
+                "board" => continue, // the loop redraws it
+                "b" | "back" | "0" => {
+                    if path.pop().is_none() {
+                        complaint = "already at the top. `q` quits.".to_string();
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            let Ok(number) = input.parse::<usize>() else {
+                complaint =
+                    format!("`{input}` is not a number. Type a number from the list, or `help`.");
+                continue;
+            };
+            match number.checked_sub(1).and_then(|i| node.picks.get(i)) {
+                Some(menu::Pick::Take(action)) => break *action,
+                Some(menu::Pick::Open(_)) => path.push(number - 1),
+                None => complaint = format!("{number} is out of range (1..{})", node.len()),
+            }
         };
 
-        // `apply` rather than `apply_trusted`: this input came from a human.
+        // Logged before it is applied, because that is when the description is accurate.
+        let prefix = if bot.is_none() {
+            format!("-- {acting}: ")
+        } else {
+            format!("-- {acting} (you): ")
+        };
+        screen.note(&state, prefix, action);
+
+        // `apply` rather than `apply_trusted`: this input came from a human. The menu only
+        // ever offers actions the engine listed, so a rejection here means the menu and the
+        // engine disagree — worth hearing about rather than silently ignoring.
         if let Err(e) = state.apply(action) {
             println!("!! {e}");
         }
@@ -655,19 +778,34 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
 fn play_help() -> String {
     "\
+Choosing a move — two steps, never more:
+  1. pick the CARD you want to act with, from your hand or from your side of the board
+  2. pick what it does — which lane to play it into, or which card to attack
+
+  A card whose only legal move is forced skips step 2 and takes it, so the first menu
+  spells out what that move is on the line you are picking. A flip is always such a
+  move, so its line names the power but not the whole power text — `powers` has that.
+
+  The screen is redrawn after every selection: what you are choosing between is always
+  directly below the board it applies to, with the last few moves above it. Run with
+  --no-clear to keep every prompt in the scrollback instead.
+
 Commands at the prompt:
-  <number>   take that action from the numbered list
+  <number>   pick that numbered line
+  0 / b      back to the card list (from the second menu)
   help / ?   this message
   powers     the card-power reference
   rules      the handful of rules people get wrong
-  board      redraw the board
+  board      redraw the screen
   q          quit
 
 Reading the board:
+  Lanes are numbered 1-3 and slots from #1, the way you would count them. The engine's own
+  indices start at 0; nothing you type here uses them.
   [K]        face-up card, rank K, visible to both players
   (K)        face-down card whose rank YOU know (you played it, or a 4 showed it to you)
   (?)        face-down card whose rank nobody has told you — including your own base cards
-  #2         the slot number to use when choosing an attacker or target
+  #2         the second card in that lane, counting from the left
   base       still a base card: untouchable until every draw pile is empty
   ex-base    entered play as a base card and was moved by a Queen; you still cannot see it
   1/2hp      one hit point left of two. Every FACE-DOWN card is 2 HP whatever it really is,

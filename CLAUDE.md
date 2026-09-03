@@ -97,6 +97,8 @@ Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.t
 | `engine/src/legal.rs` | Legal-action enumeration |
 | `engine/src/config.rs` | Every tunable; the three variant presets |
 | `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 4 probes |
+| `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and slots are numbered from 1 |
+| `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's pick-a-card-then-act tree |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
 | `engine/src/agents/` | The five ladder rungs, and the hand-written evaluation in `eval.rs` |
 | `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit |
