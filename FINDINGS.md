@@ -211,6 +211,9 @@ duel52 stats --all --games 200000 --seed 1 --markdown
 p10 39, p90 52, across every configuration. That is ~22 turns apiece, of which the first
 ~12 are the draw phase. The distribution is tight enough that game length is essentially
 not a strategic variable under random play.
+→ **Re-measured after the §4 mandatory-action ruling: mean 40.1, median 40, p10 35, p90 45.**
+The shape is the same and the conclusion is unchanged; the centre moved because a third of
+random play's actions used to go unspent. See F2.4b.
 
 **F1.2 — The stalemate rule never fires under random play.** Zero games out of 1.2M hit
 the quiet-ply cutoff, in any configuration. **Every** draw was a mutual lane win. This does
@@ -218,13 +221,22 @@ the quiet-ply cutoff, in any configuration. **Every** draw was a mutual lane win
 *strategic* — "neither player wants to attack first because attacking exposes the
 attacker" — and random agents attack constantly, so they cannot produce it. The rule is
 untested until Phase 2 puts a non-suicidal agent on both sides. **Re-measure then.**
+→ Re-measured in **F2.4**, which found it firing for greedy alone; then **F2.4b**, where the
+mandatory-action ruling removed the stall entirely. F1.2's zero is now the *expected* result
+for every agent, not an artefact of random play.
 
 **F1.3 — The mutual lane win is not astronomically rare.** `game_rules.md` §7 calls it
 "astronomically rare"; it is 0.4–0.5% of games under random play — roughly 1 in 220, and
-the *only* source of draws here. `duel52 demo --seed 86` replays one: P0's last card in a
+the *only* source of draws here. `duel52 demo --seed 47` replays one: P0's last card in a
 lane attacks P1's last card, an 8, and retaliate kills the attacker as the attack kills the
 8. Random play throws away material freely, so this rate should fall sharply with agent
 strength; the point is that the case is reachable and the terminal check has to be total.
+
+**Still 0.4% after the §4 mandatory-action ruling** (20,000 games, seed 1: 88 mutual lane
+wins, 0 stalemates, 0 ply-cap draws), and it is now the *only* way any Duel 52 game draws,
+at every level of play — see F2.4b. The replay seed changed from 86 to 47 with the ruling:
+removing `Pass` from the legal-action list re-shuffles every random game, so any finding
+that names a seed had to be re-derived rather than re-read.
 
 **F1.4 — First-player advantage is real but small: P0 scores ≈ 0.514–0.515.** About a
 +1.4 to +1.5 percentage-point edge, ~13σ from even at this sample size, and statistically
@@ -376,6 +388,11 @@ an agent copes with a weaker opponent, which is a different and less interesting
 than how it plays when the opposition is competent. Reproduce with
 `duel52 probe --games 300 --seed 1`.
 
+⚠️ **This table predates the §4 mandatory-action ruling** (2026-09-03) and its `passes/game`
+column describes an action that was never in the game. **F2.4b carries the re-run**, same
+command, same seed. The findings drawn from it below mostly survive; where they do not, the
+entry says so.
+
 | agent | first-player score | draws | stalemate | mean plies | max lane | hand@unlock | flip rate | lane conc. | passes/game |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | random | 0.520 ± 0.080 | 0.7% | 0.0% | 44.5 | **17** | 2.91 | 0.66 | 0.778 | 3.95 |
@@ -424,6 +441,127 @@ fires, so it is not dead code; but the agent that produces the stall is the one 
 behaviour is most obviously an artifact of its weights. Re-measure in Phase 3, where a
 trained value net will have a real opinion about whether a trade is good.
 
+⚠️ **Superseded by F2.4b.** Everything above is measured on a game in which passing was
+legal, which it never was. The stall was not greedy's weights; it was a phantom action.
+
+**F2.4b — F2.4 is superseded: with actions mandatory, the stall is not reachable at all.**
+The owner's ruling of 2026-09-03 (`game_rules.md` §4) is that **there is no pass** — three
+actions means three, and the only short turn is the first player's opening one. F2.4's
+finding was that greedy is "the only rung that can decline a trade … it declines often
+enough to pass 2.9 times a game and to stall outright in one game in 150." Passing was the
+whole mechanism. Re-measured at the same 4,000 greedy self-play games per variant:
+
+| variant | stalemate rate (F2.4) | stalemate rate (now) | all draws | mean plies (F2.4 → now) |
+|---|---:|---:|---:|---|
+| base | 0.7% | **0.0%** | 1.5% | 45.9 → 42.9 |
+| split | 1.0% | **0.0%** | 1.4% | 46.4 → 43.1 |
+| mirrored | **1.7%** | **0.0%** | 1.6% | 48.6 → 43.5 |
+
+Config: `two_power=bottom stalemate=20plies`, seed 1, 4,000 games per variant. Reproduce
+with `duel52 probe --agents greedy,random --games 4000 --seed 1 --variant <v> --markdown`.
+
+**The reason is structural, not statistical.** A player who prefers not to attack must still
+spend the action, and the three non-attacking actions are each finite: a hand drains, a card
+flips exactly once and nothing ever turns it face-down again, and a card joins one pair and
+cannot leave it (§5). Refusal is a resource, and it runs out. Every game that used to end in
+mutual refusal now ends in a fight. F2.4's variant ordering — mirrored most stall-prone,
+because symmetric material produces symmetric standoffs — is gone with it; the three
+variants are now indistinguishable on this axis.
+
+The residual 1.4–1.6% draws are **not** stalemates. They are the mutual-lane-win case of §7:
+the last card in a lane attacks an 8, retaliate kills the attacker as its damage kills the 8,
+both sides of the lane empty, and both players win it. §7 called that "astronomically rare"
+as a *game-ending* event; at 1.5% it is rare but perfectly ordinary, and it is now the only
+way a Duel 52 game draws.
+
+**What this costs.** The 20-ply quiet-ply rule is no longer validated as necessary by F2.4 —
+nothing reaches it. It stays as a backstop for the position where *neither* player has a
+legal action (everything frozen or out of range), which the engine must still be able to
+end. Random-vs-random over the full F1 sweep — 200,000 games in each of six configurations,
+1.2M total — gives **0 stalemates and 0 ply-cap draws everywhere**, with every draw a mutual
+lane win at 0.4–0.5%. Reproduce with `duel52 stats --all --games 200000 --seed 1`.
+
+**The whole F2 probe table, re-run** (`duel52 probe --games 300 --seed 1 --markdown`, the
+same command that produced the original). The `passes/game` column is gone — the metric it
+measured no longer exists — and `stuck/game` counts the replacement: turns that ended with
+actions unspent because nothing was legal.
+
+| agent | first-player score | draws | stalemate | mean plies | max lane | hand@unlock | flip rate | lane conc. | stuck/game |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| random | 0.525 ± 0.080 | 1.0% | **0.0%** | 39.8 | 16 | 2.38 | 0.68 | 0.777 | 0.26 |
+| greedy | 0.490 ± 0.079 | 2.0% | **0.0%** | 42.8 | 8 | 0.52 | 0.39 | 0.763 | 0.26 |
+| pimc:32x1 | 0.513 ± 0.080 | 0.7% | **0.0%** | 40.4 | 10 | 0.57 | 0.56 | 0.749 | 0.27 |
+| flatmc:600 | 0.492 ± 0.080 | 0.3% | **0.0%** | 44.6 | 12 | 2.28 | 0.64 | 0.771 | 0.21 |
+| ismcts:800 | 0.518 ± 0.080 | 1.0% | **0.0%** | 45.8 | 12 | 1.94 | 0.68 | 0.786 | 0.22 |
+
+**The last column is the one to look at.** `passes/game` ranged from 0.37 (pimc) to 3.95
+(random) — an order of magnitude, and F2.4 read that spread as *behaviour*: the agents that
+priced material declined actions, the ones that did not spent them. `stuck/game` is flat at
+0.21–0.27 across all five rungs, including the two that used to sit at either extreme. It is
+no longer a property of the agent, because it is no longer a decision. Running out of legal
+actions happens to everyone at the same rate, which is what a *position* property looks like.
+
+That flatness is what settled the follow-up question. The first fix kept `Pass` in the action
+space as a forced single-option node; the owner's call was that **a non-choice does not belong
+in the action space at all**, and the column is the evidence — an "action" every agent takes
+at the same rate regardless of how it plays is not an action. The engine now ends such a turn
+itself (`apply.rs`'s `skip_turns_with_nothing_to_do`), `Action` has no variant for it, and the
+policy head lost its `PASS` logit: **1325 → 1324**, every logit now something a player
+chooses. `stuck/game` survives as instrumentation, counted from outside by watching the ply
+advance while the acting player still had an allowance.
+
+**Re-measured after that removal, same command and seed**, with the stalemate column still
+0.0% everywhere and every difference inside one confidence interval:
+
+| agent | first-player score, with `Pass` | without | stuck/game |
+|---|---:|---:|---:|
+| random | 0.525 ± 0.080 | 0.527 ± 0.079 | 0.26 → 0.26 |
+| greedy | 0.490 ± 0.079 | 0.490 ± 0.079 | 0.26 → 0.23 |
+| pimc:32x1 | 0.513 ± 0.080 | 0.513 ± 0.080 | 0.27 → 0.27 |
+| flatmc:600 | 0.492 ± 0.080 | 0.445 ± 0.079 | 0.21 → 0.21 |
+| ismcts:800 | 0.518 ± 0.080 | 0.467 ± 0.080 | 0.22 → 0.20 |
+
+The two rungs that moved most are ±0.05 on a statistic whose CI is ±0.08 and whose true
+value is 0.5 by the symmetry of self-play, so this is noise — but noise with a specific
+cause worth recording, because it is the one way a "pure removal" can fail to be pure.
+**Every agent's `choose` was being called at the forced node**, and `greedy`, `pimc`,
+`flatmc` and `ismcts` all determinize there, which consumes randomness. Deleting those nodes
+shifts each agent's RNG stream, so identical seeds now walk different games. The aggregates
+that average over thousands of events per run (flip rate, lane concentration, hand@unlock)
+are unmoved to three decimals; the per-game outcome statistics resample. Over 20,000 random
+games the decision count fell by ~10,000 — 0.5 per game, exactly the forced-pass nodes that
+stopped existing.
+
+`stuck/game` is now inferred rather than counted, since there is no action to intercept: the
+probe watches the ply advance while the acting player still had an allowance, and attributes
+any turn nobody was offered to the player who was skipped. Verified against an independent
+recount of the same games —
+`phase2_the_stuck_turn_count_matches_an_independent_recount` replays each game, tallies the
+action-costing decisions in each ply, and calls a ply stuck when it holds fewer than its
+allowance. The terminal ply is excluded from both: a turn cut short by the game ending was
+not short of options.
+
+Two other columns moved, and both matter later. **`hand@unlock` fell for every rung that
+carries a hand** — random 2.91 → 2.38, flatmc 2.51 → 2.28, ismcts 2.19 → 1.94 — because a
+turn with nothing better to do is now a turn that plays a card. Hoarding is materially harder
+than it was when F2.5 tested it, so **H2 will need re-testing rather than re-reading**. And
+**mean plies fell for the two rungs that passed most** (random 44.5 → 39.8, greedy 46.1 →
+42.8) while the rungs that already spent their actions barely moved (pimc 40.5 → 40.4,
+ismcts 46.0 → 45.8) — a clean confirmation that the shortening is the forfeited actions
+coming back, not a change in how the game is played.
+
+**Two side effects worth having on the record**, both from the same sweep:
+
+- **Games got shorter: mean 45.0 → 40.1 plies** (38.5 under `two_power=discard`). Nothing
+  about the game changed except that turns are now spent in full. Random play had been
+  passing 3.95 times a game (F2's probe table), forfeiting roughly a third of its actions,
+  and the ply count was measuring that as much as the game. F1.1's "tightly clustered around
+  45" holds in shape — p10 35, median 40, p90 45 — at a lower centre.
+- **The encoding bound did not move.** Max cards on one side of one lane is **19** across all
+  1.2M games, against 17–20 before and an `encoding_slots` of 21. Forced actions mean more
+  cards on the table per ply, so this was the number most likely to break `encoding_slots`;
+  it did not. F3.1's two slots of headroom survive intact, and they are still only two.
+
 **F2.5 — H2 is not supported: hand size at pile-empty does not predict winning.** This is the
 hypothesis the project cared most about — "arguably the most valuable single output" — so it
 gets the sharpest test available. Comparing hand size *across* agents confounds it with
@@ -454,6 +592,15 @@ cards per game**, out of the 18 it receives — hands empty because there is not
 spend actions on, not because anyone decided to spend them. Hoarding is a choice none of
 these agents is capable of making deliberately, since none of them can represent "this card
 is worth more unplayed". A trained value net can. Phase 3 should re-run this exact test.
+
+**The §4 mandatory-action ruling raised the price of the hypothesis rather than settling it**
+(F2.4b). "Hands empty because there is nothing else to spend actions on" is now the *rule*,
+not an observation about weak agents: a turn with no flip, attack or pair available must
+spend itself on a play. Measured, hand@unlock fell across the board — random 2.91 → 2.38,
+flatmc 2.51 → 2.28, ismcts 2.19 → 1.94. Hoarding is still legal and still a choice, but it
+is a choice that has to be *paid for* in other actions, which is a sharper and more
+interesting version of H2 than the one F2.5 tested. The Phase 3 re-run is now the only test
+of it that will mean anything; every number in this section was measured on the other game.
 
 **F2.6 — H3 is not supported: strong play does not concentrate on two lanes.** Share of a
 player's card-plays landing in their busiest two of three lanes: random 0.778, greedy 0.756,
@@ -644,7 +791,7 @@ So the encoding bound is really two questions, and F2.7 answered only the first:
 
 **Recommendation, not yet applied.** `encoding_slots` should be **21** — the theoretical
 maximum, and the value `max_slots_per_side` already uses, so the encoder provably cannot
-assert. The cost is `obs_dim` 3300 → 4290 (+30%) and `action_dim` 1325 → 2195. That is a real
+assert. The cost is `obs_dim` 3300 → 4290 (+30%) and `action_dim` 1324 → 2194. That is a real
 cost and it is smaller than the alternative, which is a training or evaluation run that dies
 partway through a ladder. `PHASE3_STEP1.md` §1.1 fixed the default at 16 and said not to
 relitigate it, so **the default is still 16** and this is flagged rather than changed; the
@@ -840,6 +987,16 @@ the most dangerous, because nothing about the real game constrains what they are
 draw here was added so games would terminate; scoring it like a real draw quietly changed
 which game was being solved. Anything else marked **[ENGINE]** in `game_rules.md` deserves
 the same question: *what does an agent get for exploiting this, and did we mean to offer it?*
+
+**Postscript, 2026-09-03 — the three fixes treated the symptom.** A second run under
+`stalemate_value = 0.0` still collapsed: three consecutive refusals, self-play draws 16–18%,
+`vs random` down from 0.963 to 0.673. Pricing the draw at zero removes the *incentive* to
+stall but not the *ability*, and an agent that cannot find a plan still fills its turns with
+nothing. The actual defect was upstream of the value: `Pass` was a legal action, and it was
+not a rule. §4 says three actions; the engine let a player decline them. F2.4b has the
+measurement after that was fixed. The lesson survives intact and gains a sharper edge — the
+[ENGINE] audit should have asked not only *what is this worth?* but *is this in the rules at
+all?* The pass had no ruling behind it, in any section, and nobody had looked.
 
 ### Learned card values — Phase 3/4
 From the value net and from ablation. F2.9 gives flip *priority* per rank, which is a

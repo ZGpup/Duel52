@@ -24,7 +24,7 @@ fn rule_2_first_turn_is_a_draw_plus_two_actions() {
     assert_eq!(s.hand(P0).len(), 6, "but the draw still happened");
     assert_eq!(s.hand(P1).len(), 5);
 
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert_eq!(s.to_move, P1);
     assert_eq!(s.actions_remaining, 3, "every turn thereafter is three");
     assert_eq!(s.hand(P1).len(), 6, "P1 drew at the start of their turn");
@@ -34,7 +34,7 @@ fn rule_2_first_turn_is_a_draw_plus_two_actions() {
 #[test]
 fn rule_4_a_turn_is_exactly_three_actions() {
     let mut s = GameState::new_default(3);
-    go(&mut s, Action::Pass); // skip P0's short opening turn
+    end_turn(&mut s); // skip P0's short opening turn
     assert_eq!(s.to_move, P1);
 
     for expected in [2, 1] {
@@ -46,6 +46,120 @@ fn rule_4_a_turn_is_exactly_three_actions() {
     let rank = s.hand(P1)[0];
     go(&mut s, Action::Play { rank, lane: 0 });
     assert_eq!(s.to_move, P0, "the third action ended the turn");
+}
+
+/// §4: "**Actions are mandatory. There is no pass.**" A player who can act must act, and
+/// the action space contains nothing that lets them decline.
+#[test]
+fn rule_4_actions_are_mandatory_there_is_no_pass() {
+    // Something to play, something to flip, something to attack: none of it declinable.
+    let mut p = Position::empty();
+    p.hand(P0, &[Rank::FOUR]);
+    p.face_up(0, P0, Rank::SEVEN);
+    p.face_down(1, P0, Rank::NINE);
+    p.face_up(0, P1, Rank::SEVEN);
+    let s = p.build();
+
+    let legal = s.legal_actions();
+    assert!(legal.iter().any(|a| matches!(a, Action::Play { .. })));
+    assert!(legal.iter().any(|a| matches!(a, Action::Flip { .. })));
+    assert!(legal.iter().any(|a| matches!(a, Action::Attack { .. })));
+    assert!(
+        legal.iter().all(|a| a.costs_an_action()),
+        "nothing on offer is free, so nothing on offer is a way out"
+    );
+
+    // Even down to a single available card, playing it is compulsory.
+    let mut p = Position::empty();
+    p.hand(P0, &[Rank::FOUR]);
+    let s = p.build();
+    assert_eq!(s.legal_actions().len(), 3, "one rank into each of three lanes");
+}
+
+/// §4: a turn with no legal action in it is ended by the **engine**, not chosen away.
+///
+/// P1 has an empty hand, no face-up card to attack with, and its only face-down card is
+/// frozen, which §8 says cannot be flipped. That is every §4 action ruled out at once. So
+/// when P0's turn ends, P1's turn does not happen: play comes straight back to P0, and no
+/// caller is ever offered the empty position in between.
+#[test]
+fn rule_4_a_turn_with_no_legal_action_is_skipped_by_the_engine() {
+    let mut p = Position::empty();
+    p.unlock(); // empty piles, so P1's turn does not begin with a draw
+    p.actions(1); // P0 is one action from the end of their turn
+    p.hand(P0, &[Rank::TWO]);
+    // Each player holds all three lanes, so neither is winning any of them (§7).
+    for lane in 0..3 {
+        p.face_up(lane, P0, Rank::FOUR);
+        p.face_down(lane, P1, Rank::SEVEN);
+        p.freeze(lane, P1, 0, 100);
+    }
+    let mut s = p.build();
+
+    // P1 has an empty hand, nothing face-up to attack with, and every face-down card
+    // frozen — §8 says a frozen card cannot be flipped. Nothing is legal for them at all.
+    go(&mut s, Action::Play { rank: Rank::TWO, lane: 0 });
+
+    assert_eq!(s.to_move, P0, "P1 had nothing to do, so P1 never got the turn");
+    assert_eq!(s.ply, 2, "but the ply still advanced through it");
+    assert!(
+        !s.legal_actions().is_empty(),
+        "and what comes back is a position someone can actually play"
+    );
+}
+
+/// The same skip when *both* players are stuck: it terminates instead of looping forever.
+///
+/// Every card on the board is face-down and frozen and both hands are empty, so no turn from
+/// here can ever contain an action. `settle` keeps ending turns; what stops it is §7's
+/// quiet-ply counter, since a turn with no action in it is quiet by definition. This is the
+/// job the stalemate rule is now kept for, and the reason it cannot be deleted.
+#[test]
+fn rule_4_two_stuck_players_run_to_the_quiet_ply_limit_rather_than_hanging() {
+    let mut p = Position::empty();
+    p.unlock();
+    for lane in 0..3 {
+        for owner in [P0, P1] {
+            p.face_down(lane, owner, Rank::SEVEN);
+            p.freeze(lane, owner, 0, 100);
+        }
+    }
+    p.quiet_plies(17);
+    let mut s = p.build();
+
+    assert!(s.legal_actions().is_empty(), "the position is stuck for both sides");
+    end_turn(&mut s); // one turn ends; the skip then has to run the rest out
+
+    assert_eq!(
+        s.outcome,
+        Outcome::Draw(DrawReason::Stalemate),
+        "nobody could act, so the engine ran the counter out rather than looping"
+    );
+    assert_eq!(s.quiet_plies, 20, "the counter went 17 → 20 and stopped there");
+    assert_eq!(s.ply, 3, "which took exactly three skipped turns");
+}
+
+/// §4 + §7: the endgame is *forced* into combat, which is why no standoff exists.
+///
+/// Post-unlock with an empty hand, nothing face-down and no pair to declare, attacking is
+/// the only legal thing left. A player who would rather not attack has run out of ways to
+/// decline — the refusal resource §7 describes is finite by construction.
+#[test]
+fn rule_4_a_player_out_of_quiet_actions_must_attack() {
+    let mut p = Position::empty();
+    p.unlock();
+    p.face_up(0, P0, Rank::SEVEN);
+    p.face_up(0, P1, Rank::FOUR);
+    p.face_up(1, P1, Rank::FOUR); // so P0 has not already won two lanes
+    p.face_up(2, P1, Rank::FOUR);
+    let s = p.build();
+
+    let legal = s.legal_actions();
+    assert!(!legal.is_empty());
+    assert!(
+        legal.iter().all(|a| matches!(a, Action::Attack { .. })),
+        "every legal action should be an attack, got {legal:?}"
+    );
 }
 
 /// §4: "A card may be **played, flipped, and attack all in the same turn**, actions
@@ -104,7 +218,7 @@ fn rule_4_an_empty_pile_means_no_draw_not_an_error() {
     p.face_up(2, P1, Rank::FOUR);
     let mut s = p.build();
 
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert_eq!(s.to_move, P1);
     assert_eq!(s.hand(P1).len(), 1, "no draw, and no crash");
 }
@@ -168,7 +282,8 @@ fn rule_7_two_empty_lanes_post_unlock_with_an_empty_hand_wins_the_game() {
 
     assert_eq!(s.lanes_won_by(P0), 2);
     // The outcome latches on the next terminal check, which runs after an action resolves.
-    go(&mut s, Action::Pass);
+    // Any action does — this one changes nothing about P1's side of any lane.
+    go(&mut s, Action::Play { rank: Rank::KING, lane: 0 });
     assert_eq!(s.outcome, Outcome::Win(P0));
 }
 
@@ -323,8 +438,7 @@ fn rule_7_a_won_lane_cannot_be_refilled_by_a_queen() {
 fn rule_7_stalemate_is_declared_after_the_quiet_ply_limit() {
     let mut p = Position::empty();
     p.unlock();
-    // Both sides hold every lane and neither can attack (nothing is face-up), so passing is
-    // all either player can do.
+    // Both sides hold every lane and neither can attack (nothing is face-up).
     for lane in 0..3 {
         p.face_down(lane, P0, Rank::EIGHT);
         p.face_down(lane, P1, Rank::EIGHT);
@@ -332,9 +446,9 @@ fn rule_7_stalemate_is_declared_after_the_quiet_ply_limit() {
     p.quiet_plies(18);
     let mut s = p.build();
 
-    go(&mut s, Action::Pass); // 19
+    end_turn(&mut s); // 19
     assert_eq!(s.outcome, Outcome::Ongoing);
-    go(&mut s, Action::Pass); // 20 — the limit
+    end_turn(&mut s); // 20 — the limit
     assert_eq!(s.outcome, Outcome::Draw(DrawReason::Stalemate));
 }
 
@@ -350,10 +464,10 @@ fn rule_7_the_quiet_counter_resets_on_damage_and_nothing_else() {
 
     // Playing a card is not damage.
     go(&mut s, Action::Play { rank: Rank::KING, lane: 1 });
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert_eq!(s.quiet_plies, 6, "a quiet ply still counts up");
 
-    go(&mut s, Action::Pass); // P1's turn, also quiet
+    end_turn(&mut s); // P1's turn, also quiet
     assert_eq!(s.quiet_plies, 7);
 
     go(
@@ -364,7 +478,7 @@ fn rule_7_the_quiet_counter_resets_on_damage_and_nothing_else() {
             target: 0,
         },
     );
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert_eq!(s.quiet_plies, 0, "damage reset it");
 }
 
@@ -383,10 +497,10 @@ fn rule_7_the_stalemate_threshold_is_configurable() {
     let mut s = p.build();
 
     for _ in 0..3 {
-        go(&mut s, Action::Pass);
+        end_turn(&mut s);
         assert_eq!(s.outcome, Outcome::Ongoing);
     }
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert_eq!(s.outcome, Outcome::Draw(DrawReason::Stalemate));
 }
 
@@ -403,7 +517,7 @@ fn rule_7_a_lane_win_takes_precedence_over_the_quiet_ply_limit() {
     p.quiet_plies(19);
     let mut s = p.build();
 
-    go(&mut s, Action::Pass);
+    end_turn(&mut s); // the 20th quiet ply, which is also the check that sees the win
     assert_eq!(s.outcome, Outcome::Win(P0));
 }
 
@@ -429,7 +543,7 @@ fn rule_9_base_unlocks_only_when_both_piles_are_empty() {
     let mut s = p.build();
 
     assert!(!s.base_unlocked);
-    go(&mut s, Action::Pass); // P0's turn ends; P1 draws their last card
+    end_turn(&mut s); // P0's turn ends; P1 draws their last card
     assert_eq!(s.to_move, P1);
     assert!(s.base_unlocked, "now both piles are empty");
 }
@@ -456,11 +570,11 @@ fn rule_3_the_unlock_latch_is_never_cleared() {
     }
     let mut s = p.build();
 
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert!(s.base_unlocked, "both piles empty, so the latch set");
 
     s.piles[0] = duel52_engine::Pile::from_ranks(vec![Rank::KING]);
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert!(
         s.base_unlocked,
         "a non-empty pile must not re-lock base cards"

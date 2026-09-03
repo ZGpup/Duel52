@@ -16,7 +16,7 @@
 
 mod common;
 
-use common::sample_positions;
+use common::{sample_positions, sub_decision_positions};
 use duel52_engine::encode::{
     action_blocks, action_dim, action_layout_hash, decode_action, encode_action,
     encode_observation, legal_mask, obs_dim, obs_layout_hash, slot_features,
@@ -262,9 +262,40 @@ fn phase3_legal_pairs_are_already_canonical() {
 /// rule for folding their visits and another for which one to play.
 #[test]
 fn phase3_action_encoding_round_trips() {
+    /// The variant's name, so a coverage failure says *which* one went missing rather than
+    /// leaving the reader to diff two counts.
+    fn variant_name(action: &Action) -> &'static str {
+        match action {
+            Action::Play { .. } => "Play",
+            Action::Flip { .. } => "Flip",
+            Action::Attack { .. } => "Attack",
+            Action::DeclarePair { .. } => "DeclarePair",
+            Action::Peek { .. } => "Peek",
+            Action::ResolveNext { .. } => "ResolveNext",
+            Action::MoveHere { .. } => "MoveHere",
+            Action::GiveBack { .. } => "GiveBack",
+            Action::SplitTarget { .. } => "SplitTarget",
+        }
+    }
+    const ALL_VARIANTS: [&str; 9] = [
+        "Play",
+        "Flip",
+        "Attack",
+        "DeclarePair",
+        "Peek",
+        "ResolveNext",
+        "MoveHere",
+        "GiveBack",
+        "SplitTarget",
+    ];
+
     let mut kinds = std::collections::HashSet::new();
     let mut total = 0;
-    for state in sample_positions() {
+    // `sub_decision_positions` is added to the depth-sampled ones so the coverage assertion
+    // below means something: it guarantees each sub-decision phase is reached, rather than
+    // hoping a fixed sampling depth happens to land inside one.
+    let positions = sample_positions().into_iter().chain(sub_decision_positions());
+    for state in positions {
         let mut seen = std::collections::HashMap::new();
         for action in state.legal_actions() {
             let index = encode_action(&action, &state);
@@ -278,16 +309,20 @@ fn phase3_action_encoding_round_trips() {
             let back = decode_action(index, &state)
                 .unwrap_or_else(|| panic!("index {index} for `{action}` decoded to nothing"));
             assert_eq!(back, action, "round trip changed the action at index {index}");
-            kinds.insert(std::mem::discriminant(&action));
+            kinds.insert(variant_name(&action));
             total += 1;
         }
     }
     assert!(total > 3_000, "only {total} actions were checked");
-    assert_eq!(
-        kinds.len(),
-        10,
-        "the sample did not exercise all ten Action variants, so the round trip is untested \
-         for some of them"
+    let missing: Vec<&str> = ALL_VARIANTS
+        .iter()
+        .copied()
+        .filter(|name| !kinds.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the sample never produced {missing:?}, so the round trip is untested for those \
+         variants"
     );
 }
 

@@ -40,6 +40,19 @@ contradicted and neither blocking:
 
 Recorded so nobody re-derives the superseded version from an old note:
 
+- **There is no pass. Actions are mandatory** (`game_rules.md` §4, owner's ruling
+  2026-09-03). The engine offered `Pass` as a fifth main-phase action from the first
+  commit — not from any ruling, and not from anything in the published rules, which say
+  "take three actions" and stop. Nobody had asked where it came from, and it survived
+  §4 being written, the encoder, the whole Phase 2 ladder and two training runs. A player
+  who can act must act; the only short turns are the first player's opening one and a turn
+  with no legal action in it. Consequences in `FINDINGS.md` F2.4b — the strategic stalemate
+  stops existing.
+  - **Follow-up the same day: `Pass` is gone from the engine entirely.** The first fix kept
+    it as a forced single-option node for the turn that has nothing in it. The owner's call
+    was that a non-choice does not belong in the action space at all, so `apply.rs` now ends
+    such a turn itself and `Action` has no variant for it. The policy head lost its `PASS`
+    logit (1325 → 1324) and every checkpoint written before this date is refused.
 - **Frozen cards cannot be flipped at all.** An earlier answer said an external 5 could flip
   a frozen card; the final ruling is that a 5 skips them entirely. Freeze blocks attacking
   and being flipped, by anyone — but *not* reactivation by a King.

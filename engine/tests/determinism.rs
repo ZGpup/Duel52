@@ -5,6 +5,7 @@
 //! rests on this, so it gets its own suite rather than a line in another one.
 
 use duel52_engine::agents::{Agent, RandomAgent};
+use duel52_engine::testkit::end_turn;
 use duel52_engine::{
     Action, GameConfig, GameState, Outcome, Player, Player::P0, Player::P1, Rank, TwoPower,
     Variant,
@@ -185,7 +186,7 @@ fn a_finished_game_accepts_nothing() {
         s.apply_trusted(action);
     }
     assert!(s.legal_actions().is_empty());
-    assert!(s.apply(Action::Pass).is_err());
+    assert!(s.apply(Action::Play { rank: Rank::ACE, lane: 0 }).is_err());
 }
 
 /// Sub-decisions always belong to the player whose action opened them, and the game never
@@ -419,22 +420,65 @@ fn every_rank_appears_across_many_deals() {
     }
 }
 
-/// `Pass` is always available in the main phase — a player can be left with nothing else to
-/// do and the turn still has to end.
+/// `game_rules.md` §4: **actions are mandatory**, and there is no action that declines one.
+///
+/// The structural claim, checked on every decision of a full game: whenever the engine hands
+/// a player a position, it offers at least one thing to do, and everything it offers in the
+/// main phase costs an action. There is nothing in the action space whose purpose is to move
+/// the game along — a policy head over these logits is a distribution over real choices.
+///
+/// This is what `settle`'s auto-advance buys, and it is worth a test rather than a comment:
+/// the invariant is invisible until it breaks, and when it breaks it presents as an agent
+/// panicking on an empty action list somewhere far away.
 #[test]
-fn pass_is_always_available_in_the_main_phase() {
+fn rule_4_every_offered_action_is_a_real_action() {
     for variant in Variant::ALL {
         for seed in 0..10u64 {
             let mut s = GameState::new(GameConfig::preset(variant), seed);
             let mut agent = RandomAgent::new(seed);
             while !s.outcome.is_over() {
+                let legal = s.legal_actions();
+                assert!(
+                    !legal.is_empty(),
+                    "{variant} seed {seed} ply {}: a running game offered no decision",
+                    s.ply
+                );
                 if s.pending.is_empty() {
                     assert!(
-                        s.legal_actions().contains(&Action::Pass),
-                        "{variant} seed {seed}: no way to end the turn"
+                        legal.iter().all(|a| a.costs_an_action()),
+                        "{variant} seed {seed}: the main phase offered a free action"
                     );
                 }
-                let action = agent.choose(&s, &s.legal_actions());
+                let action = agent.choose(&s, &legal);
+                s.apply_trusted(action);
+            }
+        }
+    }
+}
+
+/// The other half of §4: a player holding a card can always play it, so a full hand is
+/// never stuck. This is what makes the mutual-standoff draw unreachable — the non-attacking
+/// actions are all finite (a hand drains, a card flips once, a card joins one pair and
+/// "cannot leave one pair to join another"), so a player who refuses to attack runs out of
+/// ways to refuse.
+///
+/// It is also what `settle`'s auto-advance relies on to stay off the hot path: it checks the
+/// hand before enumerating anything.
+#[test]
+fn rule_4_a_player_holding_a_card_is_never_stuck() {
+    for variant in Variant::ALL {
+        for seed in 0..10u64 {
+            let mut s = GameState::new(GameConfig::preset(variant), seed);
+            let mut agent = RandomAgent::new(seed);
+            while !s.outcome.is_over() {
+                let legal = s.legal_actions();
+                if s.pending.is_empty() && !s.hand(s.to_move).is_empty() {
+                    assert!(
+                        legal.iter().any(|a| matches!(a, Action::Play { .. })),
+                        "{variant} seed {seed}: a card in hand is always a legal play"
+                    );
+                }
+                let action = agent.choose(&s, &legal);
                 s.apply_trusted(action);
             }
         }
@@ -464,15 +508,17 @@ fn configs_round_trip_so_findings_stay_reproducible() {
 }
 
 /// P1 never gets the short opening turn — it belongs to whoever moves first.
+///
+/// §4: "the first player's opening turn" is the *only* short turn a player gets by rule.
 #[test]
 fn only_the_first_player_gets_the_short_opening_turn() {
     let mut s = GameState::new_default(8);
     assert_eq!(s.to_move, P0);
     assert_eq!(s.actions_remaining, 2);
-    s.apply(Action::Pass).unwrap();
+    end_turn(&mut s);
     assert_eq!(s.to_move, P1);
     assert_eq!(s.actions_remaining, 3);
-    s.apply(Action::Pass).unwrap();
+    end_turn(&mut s);
     assert_eq!(s.to_move, P0);
     assert_eq!(s.actions_remaining, 3, "P0's second turn is a full one");
 }

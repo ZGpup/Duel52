@@ -59,7 +59,7 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 294 tests: rules, determinism, information hiding,
+cargo test                               # 301 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, and the training corpus
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
@@ -68,7 +68,7 @@ cargo test                               # 294 tests: rules, determinism, inform
 ./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
 ./target/release/duel52 play --opponent human              # hotseat
 ./target/release/duel52 powers                             # card-power reference
-./target/release/duel52 demo --seed 86                     # watch a random game, ply by ply
+./target/release/duel52 demo --seed 47                     # watch a random game, ply by ply
 
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
@@ -108,13 +108,29 @@ python3 -m venv .venv && .venv/bin/pip install -q maturin pytest torch numpy
 .venv/bin/python -m pytest py/tests -q
 ```
 
-⚠️ **The stalemate draw is [ENGINE], and what it is worth is a training decision.** At the
-engine default of `stalemate_value = 0.5` a learner will discover that mutual refusal to
-attack is a safe half point and stop playing — `FINDINGS.md` F3.6 has the three generations
-where that happened. Training configs set `0.0`. This is a *learning* weight only:
-`Outcome::value_for`, `match`, `ladder` and every F1/F2 number are untouched by it. More
-generally, anything marked **[ENGINE]** in `game_rules.md` is a rule nobody agreed to, and
-deserves the question *what does an agent get for exploiting this?*
+⚠️ **The stalemate draw is [ENGINE], and it is now a backstop rather than a strategy.**
+`game_rules.md` §4 makes actions **mandatory** — there is no pass anywhere in the engine, and
+the only short turn is the first player's opening one. A turn with nothing legal in it is
+ended by `apply.rs`'s `skip_turns_with_nothing_to_do`, not chosen away, so `legal_actions()`
+is empty only when the game is over. That removes the standoff at the root: a player who
+would rather not attack must spend the action on a play, a flip or a pair, and all three
+run out.
+Greedy self-play went from 0.7–1.7% stalemates to **0 in 4,000 games per variant**
+(`FINDINGS.md` F2.4b). `stalemate_value` is still a *learning* weight and training configs
+still set `0.0`, but F3.6's collapse is no longer the failure mode to expect — the draws
+that remain are mutual lane wins. More generally, anything marked **[ENGINE]** in
+`game_rules.md` is a rule nobody agreed to, and deserves the question *what does an agent
+get for exploiting this?*
+
+⚠️ **The policy head is 1324 wide as of 2026-09-03, and every earlier checkpoint and shard is
+refused.** Removing the `PASS` block (§4 has no pass — see below) shifted `CHOOSE_SLOT` and
+`CHOOSE_RANK`, so the action-layout hash moved. A stale checkpoint fails loudly with
+`action_dim is 1325 in the checkpoint but 1324 in this build`, which is the guard working.
+Regenerate with `python -m duel52.nn init`; `runs/` from before that date cannot be resumed.
+**A `.d52sp` shard is now checked the same way.** It stores indices into `legal_actions()`,
+so an encoder change silently repoints every one of them — the header always carried the
+layout hashes but nothing read them back until this change. `Shard::read` now compares both
+and refuses a mismatch (`phase3_a_shard_from_a_different_action_layout_is_refused`).
 
 ⚠️ `encoding_slots` defaults to **16** and the encoder **asserts** rather than truncating.
 A `netpolicy` checkpoint played against `random` can exceed it — see `FINDINGS.md` F3.1.

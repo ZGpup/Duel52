@@ -21,7 +21,7 @@ from duel52._engine import encoding_spec
 def test_the_spec_reports_the_documented_shape():
     spec = encoding_spec()
     assert spec["obs_dim"] == 3300
-    assert spec["action_dim"] == 1325
+    assert spec["action_dim"] == 1324
     assert spec["encoding_slots"] == 16  # FINDINGS.md F2.7
     assert spec["lanes"] == 3
     assert spec["ranks"] == 13
@@ -35,12 +35,13 @@ def test_the_action_blocks_tile_the_policy_head():
         assert block["offset"] == at, f"{block['name']} does not start where the last ended"
         at += block["len"]
     assert at == spec["action_dim"]
+    # No PASS block: ``game_rules.md`` §4 makes actions mandatory, so a turn with nothing
+    # legal in it is ended by the engine rather than chosen. Every logit is a real decision.
     assert [b["name"] for b in spec["action_blocks"]] == [
         "PLAY",
         "FLIP",
         "ATTACK",
         "PAIR",
-        "PASS",
         "CHOOSE_SLOT",
         "CHOOSE_RANK",
     ]
@@ -138,7 +139,7 @@ def test_every_legal_action_round_trips_through_the_policy_index():
 
 
 def test_an_index_that_means_nothing_here_decodes_to_none():
-    """Most of the 1325 indices are meaningless in any given position — that is what the mask
+    """Most of the 1324 indices are meaningless in any given position — that is what the mask
     is for, and ``None`` is the honest answer rather than an error."""
     game = Game(seed=9)
     spec = encoding_spec()

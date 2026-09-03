@@ -6,7 +6,8 @@
 #![allow(dead_code)]
 
 use duel52_engine::display::render;
-use duel52_engine::{Action, GameConfig, GameState, Rng, Variant};
+use duel52_engine::testkit::Position;
+use duel52_engine::{Action, GameConfig, GameState, Player, Rank, Rng, Variant};
 
 // ============================================================ position samples ==
 
@@ -52,6 +53,55 @@ pub fn sample_positions() -> Vec<GameState> {
         "the position sample is too thin to prove anything"
     );
     out
+}
+
+/// One position per sub-decision phase, found by walking random games.
+///
+/// [`sample_positions`] stops at fixed depths, so whether it lands inside a Foresight or a
+/// Queen's move is luck — and luck that shifts whenever the legal-action list changes shape.
+/// This walks until it has seen each phase instead, so a test that needs every kind of
+/// decision node gets them. Still not hand-built: these are positions a random game reached.
+pub fn sub_decision_positions() -> Vec<GameState> {
+    let mut out: Vec<GameState> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    'search: for variant in Variant::ALL {
+        let config = GameConfig::preset(variant);
+        for seed in 0..400u64 {
+            if seen.len() == 5 {
+                break 'search;
+            }
+            let mut state = GameState::new(config, seed);
+            let mut rng = Rng::derive(seed, 0x50B_DEC1_5104_2000);
+            while !state.outcome.is_over() {
+                let phase = state.phase().to_string();
+                if !state.pending.is_empty() && !seen.contains(&phase) {
+                    seen.push(phase);
+                    out.push(state.clone());
+                }
+                let legal = state.legal_actions();
+                let action = *rng.choose(&legal).expect("a running game has actions");
+                state.apply_trusted(action);
+            }
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        5,
+        "only reached the sub-decision phases {seen:?}; the encoder tests need all five"
+    );
+    out
+}
+
+/// Give `player` a spare card in hand so their turn survives the action under test.
+///
+/// `game_rules.md` §4 has no pass, so the engine ends a turn the moment nothing in it is
+/// legal (`apply.rs`'s `skip_turns_with_nothing_to_do`). A test that builds a position with
+/// exactly one interesting action, takes it, and then asserts on `actions_remaining` or on
+/// what is *now* illegal would find the turn already over and the assertions pointing at the
+/// opponent. A card in hand is always a legal play (§4), so it keeps the turn alive without
+/// touching anything about combat, pairs or powers — which is what those tests are about.
+pub fn spare_action(p: &mut Position, player: Player) {
+    p.hand(player, &[Rank::KING]);
 }
 
 // =============================================================== rules helpers ==

@@ -625,17 +625,27 @@ impl GameState {
                     "a pending sub-decision belongs to the player who is not to move"
                 );
             }
+        }
+    }
 
-            // A running game must always offer a way forward. Without this, a bug that
-            // left an unanswerable sub-decision on the stack would present as the engine
-            // silently hanging, which is far harder to diagnose than a failed assertion.
-            if !self.outcome.is_over() {
-                assert!(
-                    !self.legal_actions().is_empty(),
-                    "no legal action is available but the game is not over: {}",
-                    self.header()
-                );
-            }
+    /// Assert that a running game offers a way forward.
+    ///
+    /// Without this, a bug that left an unanswerable sub-decision on the stack — or a §4
+    /// skip that failed to fire — would present as the engine silently hanging, which is
+    /// far harder to diagnose than a failed assertion.
+    ///
+    /// Separate from [`GameState::debug_check_invariants`] because it is a property of
+    /// *play*, not of a well-formed position. `apply` guarantees it by ending a turn that
+    /// has nothing in it (`skip_turns_with_nothing_to_do`); `testkit` builds positions
+    /// directly and is entitled to construct one nobody can move in, so it checks the
+    /// structural invariants without this one.
+    pub(crate) fn debug_check_playable(&self) {
+        if cfg!(debug_assertions) && !self.outcome.is_over() {
+            assert!(
+                !self.legal_actions().is_empty(),
+                "no legal action is available but the game is not over: {}",
+                self.header()
+            );
         }
     }
 

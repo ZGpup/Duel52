@@ -106,8 +106,6 @@ impl GameState {
                 slot_a,
                 slot_b,
             } => self.do_declare_pair(lane as usize, slot_a as usize, slot_b as usize),
-            Action::Pass => self.actions_remaining = 0,
-
             Action::Peek { side, lane, slot } => self.do_peek(side, lane as usize, slot as usize),
             Action::ResolveNext { lane, slot } => {
                 self.do_resolve_next(lane as usize, slot as usize)
@@ -119,6 +117,7 @@ impl GameState {
 
         self.settle();
         self.debug_check_invariants();
+        self.debug_check_playable();
     }
 
     // ==================================================================== §4 actions ==
@@ -737,7 +736,10 @@ impl GameState {
     }
 
     /// End the current turn and begin the next.
-    fn end_turn(&mut self) {
+    ///
+    /// `pub(crate)` for `testkit::end_turn`, which lets a hand-built position skip a turn
+    /// without having to find three legal actions to burn.
+    pub(crate) fn end_turn(&mut self) {
         // §7: the quiet-ply counter counts "individual player turns (plies)" with "no damage
         // dealt and no kill", and "resets on damage or a kill and on nothing else".
         if self.damage_this_ply {
@@ -777,6 +779,39 @@ impl GameState {
             return;
         }
         if self.actions_remaining == 0 {
+            self.end_turn();
+        }
+        self.skip_turns_with_nothing_to_do();
+    }
+
+    /// End any turn that has no legal action in it, and keep going while the next one is
+    /// equally empty.
+    ///
+    /// §4 makes actions mandatory and offers no pass, so "I cannot act" is not a decision a
+    /// player makes — it is a fact about the position, and the engine acts on it here. This
+    /// is what keeps [`GameState::legal_actions`] empty *only* when the game is over, so no
+    /// caller ever has to ask what to do with a position that allows nothing.
+    ///
+    /// **It terminates.** Every iteration calls `end_turn`, which advances the ply and runs
+    /// the terminal check; `check_terminal` ends the game at `config.max_plies` and at the
+    /// quiet-ply threshold, and a turn with no action in it is by definition quiet. Two
+    /// permanently stuck players therefore draw rather than loop.
+    pub(crate) fn skip_turns_with_nothing_to_do(&mut self) {
+        // The hand check is the cheap half of the test and almost always settles it: a card
+        // in hand can always be played into any of your own lanes, so a player holding one
+        // is never stuck. Enumerating the main phase on every action would roughly double
+        // the cost of a game (see `apply_trusted`), and this keeps it off the hot path.
+        //
+        // That shortcut is a second statement of a rule, which is how legality drifts. The
+        // guard is `rule_4_a_player_holding_a_card_is_never_stuck`, which asserts across
+        // full games in every variant that a non-empty hand really does imply a legal
+        // `Play`. If a lane capacity ever becomes a *rule* rather than an encoding cap,
+        // that test fails here rather than somewhere far away.
+        while !self.outcome.is_over()
+            && self.pending.is_empty()
+            && self.hands[self.to_move.idx()].is_empty()
+            && self.legal_main_actions().is_empty()
+        {
             self.end_turn();
         }
     }

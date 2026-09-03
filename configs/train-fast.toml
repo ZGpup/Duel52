@@ -17,7 +17,7 @@ variant = "split"
 # 21, not the default 16. FINDINGS.md F3.1: 16 survives self-play and does NOT survive an
 # evaluation ladder, because `random` never kills anything and lanes fill up against it —
 # and `random` is the anchor rung forever. 21 is the theoretical maximum, so the encoder
-# provably cannot assert mid-run. Costs obs_dim 3300 -> 4290 and action_dim 1325 -> 2195.
+# provably cannot assert mid-run. Costs obs_dim 3300 -> 4290 and action_dim 1324 -> 2194.
 #
 # This must match the checkpoint. It is what fixes obs_dim, so a mismatch is a refused
 # checkpoint rather than a silent misread.
@@ -37,6 +37,12 @@ encoding_slots = 21
 #
 # Scoring and Elo are NOT affected: a draw is still half a point in `match` and `ladder`, so
 # every number in FINDINGS.md F1 and F2 still means what it meant.
+#
+# Since the §4 mandatory-action ruling (2026-09-03) this is close to a no-op: with no pass in
+# the game, an engine stalemate needs a position where NEITHER player has a legal action, and
+# that turned up 0 times in 1.2M random games and 0 times in 12,000 greedy self-play games
+# (F2.4b). Kept at 0.0 anyway — it costs nothing, and the point of F3.6 is that an
+# engine-defined terminal condition should never be worth having.
 stalemate_value = 0.0
 
 [net]

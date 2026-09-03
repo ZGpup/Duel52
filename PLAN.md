@@ -152,7 +152,7 @@ which is a cleaner premise for the belief modeling in Phase 3.
 search; step 3 is the training loop.
 
 - [x] Observation + action encoders (`DESIGN.md` §4–5) — `engine/src/encode.rs`, 3300 floats
-      and a 1325-logit head, both config-derived. Exposed to Python through
+      and a 1324-logit head, both config-derived. Exposed to Python through
       `Game.encode_observation` / `legal_mask` / `encode_action` / `decode_action`, with
       `duel52.encoding_spec()` as the single source of shapes and layout hashes.
 - [x] Residual MLP with policy + value heads — `engine/src/nn/` (the Rust forward pass and
@@ -173,11 +173,20 @@ search; step 3 is the training loop.
       corpus. F2.7 and F3.1 both expect the slot bound to move.
 - [x] Checkpointing, resumability, config-driven throughout — a run is one TOML plus a seed;
       `--resume` continues a run directory.
-- [ ] **Run it.** The first attempt ran three generations and collapsed into the engine's
-      stalemate draw (`FINDINGS.md` F3.6); the three fixes it produced are in. The next pass
-      is `configs/train-fast.toml` — ~2.5 hours, ~18 generations — followed by a ladder
-      against the frozen Phase 2 rungs. **Watch the self-play draw rate and the reference
-      line**; those are what caught it last time.
+- [ ] **Run it.** Two attempts, both collapsed into the engine's stalemate draw
+      (`FINDINGS.md` F3.6 and its postscript) — the second even at `stalemate_value = 0.0`,
+      which removed the incentive but not the ability. The cause was a rule that was never a
+      rule: the engine let a player pass. Fixed 2026-09-03 (`game_rules.md` §4, actions are
+      mandatory); greedy self-play stalemates went to zero, F2.4b. `Pass` was then removed
+      from the action space outright, taking the policy head from 1325 to 1324 logits, so
+      **every checkpoint and shard written before 2026-09-03 is refused and `runs/` cannot
+      be resumed** — start from a fresh `python -m duel52.nn init`.
+      **The third run is the first one where a draw is not an available strategy** —
+      `configs/train-fast.toml`,
+      ~2.5 hours, ~18 generations, then a ladder against the frozen Phase 2 rungs. Every
+      Phase 2 and Phase 3 number below predates the ruling and is measured on a different
+      game; the ladder needs re-running before anything is compared across it. Still watch
+      the self-play draw rate and the reference line.
 - [ ] **Duel52-mini** in OpenSpiel; validate the loop against exact CFR before trusting it
       on the full game
 - [ ] Local best-response as the exploitability proxy
@@ -213,7 +222,8 @@ that constrain later work:
 - **`Evaluator` is batch-shaped**, because self-play will batch across concurrent games — `G`
   games in flight per worker, one simulation each per round, evaluated together. No virtual
   loss, no search distortion, every game reproducible from its own seed.
-- **The action head is exact and slot-keyed**, 1325 logits. `DESIGN.md` §4.
+- **The action head is exact and slot-keyed**, 1324 logits, every one of them a decision a
+  player actually makes. `DESIGN.md` §4.
 - **The checkpoint is a documented ~100-line binary format**, zero-dependency on both sides,
   carrying layout hashes. Not ONNX (a C++ dependency for a five-layer MLP), not safetensors
   (a JSON parser in a crate that has none).

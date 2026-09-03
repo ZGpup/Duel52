@@ -90,6 +90,21 @@ Each turn:
 
 Any combination of actions is allowed, including repeats. **[RAW]**
 
+**Actions are mandatory. There is no pass.** *Three* actions, not *up to* three: a player
+who can act must act, and keeps acting until the allowance is spent. The only two short
+turns are the ones the rules make short — the first player's opening turn (two actions), and
+a turn in which none of the four actions below is available at all. **[RULING]**
+
+That second case is **not a decision**. A player with nothing legal does not choose to end
+their turn; the engine ends it and moves on, and if the next player is equally stuck it ends
+theirs too. There is no pass action to take, nothing in the action space that declines a
+turn, and nothing for a player or an agent to be offered. **[ENGINE]**
+
+This is the rule that makes the game finish. The non-attacking actions are each finite:
+a hand drains, a card flips exactly once and nothing ever turns it back, and a card joins
+one pair and "cannot leave one pair to join another" (§5). So a player who would rather not
+attack runs out of ways to decline, and the endgame is forced into combat. See §7.
+
 There is **no hand-size limit**. **[RULING]**
 
 ### The four actions
@@ -258,7 +273,9 @@ are still being drawn, since base cards are untouchable until the pile empties.
 - Once the pile empties, hands drain and the game converges to a finite, no-new-resources
   combat endgame.
 - Hand size at the moment the pile empties is a **defensive resource** — every card in
-  hand is a turn the opponent cannot close a lane.
+  hand is a turn the opponent cannot close a lane. But it is a *wasting* one: §4 makes
+  actions mandatory, so once a player's flips, attacks and pairs are exhausted, playing out
+  the hand is the only legal thing left. A held card buys time; it does not buy safety.
 
 ### Draw / stalemate **[ENGINE — accepted by the owner]**
 
@@ -270,12 +287,26 @@ This is an engine necessity for training, not a claim about the paper game.
 "Turns" here means **individual player turns (plies)** — the default 20 is ten apiece. The
 counter resets on damage or a kill and on nothing else. **[ENGINE — accepted by the owner]**
 
-What the rule actually guards against is **mutual passivity**, not any kind of loop. There is
-no repeatable engine in this game: powers fire on flip, a King reactivates once, and nothing
+What the rule guards against is **mutual passivity**, not any kind of loop. There is no
+repeatable engine in this game: powers fire on flip, a King reactivates once, and nothing
 ever turns a card face-down again, so total power activations are bounded by
-(cards flipped) + (King reactivations). The reachable stall is strategic — post-unlock, both
-hands empty, and neither player wants to attack first because attacking exposes the attacker.
-Nobody commits and the game never ends on its own.
+(cards flipped) + (King reactivations).
+
+**Since §4's mandatory-action ruling, the passivity it guards against is unreachable by
+choice.** The old reading of the stall was strategic: post-unlock, both hands empty, neither
+player wanting to attack first because attacking exposes the attacker, and both simply
+passing. There is no passing. A player who declines to attack must spend the action on a
+play, a flip or a pair, and all three are finite — so declining runs out and the fight
+happens. Measured: greedy self-play, the only rung that ever reached the cutoff, now reaches
+it in **0 of 4,000 games per variant**, against 0.7% / 1.0% / 1.7% before (`FINDINGS.md`
+F2.4, superseded by F2.4b).
+
+The rule stays, as a **backstop rather than a mechanism**. What can still reach it is a
+position where *neither player has a legal action at all* — every remaining card frozen or
+with nothing in range. The engine ends such turns automatically (§4), so without this rule
+it would sit in that loop forever; a turn with no action in it is quiet by definition, so the
+counter runs out and the game is declared a draw. That is the whole of what the rule is now
+for. It is no longer a strategy either player can adopt.
 
 ### Terminal evaluation
 

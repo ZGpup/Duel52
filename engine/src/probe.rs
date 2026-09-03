@@ -76,8 +76,14 @@ pub struct GameStats {
     pub flip_ply_sum: [[u64; Rank::COUNT]; 2],
     /// Cards still face-down on the board when the game ended.
     pub unflipped_at_end: [u32; 2],
-    /// `Pass` actions — a turn forfeited with actions still in hand.
-    pub passes: [u32; 2],
+    /// Turns that ended with actions unspent because **nothing was legal**.
+    ///
+    /// §4 makes acting mandatory and there is no pass, so this is not an action anyone
+    /// takes — the engine ends such a turn itself and the agent never sees the position.
+    /// It is counted here from the outside, by watching the ply advance while the acting
+    /// player still had an allowance. A rising count means play is running out of material,
+    /// not that the agent is being passive; there is no longer any way to be passive.
+    pub stuck_turns: [u32; 2],
     pub pairs_declared: [u32; 2],
 }
 
@@ -100,7 +106,7 @@ impl GameStats {
             base_flips_by_rank: [[0; Rank::COUNT]; 2],
             flip_ply_sum: [[0; Rank::COUNT]; 2],
             unflipped_at_end: [0, 0],
-            passes: [0, 0],
+            stuck_turns: [0, 0],
             pairs_declared: [0, 0],
         }
     }
@@ -116,7 +122,6 @@ impl GameStats {
             }
             Action::Attack { lane, .. } => self.attacks_by_lane[me][lane as usize] += 1,
             Action::DeclarePair { .. } => self.pairs_declared[me] += 1,
-            Action::Pass => self.passes[me] += 1,
             Action::Flip { lane, slot } => {
                 if let Some(card) = state.at(lane as usize, state.to_move, slot as usize) {
                     self.flips_by_rank[me][card.rank.index()] += 1;
@@ -127,6 +132,41 @@ impl GameStats {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Count the turns this action ended that still had actions left in them.
+    ///
+    /// §4 has no pass, so a turn ending early is the engine's doing, not the player's —
+    /// there is no action to intercept in [`GameStats::note_action`]. It has to be read off
+    /// the ply counter instead, comparing the position before and after one `apply`.
+    ///
+    /// Two ways a turn can end early here, and both are counted:
+    ///
+    /// 1. **The acting player's own turn.** They spent an action but the ply still advanced,
+    ///    which means what remained of their allowance had nothing to spend itself on.
+    /// 2. **Turns nobody was offered.** If the ply advanced by more than one, the players in
+    ///    between were handed a turn with no legal action in it and the engine passed
+    ///    straight through. They alternate, starting with the opponent.
+    fn note_turn_ends(
+        &mut self,
+        acting: Player,
+        ply_before: u32,
+        allowance_before: u32,
+        costs_an_action: bool,
+        state: &GameState,
+    ) {
+        let plies_advanced = state.ply - ply_before;
+        if plies_advanced == 0 {
+            return; // mid-turn, or a free sub-decision
+        }
+        if allowance_before > u32::from(costs_an_action) {
+            self.stuck_turns[acting.idx()] += 1;
+        }
+        let mut skipped = acting.other();
+        for _ in 1..plies_advanced {
+            self.stuck_turns[skipped.idx()] += 1;
+            skipped = skipped.other();
         }
     }
 
@@ -200,10 +240,16 @@ pub fn play_instrumented(
             Player::P0 => p0.choose(&state, &legal),
             Player::P1 => p1.choose(&state, &legal),
         };
+        let acting = state.to_move;
+        let ply_before = state.ply;
+        let allowance_before = state.actions_remaining;
+        let costs = action.costs_an_action();
+
         stats.note_action(&state, action);
         state.apply_trusted(action);
         stats.decisions += 1;
         stats.note_state(&state);
+        stats.note_turn_ends(acting, ply_before, allowance_before, costs, &state);
     }
 
     stats.finish(&state);
@@ -245,7 +291,7 @@ pub struct AgentBehaviour {
     pub flips: u64,
     pub base_flips: u64,
     pub base_flips_by_rank: [u64; Rank::COUNT],
-    pub passes: u64,
+    pub stuck_turns: u64,
     pub pairs: u64,
     pub unflipped_at_end: u64,
     pub plays_by_rank: [u64; Rank::COUNT],
@@ -274,7 +320,7 @@ impl AgentBehaviour {
         self.plays += stats.plays_by_lane[i].iter().map(|&v| v as u64).sum::<u64>();
         self.flips += stats.flips_by_rank[i].iter().map(|&v| v as u64).sum::<u64>();
         self.base_flips += stats.base_flips_by_rank[i].iter().map(|&v| v as u64).sum::<u64>();
-        self.passes += stats.passes[i] as u64;
+        self.stuck_turns += stats.stuck_turns[i] as u64;
         self.pairs += stats.pairs_declared[i] as u64;
         self.unflipped_at_end += stats.unflipped_at_end[i] as u64;
         for r in 0..Rank::COUNT {
@@ -303,7 +349,7 @@ impl AgentBehaviour {
         self.plays += other.plays;
         self.flips += other.flips;
         self.base_flips += other.base_flips;
-        self.passes += other.passes;
+        self.stuck_turns += other.stuck_turns;
         self.pairs += other.pairs;
         self.unflipped_at_end += other.unflipped_at_end;
         for r in 0..Rank::COUNT {
@@ -353,8 +399,8 @@ impl AgentBehaviour {
     pub fn plays_per_game(&self) -> f64 {
         self.plays as f64 / self.games.max(1) as f64
     }
-    pub fn passes_per_game(&self) -> f64 {
-        self.passes as f64 / self.games.max(1) as f64
+    pub fn stuck_turns_per_game(&self) -> f64 {
+        self.stuck_turns as f64 / self.games.max(1) as f64
     }
 
     /// Fraction of cards this agent played from hand that it ever turned face-up.
@@ -624,7 +670,7 @@ impl MatchStats {
             out.push_str(&format!(
                 "  {:<14} hand@unlock {:.2} (won {:.2} vs lost {:.2}, gap {:+.2} +/- {:.2}) · \
                  plays/game {:.1} · flip rate {:.2} · lane conc {:.3} · attack conc {:.3} · \
-                 passes/game {:.2}\n",
+                 stuck/game {:.2}\n",
                 self.agents[i].name(),
                 b.mean_hand_at_unlock(),
                 won,
@@ -635,7 +681,7 @@ impl MatchStats {
                 b.flip_rate(),
                 b.mean_lane_concentration(),
                 b.mean_attack_concentration(),
-                b.passes_per_game(),
+                b.stuck_turns_per_game(),
             ));
         }
         out

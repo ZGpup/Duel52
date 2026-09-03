@@ -475,7 +475,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     if opts.markdown {
         println!(
             "| agent | P0 score (95% CI) | draws | stalemate | mean plies | hand@unlock | \
-             won − lost | flip rate | lane conc | attack conc | passes/game | max lane |"
+             won − lost | flip rate | lane conc | attack conc | stuck/game | max lane |"
         );
         println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for m in &rows {
@@ -495,7 +495,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 b.flip_rate(),
                 b.mean_lane_concentration(),
                 b.mean_attack_concentration(),
-                b.passes_per_game(),
+                b.stuck_turns_per_game(),
                 m.max_side_occupancy,
             );
         }

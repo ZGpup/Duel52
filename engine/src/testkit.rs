@@ -212,10 +212,35 @@ impl Position {
 
     /// Finish. Checks the engine's own invariants, so a malformed test position fails at
     /// construction rather than as a confusing failure three actions later.
+    ///
+    /// **Does not settle.** A position built here can have no legal action in it for the
+    /// player to move — most of these positions are built to be *queried*, not played, and
+    /// silently advancing the ply would change what the test is asking about. `apply` is
+    /// where §4's skip lives, so the "`legal_actions` is empty only when the game is over"
+    /// invariant covers every position reached by playing, not every position that can be
+    /// constructed. A test that wants the skip should trigger it with an action.
     pub fn build(self) -> GameState {
         self.state.debug_check_invariants();
         self.state
     }
+}
+
+// ================================================================ advancing ==
+
+/// Skip the rest of the turn to move play on to the opponent.
+///
+/// `game_rules.md` §4 makes actions mandatory — there is no pass — so a test that only
+/// wants the *next* ply cannot get one by playing a legal action; it would have to find
+/// three of them, and each would change the position it is trying to pin. This reaches past
+/// legality and ends the turn the way the engine does: the quiet-ply counter advances or
+/// resets, the ply increments, the opponent draws, and the terminal check runs. If the
+/// opponent then has nothing legal either, their turn ends too, as it would in play.
+///
+/// Like everything else here, this can produce a position real play would not reach. Use it
+/// to get *to* the position under test, never as part of the behaviour being asserted.
+pub fn end_turn(state: &mut GameState) {
+    state.end_turn();
+    state.skip_turns_with_nothing_to_do();
 }
 
 // ============================================================== query helpers ==

@@ -44,9 +44,14 @@ impl fmt::Display for Side {
 
 /// A single decision the player to move can make.
 ///
-/// The first five variants are the *actions* of `game_rules.md` §4 and cost one action
-/// each (`Pass` forfeits the rest of the turn). Everything after them is a **sub-decision**
-/// opened by a power: free, mandatory, and resolved before the turn continues.
+/// The first four variants are the *actions* of `game_rules.md` §4 and cost one action
+/// each. There is no pass and no end-turn: §4 makes acting mandatory, and a turn with no
+/// legal action left in it is ended by the engine rather than offered as a choice (see
+/// `apply.rs`'s `settle`). Everything after them is a **sub-decision** opened by a power:
+/// free, mandatory, and resolved before the turn continues.
+///
+/// So **every variant here is a real decision**. Nothing in this enum exists only to move
+/// the game along, which is what lets a policy head treat the action space as choices.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     // ---------------------------------------------------------------- costs one action --
@@ -72,9 +77,6 @@ pub enum Action {
     /// cards in a lane, *which two* you pair matters, because they can carry different
     /// damage and different attack budgets.
     DeclarePair { lane: u8, slot_a: u8, slot_b: u8 },
-
-    /// Forfeit all remaining actions this turn.
-    Pass,
 
     // ------------------------------------------------------- free, mandatory sub-choices --
     /// The 4's Foresight: privately look at one face-down card anywhere on the board,
@@ -137,7 +139,6 @@ impl fmt::Display for Action {
                 slot_a,
                 slot_b,
             } => write!(f, "pair lane {lane} slots {slot_a} + {slot_b}"),
-            Action::Pass => write!(f, "pass (end turn)"),
             Action::Peek { side, lane, slot } => {
                 write!(f, "peek at {side} lane {lane} slot {slot}")
             }

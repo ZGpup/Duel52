@@ -18,10 +18,17 @@ use crate::state::{GameState, Pending, ResolveKind};
 impl GameState {
     /// Every action the acting player may take right now.
     ///
-    /// Empty exactly when the game is over. In [`Phase::Main`] the list always contains at
-    /// least [`Action::Pass`], and in every sub-decision phase it is non-empty because
-    /// `apply.rs` only pushes a sub-decision that has an answer and prunes one that has
-    /// gone stale (see `normalize_pending`).
+    /// **In any position reached by playing, empty exactly when the game is over** — the
+    /// invariant every caller leans on. Two different mechanisms hold it up. In a
+    /// sub-decision phase the list is non-empty because `apply.rs` only pushes a
+    /// sub-decision that has an answer and prunes one that has gone stale (see
+    /// `normalize_pending`). In [`Phase::Main`] the four §4 actions genuinely can all be
+    /// unavailable — but `settle` ends such a turn on the spot and keeps going until
+    /// someone can act, so no caller is ever handed one.
+    ///
+    /// The qualifier is for [`crate::testkit`], which builds positions directly and does
+    /// not settle: a hand-built position *can* be one nobody can move in. Everything that
+    /// plays the game goes through `apply` and sees the invariant.
     pub fn legal_actions(&self) -> Vec<Action> {
         if self.outcome.is_over() {
             return Vec::new();
@@ -49,13 +56,16 @@ impl GameState {
 
     // ------------------------------------------------------------------------ main phase --
 
-    /// The four actions of `game_rules.md` §4, plus `Pass`.
+    /// The four actions of `game_rules.md` §4, and nothing else.
     ///
     /// "Any combination of actions is allowed, including repeats", and "A card may be
     /// played, flipped, and attack all in the same turn, actions permitting" — so there is
     /// no per-turn sequencing constraint to encode here. Everything below is a property of
     /// the position alone.
-    fn legal_main_actions(&self) -> Vec<Action> {
+    ///
+    /// §4 also says actions are **mandatory**: a player who can act must act, and there is
+    /// no way to decline. May return an empty list; see [`GameState::legal_actions`].
+    pub(crate) fn legal_main_actions(&self) -> Vec<Action> {
         let me = self.to_move;
         let opponent = me.other();
         let mut out = Vec::with_capacity(64);
@@ -147,10 +157,13 @@ impl GameState {
             }
         }
 
-        // --- PASS -----------------------------------------------------------------------
-        // Always available. A player can be left with nothing else — no cards in hand, no
-        // face-up cards, nothing legal to attack — and the turn still has to end.
-        out.push(Action::Pass);
+        // No pass. §4: "Take three actions" — not *up to* three. Actions are mandatory, so
+        // the four above are the whole main phase.
+        //
+        // This list **can** come back empty: an empty hand, nothing flippable, nothing in
+        // range and no pair to declare is a turn with nothing in it. That is not a decision
+        // to make, so it is not an action to offer — `apply.rs`'s `settle` ends the turn
+        // instead, and the caller never sees the position.
         out
     }
 

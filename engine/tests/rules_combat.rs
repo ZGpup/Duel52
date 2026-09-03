@@ -98,6 +98,7 @@ fn rule_4_each_card_attacks_only_once_per_turn() {
     let mut p = Position::empty();
     p.face_up(0, P0, Rank::FOUR);
     p.face_up(0, P1, Rank::JACK);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0));
@@ -246,6 +247,7 @@ fn rule_6_a_nine_deals_two_damage_to_a_jack() {
     let mut p = Position::empty();
     p.face_up(0, P0, Rank::NINE);
     p.face_up(0, P1, Rank::JACK);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0));
@@ -373,6 +375,7 @@ fn rule_6_ten_twinstrikes_two_targets_for_one_each() {
     p.face_up(0, P0, Rank::TEN);
     p.face_up(0, P1, Rank::FOUR);
     p.face_up(0, P1, Rank::FIVE);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0));
@@ -547,6 +550,7 @@ fn rule_5_a_pair_deals_two_damage_for_one_action() {
     p.face_up(0, P0, Rank::SEVEN);
     p.face_up(0, P0, Rank::SEVEN);
     p.face_up(0, P1, Rank::JACK); // 3 HP, so it survives and we can read the damage
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(
@@ -573,6 +577,7 @@ fn rule_5_a_pair_attack_spends_both_members_attacks() {
     p.face_up(0, P0, Rank::SEVEN);
     p.pair(0, P0, 0, 1);
     p.face_up(0, P1, Rank::JACK);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0));
@@ -588,6 +593,7 @@ fn rule_5_cannot_attack_separately_then_pair_for_extra_damage() {
     p.face_up(0, P0, Rank::SEVEN);
     p.face_up(0, P0, Rank::SEVEN);
     p.face_up(0, P1, Rank::JACK);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0)); // one card attacks alone
@@ -623,7 +629,7 @@ fn rule_5_a_pair_breaks_when_a_member_dies() {
         "the survivor is unpaired"
     );
 
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     allow(&s, atk(0, 0));
 }
 

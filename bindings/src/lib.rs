@@ -101,9 +101,6 @@ fn action_to_dict<'py>(py: Python<'py>, action: Action) -> PyResult<Bound<'py, P
             d.set_item("slot_a", slot_a)?;
             d.set_item("slot_b", slot_b)?;
         }
-        Action::Pass => {
-            d.set_item("kind", "pass")?;
-        }
         Action::Peek { side, lane, slot } => {
             d.set_item("kind", "peek")?;
             d.set_item(
@@ -180,7 +177,6 @@ fn action_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Action> {
             slot_a: get(d, "slot_a")?,
             slot_b: get(d, "slot_b")?,
         },
-        "pass" => Action::Pass,
         "peek" => {
             let side: String = get(d, "side")?;
             Action::Peek {

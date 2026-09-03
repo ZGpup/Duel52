@@ -147,6 +147,9 @@ impl GameState {
         }
 
         out.debug_check_invariants();
+        // A sampled world is in the same information set as the real one, so if the real
+        // position could be played, this one can too.
+        out.debug_check_playable();
         out
     }
 

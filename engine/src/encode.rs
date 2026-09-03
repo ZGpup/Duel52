@@ -458,10 +458,13 @@ pub struct ActionBlock {
 /// | `FLIP(lane, slot)` | `L·S` | 48 | [`Action::Flip`] |
 /// | `ATTACK(lane, atk, tgt)` | `L·S·S` | 768 | [`Action::Attack`] |
 /// | `PAIR(lane, a<b)` | `L·S(S−1)/2` | 360 | [`Action::DeclarePair`] |
-/// | `PASS` | 1 | 1 | [`Action::Pass`] |
 /// | `CHOOSE_SLOT(side, lane, slot)` | `2·L·S` | 96 | [`Action::Peek`] / [`Action::ResolveNext`] / [`Action::MoveHere`] / [`Action::SplitTarget`] |
 /// | `CHOOSE_RANK(rank)` | `R` | 13 | [`Action::GiveBack`] |
-/// | **total** | | **1325** | |
+/// | **total** | | **1324** | |
+///
+/// There is no `PASS` block. §4 makes actions mandatory, so a turn with nothing legal in it
+/// is ended by the engine rather than chosen — every logit here is a decision somebody
+/// actually makes.
 ///
 /// `CHOOSE_SLOT` is shared by four sub-decisions **because their phases are mutually
 /// exclusive** — [`Phase::Foresight`], [`Phase::ResolveOrder`], [`Phase::QueenSource`] and
@@ -478,7 +481,6 @@ pub fn action_blocks(config: &GameConfig) -> Vec<ActionBlock> {
         ("FLIP", l * s),
         ("ATTACK", l * s * s),
         ("PAIR", l * pairs_per_lane(s)),
-        ("PASS", 1),
         ("CHOOSE_SLOT", 2 * l * s),
         ("CHOOSE_RANK", r),
     ];
@@ -499,7 +501,7 @@ pub const fn pairs_per_lane(slots: usize) -> usize {
     slots * (slots - 1) / 2
 }
 
-/// Total policy-head width. 1325 at the default configuration.
+/// Total policy-head width. 1324 at the default configuration.
 pub fn action_dim(config: &GameConfig) -> usize {
     action_blocks(config).iter().map(|b| b.len).sum()
 }
@@ -512,7 +514,6 @@ struct Offsets {
     flip: usize,
     attack: usize,
     pair: usize,
-    pass: usize,
     choose_slot: usize,
     choose_rank: usize,
     total: usize,
@@ -528,10 +529,9 @@ impl Offsets {
             flip: b[1].offset,
             attack: b[2].offset,
             pair: b[3].offset,
-            pass: b[4].offset,
-            choose_slot: b[5].offset,
-            choose_rank: b[6].offset,
-            total: b[6].offset + b[6].len,
+            choose_slot: b[4].offset,
+            choose_rank: b[5].offset,
+            total: b[5].offset + b[5].len,
         }
     }
 
@@ -646,7 +646,6 @@ pub fn encode_action(action: &Action, state: &GameState) -> usize {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             o.pair + lane * pairs_per_lane(o.slots) + o.pair_index(lo, hi)
         }
-        Action::Pass => o.pass,
         Action::Peek { side, lane, slot } => {
             let (lane, slot) = checked(config, lane as usize, slot as usize, "peek");
             o.choose_slot(side, lane, slot)
@@ -672,7 +671,7 @@ pub fn encode_action(action: &Action, state: &GameState) -> usize {
 ///
 /// The phase is what disambiguates the shared `CHOOSE_SLOT` block, so this is a partial
 /// inverse of [`encode_action`] *at a position*, not a global one. A `None` result is not an
-/// error — most of the 1325 indices are meaningless in any given position, which is what the
+/// error — most of the 1324 indices are meaningless in any given position, which is what the
 /// legality mask is for.
 pub fn decode_action(index: usize, state: &GameState) -> Option<Action> {
     let config = &state.config;
@@ -706,7 +705,7 @@ pub fn decode_action(index: usize, state: &GameState) -> Option<Action> {
             target: target as u8,
         });
     }
-    if index < o.pass {
+    if index < o.choose_slot {
         let i = index - o.pair;
         let per_lane = pairs_per_lane(o.slots);
         let (a, b) = o.unpair_index(i % per_lane);
@@ -715,9 +714,6 @@ pub fn decode_action(index: usize, state: &GameState) -> Option<Action> {
             slot_a: a as u8,
             slot_b: b as u8,
         });
-    }
-    if index == o.pass {
-        return Some(Action::Pass);
     }
     if index < o.choose_rank {
         let i = index - o.choose_slot;
@@ -864,13 +860,14 @@ mod tests {
         let cfg = GameConfig::default();
         assert_eq!(slot_features(&cfg), 33);
         assert_eq!(board_len(&cfg), 3 * 2 * 16 * 33);
-        assert_eq!(action_dim(&cfg), 1325);
+        assert_eq!(action_dim(&cfg), 1324);
         assert_eq!(
             action_blocks(&cfg)
                 .iter()
                 .map(|b| b.len)
                 .collect::<Vec<_>>(),
-            vec![39, 48, 768, 360, 1, 96, 13]
+            vec![39, 48, 768, 360, 96, 13],
+            "six blocks: PLAY, FLIP, ATTACK, PAIR, CHOOSE_SLOT, CHOOSE_RANK — and no PASS"
         );
     }
 

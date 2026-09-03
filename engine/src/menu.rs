@@ -232,7 +232,7 @@ fn lane_of(action: Action) -> Option<usize> {
         | Action::Peek { lane, .. }
         | Action::ResolveNext { lane, .. }
         | Action::MoveHere { lane, .. } => Some(lane as usize),
-        Action::Pass | Action::GiveBack { .. } | Action::SplitTarget { .. } => None,
+        Action::GiveBack { .. } | Action::SplitTarget { .. } => None,
     }
 }
 
@@ -298,7 +298,7 @@ fn power_note(state: &GameState, lane: usize, owner: Player, slot: usize, observ
 
 // ====================================================================== the main phase ==
 
-/// The five §4 actions, always in this order at these numbers.
+/// The four §4 actions, always in this order at these numbers.
 ///
 /// Fixing the numbers costs a row for each verb that has nothing behind it and buys the
 /// thing a player actually wants from a menu they will see a thousand times: `3` is attack,
@@ -336,7 +336,8 @@ fn build_main(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
         String::new(),
         (!pairs.is_empty()).then(|| pair_menu(state, &pairs, observer)),
     );
-    b.push("PASS", String::new(), Pick::Take(Action::Pass));
+    // No fifth row. §4 makes acting mandatory and the engine ends a turn with nothing in
+    // it, so there is never anything to offer here but the four verbs.
     b.done()
 }
 
@@ -858,21 +859,24 @@ mod tests {
         }
     }
 
-    /// The five verbs are always in the same order at the same numbers, whatever is legal.
+    /// The four verbs are always in the same order at the same numbers, whatever is legal.
+    ///
+    /// Four rows, not five: §4 has no pass, and the engine skips a turn with nothing in it
+    /// rather than offering a row for it, so the menu never shows a way to do nothing.
     #[test]
-    fn the_five_verbs_keep_their_numbers() {
-        let names = ["PLAY", "FLIP", "ATTACK", "PAIR", "PASS"];
+    fn the_four_verbs_keep_their_numbers() {
+        let names = ["PLAY", "FLIP", "ATTACK", "PAIR"];
 
-        // A fresh deal: cards in hand, nothing face-up, so only PLAY and PASS can be taken.
+        // A fresh deal: cards in hand, nothing face-up, so only PLAY can be taken.
         let opening = GameState::new(GameConfig::split_deck(), 3);
         let menu = build(&opening, &opening.legal_actions(), Some(Player::P0));
-        assert_eq!(menu.len(), 5);
+        assert_eq!(menu.len(), 4);
         for (row, name) in menu.rows.iter().zip(names) {
             assert_eq!(row.name, name);
         }
+        assert!(matches!(menu.picks[0], Pick::Open(_)), "playing is on");
         assert!(matches!(menu.picks[2], Pick::Unavailable), "nothing to attack");
         assert!(matches!(menu.picks[3], Pick::Unavailable), "nothing to pair");
-        assert!(matches!(menu.picks[4], Pick::Take(Action::Pass)));
 
         // A position where attacking is on and playing is not: the numbers do not move.
         let mut p = Position::new(GameConfig::split_deck());
@@ -880,7 +884,7 @@ mod tests {
         p.face_up(0, Player::P1, Rank::FOUR);
         let midgame = p.build();
         let menu = build(&midgame, &midgame.legal_actions(), Some(Player::P0));
-        assert_eq!(menu.len(), 5);
+        assert_eq!(menu.len(), 4);
         for (row, name) in menu.rows.iter().zip(names) {
             assert_eq!(row.name, name);
         }

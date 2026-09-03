@@ -628,8 +628,6 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             )
         }
 
-        Action::Pass => "PASS  forfeit the rest of this turn".to_string(),
-
         Action::Peek { side, lane, slot } => {
             let owner = match side {
                 Side::Mine => me,

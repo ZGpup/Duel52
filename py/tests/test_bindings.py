@@ -66,7 +66,10 @@ def test_legal_actions_are_dicts_with_a_kind():
     actions = g.legal_actions()
     assert actions, "a running game always has at least one legal action"
     assert all(isinstance(a, dict) and "kind" in a for a in actions)
-    assert any(a["kind"] == "pass" for a in actions), "Pass is always available"
+    # ``game_rules.md`` §4 makes acting mandatory, so an opening hand means plays and no
+    # pass. ``pass`` exists only for a position with nothing legal left in it.
+    assert any(a["kind"] == "play" for a in actions)
+    assert not any(a["kind"] == "pass" for a in actions), "a player who can act must act"
 
 
 def test_every_action_round_trips_through_the_dict_encoding():
@@ -84,8 +87,10 @@ def test_every_action_round_trips_through_the_dict_encoding():
             choice = rng.choice(actions)
             seen_kinds.add(choice["kind"])
             g.apply(choice)  # by dict, not by index
-    # The rarer sub-decisions need a few games to show up; these five are unmissable.
-    assert {"play", "flip", "attack", "pass"} <= seen_kinds
+    # The rarer sub-decisions need a few games to show up; these three are unmissable.
+    # ``pass`` is not among them: §4 makes acting mandatory, so it takes a position with no
+    # legal action at all, which a random game essentially never reaches.
+    assert {"play", "flip", "attack"} <= seen_kinds
 
 
 def test_apply_rejects_an_illegal_action():
@@ -112,7 +117,7 @@ def test_action_descriptions_are_human_readable():
     g = Game(seed=5)
     descriptions = g.legal_action_descriptions(observer="p0")
     assert len(descriptions) == g.legal_action_count()
-    assert any("PASS" in d for d in descriptions)
+    assert any("PLAY" in d for d in descriptions)
 
 
 # --------------------------------------------------------------------- observations --
@@ -226,7 +231,7 @@ def test_a_finished_game_offers_nothing():
     g = rollout(Game(seed=6), lambda _g, a: rng.randrange(len(a)))
     assert g.legal_actions() == []
     with pytest.raises(RuntimeError):
-        g.apply({"kind": "pass"})
+        g.apply({"kind": "play", "rank": 1, "lane": 0})
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

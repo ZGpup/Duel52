@@ -86,12 +86,30 @@ Duel52-mini shrinks the head rather than misaligning it:
 | `FLIP(lane, slot)` | `L·S` | 48 | `Flip { lane, slot }` — subsumes the old `FLIP_UNKNOWN` |
 | `ATTACK(lane, atk, tgt)` | `L·S·S` | 768 | `Attack { lane, attacker, target }` |
 | `PAIR(lane, a<b)` | `L·S(S−1)/2` | 360 | `DeclarePair { lane, slot_a, slot_b }` |
-| `PASS` | 1 | 1 | `Pass` |
 | `CHOOSE_SLOT(side, lane, slot)` | `2·L·S` | 96 | `Peek` / `ResolveNext` / `MoveHere` / `SplitTarget` |
 | `CHOOSE_RANK(rank)` | `R` | 13 | `GiveBack { rank }` |
-| **total** | | **1325** | |
+| **total** | | **1324** | |
 
 Implemented in `engine/src/encode.rs`.
+
+**There is no `PASS` block, and the head went 1325 → 1324 (2026-09-03).** `game_rules.md` §4
+makes actions mandatory, so a turn with none of the four §4 actions available is not a
+decision anybody makes — `apply.rs`'s `skip_turns_with_nothing_to_do` ends it, and the
+position is never handed to a caller. **Every logit in this head is therefore something a
+player chooses**, which is the property that makes a policy target a distribution over
+choices rather than a mixture of choices and bookkeeping.
+
+The alternative was to keep a dead logit to preserve the layout hash. That is the wrong
+trade: the hash exists to catch drift between the trained function and the evaluated one,
+not to be protected from an intentional change. Removing the block shifts `CHOOSE_SLOT` and
+`CHOOSE_RANK` down by one, so the hash moves and every checkpoint written before this date
+is refused with a one-line `action_dim` error — which is the machinery working. Regenerate
+with `python -m duel52.nn init`.
+
+The engine's own invariant moved with it. `legal_actions()` is empty **only when the game is
+over** for any position reached by playing, and `GameState::debug_check_playable` asserts it
+after every action. Positions built by `testkit` are exempt: they are constructed rather than
+played, and are frequently built to be queried rather than moved in.
 
 **Why this replaced the rank-keyed table (2026-09-03).** The original head keyed `FLIP` and
 `PAIR` by rank, on the reasoning that same-rank cards are interchangeable to the player
@@ -176,7 +194,7 @@ Foresight knowledge is folded into the board tensor: a card whose rank this obse
 gets its real one-hot; everything else gets `rank_unknown`.
 
 **Network**: pre-norm residual MLP, **5 blocks, width 512**, LayerNorm `eps = 1e-5` with
-elementwise affine. Policy head returns **1325 raw logits** — masking and softmax are the
+elementwise affine. Policy head returns **1324 raw logits** — masking and softmax are the
 caller's job, because PUCT needs the masked distribution anyway and a masked softmax inside
 the network would have to be mirrored exactly in the Rust forward pass for the parity test
 to mean anything. Value head is `tanh` over a 256-wide hidden layer. ≈5.1M parameters,
@@ -186,7 +204,8 @@ first.
 
 > **Corrected 2026-09-03.** This line said "374 logits" while §4's own table totalled 395,
 > and neither number was ever right — nothing in the engine produced 374. Both are
-> superseded by §4's 1325. Recording the inconsistency rather than quietly deleting it,
+> superseded by §4's table, which totals 1324 since the `PASS` block was removed later the
+> same day. Recording the inconsistency rather than quietly deleting it,
 > because it is the kind of drift the checkpoint's `action_layout_hash` now exists to make
 > impossible: a policy head that disagrees with the encoder does not crash, it just trains
 > badly.

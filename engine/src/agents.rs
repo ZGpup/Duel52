@@ -63,10 +63,10 @@ pub trait Agent {
 /// the rollout policy inside [`flat_mc`] and [`ismcts`]. Seeded, so a random-vs-random game
 /// is as reproducible as any other.
 ///
-/// One consequence worth keeping in mind when reading Phase 1 numbers: `Pass` is one legal
-/// action among typically dozens, so a random agent forfeits the rest of its turn a few
-/// percent of the time, and it attacks far more often than a human would. Random-play
-/// statistics describe the *game tree*, not the game as played.
+/// One consequence worth keeping in mind when reading Phase 1 numbers: it attacks far more
+/// often than a human would, and plays out its hand for no reason. Random-play statistics
+/// describe the *game tree*, not the game as played. It cannot, however, stall: §4 makes
+/// acting mandatory, so a random agent spends every action it has.
 #[derive(Clone, Debug)]
 pub struct RandomAgent {
     rng: Rng,

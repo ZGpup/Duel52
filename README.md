@@ -52,13 +52,15 @@ Details and provenance in [FINDINGS.md](FINDINGS.md). Random play characterises 
 - Games are short and tightly clustered: **45 plies**, median and mean, in every variant.
 - **First-player advantage is real but small** — P0 scores 0.514, about +1.4 points.
 - **The stalemate rule never fired once in 1.2M games**, because the stall the rules
-  describe is strategic and random agents attack constantly. It remains untested.
+  describe is strategic and random agents attack constantly. Phase 2 found the agent that
+  could produce it; the §4 mandatory-action ruling then made it unreachable — see below.
 - **The house rule for the 2 fixes a real artifact.** Rules-as-written, the 2 discards a
   card from a *shared* pile, which hands the first player half an extra draw per game and
   +0.8 points of score. Bottoming instead makes it exactly zero. The artifact turns out to
   be about pile *sharing*, so it does not exist in the split-deck variant at all.
 - The mutual-lane-win draw the rules call "astronomically rare" happens in **1 game in
-  220** at this level of play. `duel52 demo --seed 86` replays one.
+  220** at this level of play. `duel52 demo --seed 47` replays one. Since the §4
+  mandatory-action ruling it is the *only* way the game draws at all.
 
 ## What Phase 2 found
 
@@ -72,9 +74,13 @@ Now with agents that actually try. Full provenance in [FINDINGS.md](FINDINGS.md)
   buys nothing measurable while one extra ply of search is worth +0.28 — the signature of
   strategy fusion, which is bias rather than variance. This is the phase's main result, and
   it says belief modelling in Phase 3 is buying something real.
-- **The stalemate rule finally fires** — 0.7–1.7% of greedy self-play games, most often in
-  the mirrored variant, where symmetric decks make neither side want to attack first. It sat
-  at exactly zero across 1.2M random games.
+- **The stalemate rule fired, and then stopped existing.** Greedy — the only rung that
+  prices material, so the only one that can decline a trade — stalled in 0.7–1.7% of its
+  self-play games, most often in the mirrored variant where symmetric decks make neither
+  side want to attack first. Chasing that led to the actual defect: the engine had been
+  letting players **pass**, which is not a rule and never was. With §4's three actions made
+  mandatory, greedy's stalemate rate is **0 in 4,000 games per variant**, and the only draw
+  left in Duel 52 is the mutual lane win. Every Phase 2 number above predates that ruling.
 - **Hoarding cards does not appear to win games.** Within a single agent's self-play, the
   side holding more cards when the draw pile empties wins no more often, at any rung. That is
   the project's headline hypothesis, and it is unsupported so far — though no Phase 2 agent

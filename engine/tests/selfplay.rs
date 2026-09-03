@@ -191,6 +191,46 @@ fn phase3_a_checkpoint_is_not_mistaken_for_a_shard() {
     assert!(err.contains("bad magic"), "unexpected error: {err}");
 }
 
+/// A shard generated against a different action layout is **refused**, not replayed.
+///
+/// This is the sharpest version of the module's opening warning. A sample's `chosen` is a
+/// position in `legal_actions()`, so a build that enumerates actions differently reads the
+/// same bytes as different moves — every observation paired with a policy target from a
+/// position the agent never saw. Nothing crashes. The header has carried the layout hashes
+/// since the format was written; removing `Action::Pass` on 2026-09-03 is what made it
+/// obvious that nobody was reading them back.
+///
+/// The corruption here is one hex digit in the recorded hash, which stands in for any
+/// encoder change at all — the reader's job is to compare, not to understand.
+#[test]
+fn phase3_a_shard_from_a_different_action_layout_is_refused() {
+    let path = write_shard(2, 1, "layout");
+    let good = std::fs::read(&path).expect("read shard");
+
+    let recorded = selfplay::Shard::read(&path).expect("the untouched shard reads");
+    let hash = recorded
+        .get("action_layout_hash")
+        .expect("the header carries the hash")
+        .to_string();
+
+    // Flip the first hex digit of the recorded hash, in place, so nothing else moves.
+    let at = good
+        .windows(hash.len())
+        .position(|w| w == hash.as_bytes())
+        .expect("the hash appears verbatim in the header");
+    let mut corrupted = good.clone();
+    corrupted[at] = if hash.as_bytes()[0] == b'0' { b'1' } else { b'0' };
+
+    let bad_path = path.with_extension("layout-drift.d52sp");
+    std::fs::write(&bad_path, &corrupted).expect("write the corrupted shard");
+
+    let err = selfplay::Shard::read(&bad_path).expect_err("a stale layout must be refused");
+    assert!(
+        err.contains("action_layout_hash") && err.contains("Regenerate"),
+        "the error must name the hash and say what to do: {err}"
+    );
+}
+
 /// Self-play must produce a *game*, not a fragment: every recorded trajectory has to end in
 /// a terminal position when replayed.
 #[test]

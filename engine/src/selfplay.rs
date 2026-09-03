@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use crate::agents::{NetMctsAgent, RootNoise};
 use crate::config::GameConfig;
+use crate::encode::{action_layout_hash, obs_layout_hash};
 use crate::outcome::{DrawReason, Outcome};
 use crate::player::Player;
 use crate::rng::Rng;
@@ -507,6 +508,33 @@ impl Shard {
             .collect();
         let config = GameConfig::from_config_str(&config_text)
             .map_err(|e| format!("{}: embedded config is invalid: {e}", path.display()))?;
+
+        // A sample's `chosen` and its policy indices are positions in `legal_actions()`, so
+        // a shard is only replayable by a build that enumerates the same actions in the same
+        // order. The header has always carried the layout hashes; until 2026-09-03 nothing
+        // read them back, and removing `Action::Pass` is exactly the change that would have
+        // gone unnoticed — the indices still parse, they just name different moves. That
+        // failure is invisible: nothing crashes, the corpus is quietly wrong, and the
+        // natural suspect is the training loop.
+        for (key, current) in [
+            ("action_layout_hash", action_layout_hash(&config)),
+            ("obs_layout_hash", obs_layout_hash(&config)),
+        ] {
+            let recorded = header
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .ok_or_else(|| format!("{}: header has no {key}", path.display()))?;
+            let expected = format!("{current:016x}");
+            if recorded != expected {
+                return Err(format!(
+                    "{}: {key} is {recorded} in the shard but {expected} in this build — the \
+                     shard was generated against a different encoder and its action indices \
+                     mean something else here. Regenerate it.",
+                    path.display()
+                ));
+            }
+        }
 
         let mut games = Vec::new();
         while at < data.len() {

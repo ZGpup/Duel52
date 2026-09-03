@@ -116,7 +116,7 @@ fn rule_6_foresight_knowledge_is_private_and_persistent() {
 
     // Persistent: several turns later P0 still knows it.
     for _ in 0..6 {
-        go(&mut s, Action::Pass);
+        end_turn(&mut s);
     }
     assert!(
         card_at(&s, 1, P1, 0).rank_known_to(P0),
@@ -314,8 +314,8 @@ fn rule_10a_a_bottomed_card_comes_back_around() {
     go(&mut s, Action::GiveBack { rank: Rank::JACK }); // bottoms the J
     assert_eq!(s.pile(P0).len(), 1);
 
-    go(&mut s, Action::Pass); // P0's turn ends
-    go(&mut s, Action::Pass); // P1's turn ends; P0 draws at the start of theirs
+    end_turn(&mut s); // P0's turn ends
+    end_turn(&mut s); // P1's turn ends; P0 draws at the start of theirs
 
     assert!(
         s.hand(P0).contains(&Rank::JACK),
@@ -339,7 +339,7 @@ fn rule_10a_in_the_base_game_you_bottom_into_the_shared_pile() {
     go(&mut s, Action::GiveBack { rank: Rank::JACK });
 
     // Both players draw from the same pile, so P1 is the next to draw from it.
-    go(&mut s, Action::Pass);
+    end_turn(&mut s);
     assert_eq!(s.to_move, P1);
     assert!(
         s.hand(P1).contains(&Rank::JACK),

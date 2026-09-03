@@ -182,8 +182,8 @@ fn alpha_beta(
         .collect();
 
     if children.is_empty() {
-        // Unreachable while the game is running — `legal_actions` always offers at least
-        // `Pass` — but a bottomed-out search must still return something finite.
+        // Unreachable while the game is running — `legal_actions` is empty only once the
+        // game is over — but a bottomed-out search must still return something finite.
         return evaluate(state, me, View::Omniscient, weights);
     }
 

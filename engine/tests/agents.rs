@@ -685,6 +685,71 @@ fn phase2_lane_concentration_is_a_well_formed_share() {
     }
 }
 
+/// `GameStats::stuck_turns` agrees with an independent count of the same thing.
+///
+/// §4 has no pass, so a turn ending with actions unspent is the engine's doing and there is
+/// no action for the probe to intercept — it is inferred from the ply counter instead
+/// (`note_turn_ends`). Inference is exactly the kind of measurement that can be quietly
+/// wrong and still look plausible in a table, and `FINDINGS.md` F2.4b reads a conclusion off
+/// this column, so it gets checked against a count derived a completely different way:
+/// replay the game, tally the action-costing decisions taken in each ply, and call a ply
+/// stuck when it holds fewer than its allowance. A skipped turn holds none.
+#[test]
+fn phase2_the_stuck_turn_count_matches_an_independent_recount() {
+    let config = GameConfig::split_deck();
+    for spec in [AgentSpec::Random, AgentSpec::Greedy] {
+        for seed in 0..40u64 {
+            let stats = probe::play_spec_game(config, seed, spec.clone(), spec.clone());
+
+            // Replay the same game, counting what each ply actually contained.
+            let mut spent: Vec<u32> = Vec::new();
+            let mut state = GameState::new(config, seed);
+            // The same streams `play_spec_game` uses, so the replay is the same game.
+            let mut p0 = spec.build(seed, probe::AGENT_STREAM[0]);
+            let mut p1 = spec.build(seed, probe::AGENT_STREAM[1]);
+            while !state.outcome.is_over() {
+                let legal = state.legal_actions();
+                let action = match state.to_move {
+                    Player::P0 => p0.choose(&state, &legal),
+                    Player::P1 => p1.choose(&state, &legal),
+                };
+                let ply = state.ply as usize;
+                if spent.len() <= ply {
+                    spent.resize(ply + 1, 0);
+                }
+                if action.costs_an_action() {
+                    spent[ply] += 1;
+                }
+                state.apply_trusted(action);
+            }
+            if spent.len() <= state.ply as usize {
+                spent.resize(state.ply as usize + 1, 0);
+            }
+
+            // The last ply is where the game ended, so it was cut short by the result
+            // rather than by having nothing in it. Every ply before it is fair game.
+            let mut recount = [0u32; 2];
+            for (ply, &taken) in spent.iter().enumerate().take(state.ply as usize) {
+                let allowance = if ply == 0 {
+                    config.first_turn_actions
+                } else {
+                    config.actions_per_turn
+                };
+                if taken < allowance {
+                    recount[ply % 2] += 1;
+                }
+            }
+
+            assert_eq!(
+                stats.stuck_turns, recount,
+                "{spec:?} seed {seed}: the probe counted {:?} stuck turns, the replay found \
+                 {recount:?}",
+                stats.stuck_turns
+            );
+        }
+    }
+}
+
 /// Elo is only defined up to an additive constant, so the anchor has to actually anchor.
 #[test]
 fn phase2_elo_anchors_where_it_is_told() {

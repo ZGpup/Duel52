@@ -33,6 +33,7 @@ fn rule_6_ace_may_attack_twice_on_the_turn_it_is_flipped() {
     p.face_down(0, P0, Rank::ACE);
     p.face_up(0, P1, Rank::FOUR);
     p.face_up(0, P1, Rank::FIVE);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, Action::Flip { lane: 0, slot: 0 });
@@ -75,6 +76,7 @@ fn rule_6_ace_second_attack_costs_its_own_action() {
     let mut p = Position::empty();
     p.face_down(0, P0, Rank::ACE);
     p.face_up(0, P1, Rank::FOUR);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     go(&mut s, Action::Flip { lane: 0, slot: 0 }); // 3 - 1 + 1 = 3
@@ -110,8 +112,8 @@ fn rule_6_ace_double_attack_expires_at_the_end_of_the_turn() {
 
     go(&mut s, Action::Flip { lane: 0, slot: 0 });
     assert_eq!(card_at(&s, 0, P0, 0).attack_allowance, 2);
-    go(&mut s, Action::Pass); // P0 ends the turn
-    go(&mut s, Action::Pass); // P1 ends the turn; back to P0
+    end_turn(&mut s); // P0's turn ends
+    end_turn(&mut s); // P1's turn ends; back to P0
     assert_eq!(s.to_move, P0);
     assert_eq!(
         card_at(&s, 0, P0, 0).attack_allowance,
@@ -446,6 +448,7 @@ fn rule_6_four_may_peek_at_your_own_base_card() {
 fn rule_8_four_with_no_face_down_card_fizzles_and_the_flip_is_still_legal() {
     let mut p = Position::empty();
     p.face_down(0, P0, Rank::FOUR);
+    spare_action(&mut p, P0);
     let mut s = p.build();
 
     allow(&s, Action::Flip { lane: 0, slot: 0 });
@@ -649,7 +652,7 @@ fn rule_8_freeze_does_not_catch_cards_that_arrive_later() {
     let mut s = p.build();
 
     go(&mut s, Action::Flip { lane: 0, slot: 0 });
-    go(&mut s, Action::Pass); // P0's turn ends; P1 is now to move on ply 5
+    end_turn(&mut s); // P0's turn ends; P1 is now to move on ply 5
 
     assert_eq!(s.to_move, P1);
     go(&mut s, Action::Play { rank: Rank::TEN, lane: 0 });
