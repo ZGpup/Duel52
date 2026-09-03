@@ -596,12 +596,22 @@ impl GameState {
                     }
                 }
             }
-            // Every pair id used somewhere is used on exactly one side of one lane.
             if let Some(top) = self.pending.last() {
                 assert_eq!(
                     top.player(),
                     self.to_move,
                     "a pending sub-decision belongs to the player who is not to move"
+                );
+            }
+
+            // A running game must always offer a way forward. Without this, a bug that
+            // left an unanswerable sub-decision on the stack would present as the engine
+            // silently hanging, which is far harder to diagnose than a failed assertion.
+            if !self.outcome.is_over() {
+                assert!(
+                    !self.legal_actions().is_empty(),
+                    "no legal action is available but the game is not over: {}",
+                    self.header()
                 );
             }
         }

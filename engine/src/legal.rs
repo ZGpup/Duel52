@@ -277,6 +277,13 @@ impl GameState {
                     lane,
                     remaining,
                 } => (*kind, *player, *lane, remaining.clone()),
+                // Every other sub-decision is pushed and answered with nothing able to run
+                // in between, so it cannot go stale. Notably a `SplitTarget` must *not* be
+                // dropped even if it somehow did: no damage has landed yet, so discarding
+                // the node would silently lose the primary hit as well as the split.
+                // `debug_check_invariants` asserts that a live sub-decision always has an
+                // answer, which turns a hypothetical bug here into a test failure rather
+                // than a hang.
                 _ => return,
             };
 

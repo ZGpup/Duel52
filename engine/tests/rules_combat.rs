@@ -215,6 +215,27 @@ fn rule_6_a_nine_deals_two_damage_to_a_jack() {
     assert_eq!(s.actions_remaining, 2, "and it cost one action");
 }
 
+/// The 9's doubling reads the target's **rank**, so it applies to a face-down Jack too.
+///
+/// **[ASSUMED]** This is the mirror image of the twinstrike rule: there the *target's*
+/// power does the blocking and goes inert face-down, but here the *attacker's* power keys
+/// on a physical fact about the target — the same way hit points do, and a face-down Jack
+/// keeps its 3 HP. The rules do not address the case directly.
+#[test]
+fn rule_6_assumed_a_nine_deals_two_to_a_face_down_jack() {
+    let mut p = Position::empty();
+    p.face_up(0, P0, Rank::NINE);
+    p.face_down(0, P1, Rank::JACK);
+    let mut s = p.build();
+
+    go(&mut s, atk(0, 0));
+    assert_eq!(damage_at(&s, 0, P1, 0), 2);
+    assert!(
+        !card_at(&s, 0, P1, 0).face_up,
+        "and the attack does not reveal it"
+    );
+}
+
 /// The 9's doubling keys on the target being a Jack, not on anything else.
 #[test]
 fn rule_6_a_nine_deals_normal_damage_to_everything_else() {
@@ -777,6 +798,32 @@ fn rule_5_a_pair_of_tens_consolidates_to_two_against_a_lone_defender() {
 
     go(&mut s, atk(0, 0));
     assert_eq!(occupancy(&s, 0, P1), 0, "2 damage, so the 7 dies");
+}
+
+/// The intersection of two rulings: a **pair of 10s against two Jacks**. §5 forces the
+/// pair's 2 to split 1 + 1, and §8 says taunt has already confined both halves to Jacks
+/// with nothing to leak past — so it is 1 to each Jack, and the third card is untouched.
+#[test]
+fn rule_5_a_pair_of_tens_against_two_jacks_deals_one_to_each() {
+    let mut p = Position::empty();
+    p.face_up(0, P0, Rank::TEN);
+    p.face_up(0, P0, Rank::TEN);
+    p.pair(0, P0, 0, 1);
+    p.face_up(0, P1, Rank::JACK);
+    p.face_up(0, P1, Rank::JACK);
+    p.face_up(0, P1, Rank::SEVEN);
+    let mut s = p.build();
+
+    go(&mut s, atk(0, 0));
+    assert_eq!(
+        s.legal_actions(),
+        vec![Action::SplitTarget { slot: 1 }],
+        "the second half is confined to the other Jack"
+    );
+    go(&mut s, Action::SplitTarget { slot: 1 });
+    assert_eq!(damage_at(&s, 0, P1, 0), 1);
+    assert_eq!(damage_at(&s, 0, P1, 1), 1);
+    assert_eq!(damage_at(&s, 0, P1, 2), 0, "nothing leaked past the taunt");
 }
 
 /// A lone 10 whose split is blocked deals 1, not 2: its second point of damage *was* the

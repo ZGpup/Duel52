@@ -1058,6 +1058,75 @@ fn rule_6_king_only_empowers_its_own_lane_and_its_own_side() {
     assert_eq!(s.actions_remaining, 2, "no Ace fired");
 }
 
+/// §6: a King reactivating a **Queen** gives a second Move.
+#[test]
+fn rule_6_king_reactivating_a_queen_grants_a_second_move() {
+    let mut p = Position::empty();
+    p.face_up(0, P0, Rank::QUEEN);
+    p.face_up(1, P0, Rank::FIVE);
+    p.face_down(0, P0, Rank::KING);
+    let mut s = p.build();
+
+    go(&mut s, Action::Flip { lane: 0, slot: 1 }); // flip the King
+    resolve_only(&mut s); // it reactivates the Queen
+    assert_eq!(s.phase(), Phase::QueenSource, "the Queen fires again");
+    go(&mut s, Action::MoveHere { lane: 1, slot: 0 });
+    assert_eq!(occupancy(&s, 1, P0), 0);
+    assert_eq!(occupancy(&s, 0, P0), 3);
+}
+
+/// §6: a King reactivating a **7** heals again — useful because the lane may have taken
+/// damage since the 7 was first flipped.
+#[test]
+fn rule_6_king_reactivating_a_seven_heals_again() {
+    let mut p = Position::empty();
+    p.face_up(0, P0, Rank::SEVEN);
+    p.face_up(0, P0, Rank::EIGHT);
+    p.damage(0, P0, 1, 1);
+    p.face_down(0, P0, Rank::KING);
+    let mut s = p.build();
+
+    go(&mut s, Action::Flip { lane: 0, slot: 2 });
+    resolve_only(&mut s);
+    assert_eq!(damage_at(&s, 0, P0, 1), 0, "the 7 fired a second time");
+}
+
+/// §6: an Ace flipped as the **last** action of a turn still grants its action, so the turn
+/// continues rather than ending. The rule says "gain 1 action this turn" with no proviso
+/// about having any left.
+#[test]
+fn rule_6_an_ace_flipped_as_the_last_action_extends_the_turn() {
+    let mut p = Position::empty();
+    p.actions(1);
+    p.face_down(0, P0, Rank::ACE);
+    p.hand(P0, &[Rank::KING]);
+    let mut s = p.build();
+
+    go(&mut s, Action::Flip { lane: 0, slot: 0 });
+    assert_eq!(s.to_move, P0, "the turn did not end");
+    assert_eq!(s.actions_remaining, 1, "1 - 1 + 1");
+}
+
+/// The same, one level deeper: a 5 flipped as the last action, which flips an Ace, hands
+/// the action back and keeps the turn alive. §6 attaches the grant to the flip, not to who
+/// caused it.
+#[test]
+fn rule_6_an_ace_flipped_by_a_five_on_the_last_action_extends_the_turn() {
+    let mut p = Position::empty();
+    p.actions(1);
+    p.face_down(0, P0, Rank::FIVE);
+    p.face_down(0, P0, Rank::ACE);
+    p.hand(P0, &[Rank::KING]);
+    let mut s = p.build();
+
+    go(&mut s, Action::Flip { lane: 0, slot: 0 });
+    assert_eq!(s.actions_remaining, 0, "the 5 spent the last action");
+    assert_eq!(s.to_move, P0, "but the turn cannot end mid-resolution (§7)");
+    resolve_only(&mut s); // the 5 flips the Ace
+    assert_eq!(s.actions_remaining, 1, "the Ace hands one back");
+    assert_eq!(s.to_move, P0);
+}
+
 /// §6 + §8: a King reactivating a 5 makes the 5 flip the lane, and the nested resolution
 /// finishes before control returns. This is the cascade §8 calls out by name.
 #[test]
