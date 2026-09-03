@@ -33,7 +33,7 @@
 
 use crate::card::CardId;
 use crate::player::Player;
-use crate::rank::Rank;
+use crate::rank::{Rank, RankCounts};
 use crate::rng::Rng;
 use crate::state::GameState;
 
@@ -148,6 +148,30 @@ impl GameState {
 
         out.debug_check_invariants();
         out
+    }
+
+    /// The multiset of ranks `observer` **cannot place** — the belief feature of
+    /// `DESIGN.md` §5.
+    ///
+    /// A rank is counted once for every copy that could be sitting in a face-down card the
+    /// observer cannot read, the opponent's hand, an unknown pile position, or the
+    /// removed-unseen pool. It is exactly the bag [`GameState::determinize`] deals from, so
+    /// the encoder and the sampler can never disagree about what is unknown — and it is a
+    /// function of the observer's information set for the same reason determinization is.
+    ///
+    /// `game_rules.md` §2: these counts never reach zero uncertainty, because the ten cards
+    /// removed at setup stay indistinguishable from cards in a hand or a base slot. §9b is
+    /// the exception: there the removed multiset is public, so it is subtracted out.
+    pub fn unseen_counts(&self, observer: Player) -> RankCounts {
+        let dealt = self.card_census() == self.expected_card_count();
+        let mut counts: RankCounts = [0; Rank::COUNT];
+        for pool in 0..self.pool_count() {
+            let (bag, _) = self.hidden_pool(observer, pool, dealt);
+            for rank in bag {
+                counts[rank.index()] += 1;
+            }
+        }
+        counts
     }
 
     /// How many independent deck pools this variant has: one shared deck, or one per player.

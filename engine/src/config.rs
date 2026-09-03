@@ -131,6 +131,24 @@ pub struct GameConfig {
     /// and Phase 1 reports the occupancy actually observed, so Phase 3 can pick a tight
     /// encoding bound from evidence instead of a guess.
     pub max_slots_per_side: usize,
+    /// Slots per side per lane that the **neural-network encoder** reserves.
+    ///
+    /// Separate from [`GameConfig::max_slots_per_side`], and deliberately much smaller.
+    /// That field is the engine's legality assertion and is set to a value the game cannot
+    /// reach; this one sizes a fixed-shape tensor, so it has to be a bet about what play
+    /// actually produces.
+    ///
+    /// `FINDINGS.md` F2.7 is the authority for the default of **16**. Random play sprawls
+    /// to 17–20 cards on one side of one lane, but *competent* play tops out at 8–12
+    /// (ISMCTS peaks at 12 over 300 games), because agents that kill things keep lanes
+    /// short. 16 sits above every observed value from a real agent and well under the
+    /// theoretical 21.
+    ///
+    /// The encoder **asserts** rather than truncating: silently dropping a card would
+    /// change the game the network is looking at. F2.7 also asks for the *distribution* to
+    /// be re-measured against the trained agent — not the maximum, which only grows with
+    /// the sample — before this is tightened.
+    pub encoding_slots: usize,
 
     // ---- Deck composition ----
     /// Highest rank index in play, inclusive. 12 (King) in the full game; Duel52-mini uses
@@ -190,6 +208,9 @@ impl GameConfig {
             // their 3 base cards: 34 cards is the most one player can ever have on the
             // table, so one lane can never exceed it.
             max_slots_per_side: 34,
+            // `FINDINGS.md` F2.7. Independent of the variant: the bound is a property of
+            // how agents play, not of the deck.
+            encoding_slots: 16,
             max_rank_index: 12,
             copies_per_rank: 4,
             hand_size: 5,
@@ -334,6 +355,18 @@ impl GameConfig {
         if self.max_slots_per_side == 0 {
             return Err("max_slots_per_side must be at least 1".into());
         }
+        if self.encoding_slots == 0 {
+            return Err("encoding_slots must be at least 1".into());
+        }
+        if self.encoding_slots > self.max_slots_per_side {
+            // Not fatal to the engine, but it means the tensor reserves slots the engine
+            // would already have refused to fill — a sign one of the two was edited alone.
+            return Err(format!(
+                "encoding_slots ({}) exceeds max_slots_per_side ({}), so the encoder \
+                 reserves slots the engine would never allow",
+                self.encoding_slots, self.max_slots_per_side
+            ));
+        }
         Ok(())
     }
 
@@ -390,6 +423,7 @@ impl GameConfig {
                 "lanes" => cfg.lanes = num(k, v)?,
                 "lanes_to_win" => cfg.lanes_to_win = num(k, v)?,
                 "max_slots_per_side" => cfg.max_slots_per_side = num(k, v)?,
+                "encoding_slots" => cfg.encoding_slots = num(k, v)?,
                 "max_rank_index" => cfg.max_rank_index = num(k, v)?,
                 "copies_per_rank" => cfg.copies_per_rank = num(k, v)?,
                 "hand_size" => cfg.hand_size = num(k, v)?,
@@ -416,6 +450,7 @@ impl GameConfig {
              lanes = {}\n\
              lanes_to_win = {}\n\
              max_slots_per_side = {}\n\
+             encoding_slots = {}\n\
              max_rank_index = {}\n\
              copies_per_rank = {}\n\
              hand_size = {}\n\
@@ -431,6 +466,7 @@ impl GameConfig {
             self.lanes,
             self.lanes_to_win,
             self.max_slots_per_side,
+            self.encoding_slots,
             self.max_rank_index,
             self.copies_per_rank,
             self.hand_size,
@@ -520,6 +556,28 @@ mod tests {
     #[test]
     fn unknown_config_keys_are_rejected() {
         assert!(GameConfig::from_config_str("stalemate_quiet_ply = 9\n").is_err());
+    }
+
+    /// `FINDINGS.md` F2.7: 16, above every value competent self-play produced and below
+    /// the theoretical 21. Separate from `max_slots_per_side`, which stays the engine's
+    /// legality assertion — F2.7's saving is the *tensor*, not the rules.
+    #[test]
+    fn finding_2_7_encoding_slots_default_to_sixteen_in_every_variant() {
+        for v in Variant::ALL {
+            let cfg = GameConfig::preset(v);
+            assert_eq!(cfg.encoding_slots, 16);
+            assert!(
+                cfg.encoding_slots < cfg.max_slots_per_side,
+                "the encoding bound must stay strictly under the legality bound"
+            );
+        }
+    }
+
+    #[test]
+    fn encoding_slots_above_the_legality_bound_is_rejected() {
+        let mut cfg = GameConfig::split_deck();
+        cfg.encoding_slots = cfg.max_slots_per_side + 1;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

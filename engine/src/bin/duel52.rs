@@ -383,10 +383,10 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
 /// ladder, which is the comparison worth running if you did not say.
 fn cmd_match(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
-    let a = opts.agent_a.unwrap_or(AgentSpec::Ismcts {
+    let a = opts.agent_a.clone().unwrap_or(AgentSpec::Ismcts {
         iterations: duel52_engine::IsmctsAgent::DEFAULT_ITERATIONS,
     });
-    let b = opts.agent_b.unwrap_or(AgentSpec::Random);
+    let b = opts.agent_b.clone().unwrap_or(AgentSpec::Random);
     let games = opts.games_or(400);
 
     let result = ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads);
@@ -412,8 +412,8 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
         }
         rows.push(ladder::run_match(
             opts.config,
-            *spec,
-            *spec,
+            spec.clone(),
+            spec.clone(),
             opts.seed,
             games,
             opts.threads,
@@ -634,9 +634,10 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let mut state = GameState::new(opts.config, opts.seed);
     let mut bot = opts
         .opponent
+        .as_ref()
         .map(|spec| spec.build(opts.seed ^ 0xBEEF, 99));
 
-    let mode = match opts.opponent {
+    let mode = match &opts.opponent {
         None => "hotseat".to_string(),
         Some(spec) => format!("you are {} vs `{}`", opts.human, spec.name()),
     };

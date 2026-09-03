@@ -39,7 +39,9 @@
 //! | `legal` | Legal-action enumeration (`impl GameState`) |
 //! | `apply` | Powers, combat, and the turn machinery (`impl GameState`) |
 //! | [`display`] | Rendering a board for a specific observer, without leaking |
+//! | [`encode`] | Observation and action tensors, and the layout hashes that pin them |
 //! | [`menu`] | Reshaping the legal-action list into the CLI's pick-a-card-then-act tree |
+//! | [`nn`] | The reference network: weights, checkpoint format, forward pass |
 //! | [`agents`] | The five-rung Phase 2 ladder, and the trait an agent implements |
 //! | [`elo`] | Fitting ratings to a round-robin result table |
 //! | [`ladder`] | Running the round-robin, in parallel |
@@ -74,8 +76,10 @@ pub mod card;
 pub mod config;
 pub mod display;
 pub mod elo;
+pub mod encode;
 pub mod ladder;
 pub mod menu;
+pub mod nn;
 pub mod outcome;
 pub mod player;
 pub mod probe;
@@ -98,6 +102,9 @@ pub use agents::{
 };
 pub use card::{Card, CardId, PairId};
 pub use config::{GameConfig, TwoPower, Variant};
+pub use encode::{
+    action_dim, decode_action, encode_action, encode_observation, legal_mask, obs_dim,
+};
 pub use outcome::{DrawReason, Outcome};
 pub use player::Player;
 pub use rank::{rank_counts, Rank, RankCounts};

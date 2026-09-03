@@ -48,10 +48,14 @@ pub fn run_match(
     let games = games + (games % 2);
     let threads = threads.max(1).min(games.max(1));
 
-    let mut total = MatchStats::empty(config, [a, b]);
+    let mut total = MatchStats::empty(config, [a.clone(), b.clone()]);
     if games == 0 {
         return total;
     }
+    // `AgentSpec` stopped being `Copy` when `NetPolicy` gained a checkpoint path, so the
+    // pair is borrowed into the workers rather than copied into them. Cloning per shard
+    // would be harmless too — this is once per thread, not once per game.
+    let specs = [a, b];
 
     let shards: Vec<(usize, usize)> = (0..threads)
         .map(|t| {
@@ -66,10 +70,11 @@ pub fn run_match(
         let handles: Vec<_> = shards
             .iter()
             .map(|&(lo, hi)| {
+                let specs = &specs;
                 scope.spawn(move || {
-                    let mut shard = MatchStats::empty(config, [a, b]);
+                    let mut shard = MatchStats::empty(config, specs.clone());
                     for g in lo..hi {
-                        shard.absorb(&play_indexed(config, [a, b], first_seed, g), seats(g));
+                        shard.absorb(&play_indexed(config, specs, first_seed, g), seats(g));
                     }
                     shard
                 })
@@ -102,7 +107,7 @@ fn seats(g: usize) -> [usize; 2] {
 /// `2k + 1` are the same deal with the seats swapped.
 fn play_indexed(
     config: GameConfig,
-    agents: [AgentSpec; 2],
+    agents: &[AgentSpec; 2],
     first_seed: u64,
     g: usize,
 ) -> crate::probe::GameStats {
@@ -226,8 +231,8 @@ pub fn run_ladder(
             }
             let m = run_match(
                 config,
-                roster[i],
-                roster[j],
+                roster[i].clone(),
+                roster[j].clone(),
                 first_seed,
                 games_per_pairing,
                 threads,

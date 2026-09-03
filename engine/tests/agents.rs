@@ -24,53 +24,59 @@ use duel52_engine::{
 
 /// Budgets small enough for the `opt-level = 1` test profile. The ladder's real budgets live
 /// in [`AgentSpec::LADDER`]; nothing here is measuring strength, only correctness.
-const TEST_ROSTER: [AgentSpec; 5] = [
-    AgentSpec::Random,
-    AgentSpec::Greedy,
-    AgentSpec::FlatMc { playouts: 24 },
-    AgentSpec::Pimc {
-        worlds: 2,
-        depth: 1,
-    },
-    AgentSpec::Ismcts { iterations: 40 },
-];
-
-/// Walk a random game forward `decisions` decisions and stop wherever that lands — mid-turn,
-/// mid-cascade, anywhere. Returns `None` if the game ended first.
-fn position_after(config: GameConfig, seed: u64, decisions: usize) -> Option<GameState> {
-    let mut state = GameState::new(config, seed);
-    let mut rng = Rng::derive(seed, 0xA55E_7000_0000_0001);
-    for _ in 0..decisions {
-        if state.outcome.is_over() {
-            return None;
-        }
-        let legal = state.legal_actions();
-        let action = *rng.choose(&legal).expect("a running game has actions");
-        state.apply_trusted(action);
-    }
-    if state.outcome.is_over() {
-        None
-    } else {
-        Some(state)
-    }
+///
+/// **Every agent must be in this list.** `PLAN.md` used to claim that adding an agent got it
+/// covered by [`phase2_no_agent_reads_hidden_information`] automatically — it does not, and
+/// never did: that test iterates this roster, not [`AgentSpec::LADDER`]. Adding a rung means
+/// adding it here by hand. `PLAN.md` was corrected when Phase 3's `netpolicy` arrived.
+///
+/// A function rather than a `const` because `netpolicy` names a checkpoint file, which has
+/// to exist before the roster can mention it.
+fn test_roster() -> Vec<AgentSpec> {
+    vec![
+        AgentSpec::Random,
+        AgentSpec::Greedy,
+        AgentSpec::FlatMc { playouts: 24 },
+        AgentSpec::Pimc {
+            worlds: 2,
+            depth: 1,
+        },
+        AgentSpec::Ismcts { iterations: 40 },
+        AgentSpec::NetPolicy {
+            checkpoint: test_checkpoint(),
+        },
+    ]
 }
 
-/// A spread of positions across all three variants, at every stage of a game.
-fn sample_positions() -> Vec<GameState> {
-    let mut out = Vec::new();
-    for variant in Variant::ALL {
-        let config = GameConfig::preset(variant);
-        for seed in 0..12u64 {
-            for depth in [1usize, 7, 23, 60, 110, 180] {
-                if let Some(state) = position_after(config, seed, depth) {
-                    out.push(state);
-                }
-            }
-        }
-    }
-    assert!(out.len() > 100, "the position sample is too thin to prove anything");
-    out
+/// A small random-init checkpoint, written once per test process.
+///
+/// `Weights::random` is what makes this possible without Python in the loop — see
+/// `nn/weights.rs`. A test that needed `maturin develop` first would not run in plain
+/// `cargo test`, and a test that does not run is not a test.
+fn test_checkpoint() -> String {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let config = GameConfig::default();
+        let arch = duel52_engine::nn::Arch {
+            obs_dim: duel52_engine::encode::obs_dim(&config),
+            action_dim: duel52_engine::encode::action_dim(&config),
+            width: 24,
+            blocks: 2,
+            value_hidden: 12,
+        };
+        let path = std::env::temp_dir().join(format!("duel52-roster-{}.d52nn", std::process::id()));
+        duel52_engine::nn::Weights::random(20260903, arch)
+            .save(&path, &config)
+            .expect("write the roster checkpoint");
+        path.display().to_string()
+    })
+    .clone()
 }
+
+// `position_after` and `sample_positions` moved to `tests/common/` when the Phase 3 encoder
+// tests needed the same sample — see `engine/tests/encoding.rs`.
+use common::{position_after, sample_positions};
 
 // ==================================================== determinization ==
 
@@ -322,7 +328,7 @@ fn phase2_no_agent_reads_hidden_information() {
         }
         let world = state.determinize(observer, &mut rng);
 
-        for spec in TEST_ROSTER {
+        for spec in test_roster() {
             let real = spec.build(1234, 7).choose(&state, &legal);
             let sampled = spec.build(1234, 7).choose(&world, &legal);
             assert_eq!(
@@ -382,8 +388,8 @@ fn phase2_the_omniscient_evaluation_does_see_hidden_ranks() {
 fn phase2_every_agent_plays_a_legal_game_to_the_end() {
     for variant in Variant::ALL {
         let config = GameConfig::preset(variant);
-        for spec in TEST_ROSTER {
-            let stats = probe::play_spec_game(config, 3, spec, AgentSpec::Random);
+        for spec in test_roster() {
+            let stats = probe::play_spec_game(config, 3, spec.clone(), AgentSpec::Random);
             assert!(stats.outcome.is_over(), "{spec} in {variant} left a game unfinished");
             assert_ne!(
                 stats.outcome,
@@ -398,10 +404,11 @@ fn phase2_every_agent_plays_a_legal_game_to_the_end() {
 /// game." That has to survive the arrival of stateful search agents.
 #[test]
 fn phase2_agent_games_are_reproducible() {
-    for spec in TEST_ROSTER {
+    for spec in test_roster() {
         for seed in [0u64, 11, 909] {
-            let a = probe::play_spec_game(GameConfig::split_deck(), seed, spec, spec);
-            let b = probe::play_spec_game(GameConfig::split_deck(), seed, spec, spec);
+            let cfg = GameConfig::split_deck();
+            let a = probe::play_spec_game(cfg, seed, spec.clone(), spec.clone());
+            let b = probe::play_spec_game(cfg, seed, spec.clone(), spec.clone());
             assert_eq!(a.outcome, b.outcome, "{spec} seed {seed}");
             assert_eq!(a.plies, b.plies, "{spec} seed {seed}");
             assert_eq!(a.decisions, b.decisions, "{spec} seed {seed}");

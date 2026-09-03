@@ -32,6 +32,7 @@ pub mod eval;
 pub mod flat_mc;
 pub mod greedy;
 pub mod ismcts;
+pub mod net_policy;
 pub mod pimc;
 
 use crate::action::Action;
@@ -41,6 +42,7 @@ use crate::state::GameState;
 pub use flat_mc::FlatMcAgent;
 pub use greedy::GreedyAgent;
 pub use ismcts::IsmctsAgent;
+pub use net_policy::NetPolicyAgent;
 pub use pimc::PimcAgent;
 
 /// Something that picks an action.
@@ -146,13 +148,17 @@ pub(crate) fn pick_best(scores: &[f32], rng: &mut Rng) -> usize {
 /// Exists so that the ladder, the `probe` command and `play --opponent` all name agents the
 /// same way, and so a result row in `FINDINGS.md` can be re-run by pasting its agent name
 /// back into the CLI.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Not `Copy`: [`AgentSpec::NetPolicy`] carries a checkpoint path. `Clone` is enough
+/// everywhere — a spec is cloned once per game at most, next to the cost of playing it.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AgentSpec {
     Random,
     Greedy,
     FlatMc { playouts: usize },
     Pimc { worlds: usize, depth: u32 },
     Ismcts { iterations: usize },
+    /// Phase 3's policy-only rung: a checkpoint played by argmax, no search.
+    NetPolicy { checkpoint: String },
 }
 
 impl AgentSpec {
@@ -177,13 +183,19 @@ impl AgentSpec {
     ];
 
     /// Parse `family` or `family:budget`, e.g. `greedy`, `flatmc:600`, `pimc:8x2`,
-    /// `ismcts:1600`.
+    /// `ismcts:1600`, `netpolicy:runs/gen3.d52nn`.
+    ///
+    /// Only the **family** is lowercased. It used to be the whole string, which was
+    /// harmless while every budget was a number — and would silently corrupt a checkpoint
+    /// path the moment `netpolicy:` arrived. A path is taken verbatim, colons included, so
+    /// an absolute Windows-style path survives too.
     pub fn parse(text: &str) -> Result<AgentSpec, String> {
-        let text = text.trim().to_ascii_lowercase();
+        let text = text.trim();
         let (family, budget) = match text.split_once(':') {
-            Some((f, b)) => (f, Some(b)),
-            None => (text.as_str(), None),
+            Some((f, b)) => (f.to_ascii_lowercase(), Some(b)),
+            None => (text.to_ascii_lowercase(), None),
         };
+        let family = family.as_str();
 
         fn number(what: &str, value: &str) -> Result<usize, String> {
             value
@@ -219,20 +231,31 @@ impl AgentSpec {
                     None => IsmctsAgent::DEFAULT_ITERATIONS,
                 },
             }),
+            "netpolicy" | "net" => match budget {
+                Some(path) if !path.trim().is_empty() => Ok(AgentSpec::NetPolicy {
+                    checkpoint: path.to_string(),
+                }),
+                _ => Err(
+                    "netpolicy needs a checkpoint path, e.g. `netpolicy:checkpoints/init.d52nn`"
+                        .to_string(),
+                ),
+            },
             other => Err(format!(
-                "unknown agent `{other}` — expected random, greedy, flatmc, pimc or ismcts"
+                "unknown agent `{other}` — expected random, greedy, flatmc, pimc, ismcts or \
+                 netpolicy"
             )),
         }
     }
 
     /// The name this configuration reports, without building it.
     pub fn name(&self) -> String {
-        match *self {
+        match self {
             AgentSpec::Random => "random".to_string(),
             AgentSpec::Greedy => "greedy".to_string(),
             AgentSpec::FlatMc { playouts } => format!("flatmc:{playouts}"),
             AgentSpec::Pimc { worlds, depth } => format!("pimc:{worlds}x{depth}"),
             AgentSpec::Ismcts { iterations } => format!("ismcts:{iterations}"),
+            AgentSpec::NetPolicy { checkpoint } => format!("netpolicy:{checkpoint}"),
         }
     }
 
@@ -244,18 +267,22 @@ impl AgentSpec {
     /// [`Rng`], so both hold trivially; an agent that needed interior mutability would have
     /// to use a lock rather than a `RefCell`, which is the right trade for this project.
     pub fn build(&self, seed: u64, stream: u64) -> Box<dyn Agent + Send + Sync> {
-        match *self {
+        match self {
             AgentSpec::Random => Box::new(RandomAgent::derived(seed, stream)),
             AgentSpec::Greedy => Box::new(GreedyAgent::derived(seed, stream)),
             AgentSpec::FlatMc { playouts } => {
-                Box::new(FlatMcAgent::derived(seed, stream, playouts))
+                Box::new(FlatMcAgent::derived(seed, stream, *playouts))
             }
             AgentSpec::Pimc { worlds, depth } => {
-                Box::new(PimcAgent::derived(seed, stream, worlds, depth))
+                Box::new(PimcAgent::derived(seed, stream, *worlds, *depth))
             }
             AgentSpec::Ismcts { iterations } => {
-                Box::new(IsmctsAgent::derived(seed, stream, iterations))
+                Box::new(IsmctsAgent::derived(seed, stream, *iterations))
             }
+            // No seed: the policy is played by argmax, so it consumes no randomness. The
+            // checkpoint is read on the first decision, once per process — see
+            // `net_policy::load_cached`.
+            AgentSpec::NetPolicy { checkpoint } => Box::new(NetPolicyAgent::new(checkpoint)),
         }
     }
 }
