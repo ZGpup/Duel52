@@ -36,9 +36,16 @@ Canonical, engine-side:
   rather than silently truncating).
   - This started at 8, which `FINDINGS.md` F1.7 rejected on random-play evidence (20 cards on
     one side) and F2.7 then partly restored: competent self-play peaks at 8–12, and it is
-    *random* play that sprawls. 16 sits above every value any agent has produced and well
-    under the theoretical 21. Re-measure the **distribution** — not the maximum, which only
-    grows with the sample — against the Phase 3 agent before tightening it.
+    *random* play that sprawls. 16 sits above every value any agent has produced **in
+    self-play** and well under the theoretical 21. Re-measure the **distribution** — not the
+    maximum, which only grows with the sample — against the Phase 3 agent before tightening
+    it. `encode::observed_max_slots()` is the running high-water mark for that.
+  - **`FINDINGS.md` F3.1 is the caveat that matters**: sprawl is set by the *weakest* agent
+    in a pairing, and F2.7 measured self-play only. A net played against `random` reaches
+    13–17, so 16 sits *inside* that distribution rather than above it, and the ladder — which
+    keeps `random` as its permanent anchor rung — asserts. Self-play stays at 10. The encoding
+    bound is now two separate questions: what self-play needs, and what the *evaluation
+    ladder* needs.
 - **Card instance**: `rank` (0–12), `face_up`, `is_base`, `entered_as_base`, `damage`,
   `frozen_until_turn`, `attacks_used`, `attack_allowance`, `pair_id`.
   - `is_base` vs `entered_as_base`: a Queen-moved base card stops being a base card but
@@ -69,18 +76,50 @@ Each of the three per-turn actions is its own decision node. Sub-choices opened 
 are **separate decision nodes that cost no action**. This keeps the branching factor in the
 tens rather than the thousands, and is the single most important encoding decision.
 
-Fixed policy head, legality-masked, phase-conditioned:
+Fixed policy head, legality-masked, phase-conditioned. `L = 3` lanes, `S = 16` slots
+(`config.encoding_slots`), `R = 13` ranks — everything is derived from config, so
+Duel52-mini shrinks the head rather than misaligning it:
 
-| Action | Count | Encoding note |
-|---|---|---|
-| `PLAY(rank, lane)` | 13 × 3 = 39 | Hand is a multiset; rank is the correct key. |
-| `FLIP(rank, lane)` | 13 × 3 = 39 | Your played face-down cards are known to you by rank; same-rank duplicates are interchangeable. |
-| `FLIP_UNKNOWN(lane, slot)` | 3 × 8 = 24 | Face-down cards whose rank the *owner* does not know, so they cannot be rank-keyed: the base card in its own slot, plus any Queen-moved base card now sitting in a normal slot. |
-| `ATTACK(lane, atk_slot, tgt_slot)` | 3 × 8 × 8 = 192 | Slot-indexed: opposing face-down targets have no known rank. |
-| `PAIR(lane, rank)` | 39 | A pair requires two same-rank face-up cards, both known. |
-| `PASS` | 1 | Forfeit remaining actions. |
-| **Sub-choices** | 61 | `CHOOSE_SLOT` (3 × 2 × 8 = 48) for a 4's peek, a Queen's move source, a 10's second target, and 5/King resolution ordering; `CHOOSE_RANK` (13) for the card a 2 bottoms (or discards, under `two_power: discard`). |
-| **Total** | **395** | |
+| block | formula | S=16 | engine `Action` |
+|---|---|---:|---|
+| `PLAY(rank, lane)` | `R·L` | 39 | `Play { rank, lane }` |
+| `FLIP(lane, slot)` | `L·S` | 48 | `Flip { lane, slot }` — subsumes the old `FLIP_UNKNOWN` |
+| `ATTACK(lane, atk, tgt)` | `L·S·S` | 768 | `Attack { lane, attacker, target }` |
+| `PAIR(lane, a<b)` | `L·S(S−1)/2` | 360 | `DeclarePair { lane, slot_a, slot_b }` |
+| `PASS` | 1 | 1 | `Pass` |
+| `CHOOSE_SLOT(side, lane, slot)` | `2·L·S` | 96 | `Peek` / `ResolveNext` / `MoveHere` / `SplitTarget` |
+| `CHOOSE_RANK(rank)` | `R` | 13 | `GiveBack { rank }` |
+| **total** | | **1325** | |
+
+Implemented in `engine/src/encode.rs`.
+
+**Why this replaced the rank-keyed table (2026-09-03).** The original head keyed `FLIP` and
+`PAIR` by rank, on the reasoning that same-rank cards are interchangeable to the player
+choosing. They are not, and `engine/src/action.rs`'s module header already said so:
+
+- `FLIP(rank, lane)` cannot separate two same-rank face-down cards carrying different
+  damage — and face-down cards do take damage (`game_rules.md` §5).
+- `PAIR(lane, rank)` cannot express *which two* of three same-rank cards you pair, and the
+  choice matters because they differ in damage and attack budget.
+
+That is not only a strength question. In an AlphaZero loop the policy target is the visit
+distribution over engine actions; two distinct actions sharing a logit force an invented
+rule for folding their visits and another for which one to actually play. Both are
+arbitrary, and both distort the policy Phase 4 is supposed to read. The head is exact and
+slot-keyed instead, and `phase3_action_encoding_round_trips` asserts injectivity over the
+legal set.
+
+`CHOOSE_SLOT` **is** shared, across four sub-decisions, and that is safe for a reason the
+rank keying did not have: `Foresight`, `ResolveOrder`, `QueenSource` and `SplitTarget` are
+mutually exclusive phases, so the mask disambiguates and no two of them can collide. Sharing
+`FLIP` or `PAIR` was unsafe precisely because those collide inside a single phase.
+
+Two consequences: `SplitTarget` carries no lane (it comes from the attack in flight), so
+**encode and decode both take the state**; and `DeclarePair` is unordered, so the index is
+canonicalised to `slot_a < slot_b` — `legal.rs` already emits only that order, pinned by
+`phase3_legal_pairs_are_already_canonical`.
+
+The 8-slot assumption in the old counts is gone; see §3 and `FINDINGS.md` F2.7, F3.1.
 
 Resolution ordering is **adaptive** (`game_rules.md` §8): a 5 that flips four cards is four
 successive `CHOOSE_SLOT` nodes, each chosen after seeing the previous power land — not one
@@ -91,14 +130,28 @@ The observation carries a **phase** field so the head knows which mask applies.
 
 ## 5. Observation encoding
 
-Per-observer, ~1300 floats:
+Per-observer, **3300 floats** at the default configuration. Implemented in
+`engine/src/encode.rs`, which documents the exact layout block by block; the numbers below
+are `config`-derived, so a smaller variant shrinks the tensor rather than misaligning it.
 
-- **Board tensor** — 3 lanes × 2 sides × 8 slots × ~25 features: occupancy, rank one-hot
-  (13, zeroed when unknown to this observer), `rank_unknown`, `face_up`, `is_base`,
-  damage one-hot, max-HP, `frozen`, `attacked_this_turn`, `paired`, `is_mine`.
-- **Scalars** — actions remaining, turn index, own hand rank counts (13), opponent hand
-  size, draw pile size(s), discard rank counts (13), `base_unlocked`, first-player flag,
-  quiet-turn counter.
+This used to read "~1300 floats", which silently assumed §3's abandoned 8-slot board. At 16
+slots the board block alone is 3168 floats — the size is dominated by `lanes × sides × slots
+× features`, so it tracks `encoding_slots` almost linearly. See `FINDINGS.md` F3.1 for what
+that bound actually has to survive.
+
+- **Board tensor** — 3 lanes × 2 sides × 16 slots × 33 features = 3168. Sides are ordered
+  `[observer, opponent]`, so the tensor is always from the observer's point of view and the
+  network never learns a seat convention. Per slot: `occupied`, rank one-hot (13, **all
+  zero** when unknown to this observer), `rank_unknown`, `face_up`, `is_base`,
+  `entered_as_base`, damage one-hot (4), max-HP one-hot (2), `frozen`, attack-allowance
+  one-hot (4), `attacks_used / allowance`, `can_attack_now`, `paired`, `is_mine`.
+- **Scalars** — 132 floats: phase one-hot (7), actions-remaining one-hot (4),
+  `is_mine_to_move`, `ply / max_plies`, `quiet_plies / stalemate_quiet_plies`,
+  `base_unlocked`, `observer_is_first_player`, lanes won per player, own hand rank counts
+  (13), both hand sizes, both pile sizes, `shared_pile`, discard rank counts for both
+  players (26), the belief and bottomed-card features below, and per-lane derived counts
+  (12 — cheap, and it saves a dense MLP from rediscovering that slot indices within one lane
+  belong together).
 - **Belief features** — unseen-card rank counts from this observer's perspective. Note
   these **never reach zero uncertainty**: the 10 removed cards are permanently
   indistinguishable from cards in the opponent's hand or base. Encode the removed-pool size
@@ -122,8 +175,21 @@ the sampling side.
 Foresight knowledge is folded into the board tensor: a card whose rank this observer knows
 gets its real one-hot; everything else gets `rank_unknown`.
 
-**Network**: 4–6 residual MLP blocks, width 512. Policy head (374 logits) + value head
-(scalar, tanh). Upgrade to slot-wise attention only if the MLP plateaus — measure first.
+**Network**: pre-norm residual MLP, **5 blocks, width 512**, LayerNorm `eps = 1e-5` with
+elementwise affine. Policy head returns **1325 raw logits** — masking and softmax are the
+caller's job, because PUCT needs the masked distribution anyway and a masked softmax inside
+the network would have to be mirrored exactly in the Rust forward pass for the parity test
+to mean anything. Value head is `tanh` over a 256-wide hidden layer. ≈5.1M parameters,
+~20 MB fp32. `blocks`, `width` and `value_hidden` come from config on both sides and travel
+in the checkpoint header. Upgrade to slot-wise attention only if the MLP plateaus — measure
+first.
+
+> **Corrected 2026-09-03.** This line said "374 logits" while §4's own table totalled 395,
+> and neither number was ever right — nothing in the engine produced 374. Both are
+> superseded by §4's 1325. Recording the inconsistency rather than quietly deleting it,
+> because it is the kind of drift the checkpoint's `action_layout_hash` now exists to make
+> impossible: a policy head that disagrees with the encoder does not crash, it just trains
+> badly.
 
 ## 6. Search
 
@@ -180,20 +246,54 @@ Exact exploitability is out of reach for the full game, so:
 - Local self-play (M-series, MPS): a few hundred thousand ISMCTS games over a few days.
 - The handoff config swaps MPS → CUDA and raises worker count. No code changes.
 
-## 9. Repo layout (planned)
+## 9. Repo layout, and where inference runs
 
 ```
 duel52/
-  engine/          Rust crate — rules, legality, ISMCTS-friendly determinization
-    src/
+  engine/          Rust crate — rules, legality, determinization, encoders, inference
+    src/encode.rs  observation + action tensors, and the layout hashes that pin them
+    src/nn/        weights, the .d52nn checkpoint format, the reference forward pass
     tests/         one named test per ruling in game_rules.md
+  bindings/        PyO3 wrapper
   py/
-    duel52/        PyO3 bindings + gym-ish wrapper
+    duel52/        the Python package
+    duel52/nn/     the PyTorch model, and checkpoint read/write
     train/         AZ self-play loop, R-NaD (later)
     analyze/       Phase 4 insight extraction
   configs/         variant + training configs (base / split / mirrored)
   openspiel/       Duel52-mini game registration
 ```
+
+### Search and inference in Rust, training in Python
+
+This section originally implied the training loop would own the network and reach the engine
+through PyO3. **Reversed in Phase 3, for one decisive reason:** Phase 3's deliverable is an
+Elo table, and that table is produced by `duel52 ladder`, which is Rust and takes an
+`AgentSpec`. So are `match`, `probe` and `play --opponent`, and `FINDINGS.md` F2.4, F2.5,
+F2.7 and F2.8 all explicitly ask Phase 3 to re-run those measurements against the trained
+agent. A Python-side agent could use none of it.
+
+So PyTorch still owns the architecture, the weights and the gradients; Rust gets a frozen
+snapshot and runs forward passes. They meet at a `.d52nn` checkpoint, whose header carries
+FNV-1a hashes of the observation and action layouts. Rust recomputes them from its own
+constants at load and refuses a mismatch. That check is the point: silent layout drift
+between the trained function and the evaluated function does not crash anything — it
+produces an agent that is merely bad, and the natural suspect is the training run.
+
+The `Evaluator` trait (`engine/src/nn/mod.rs`) is **batch-shaped from the start**, even
+though step 1's only consumer evaluates one position at a time. The self-play loop will keep
+`G` games in flight per worker and advance one simulation in each per round, evaluating the
+round as a single batch — no virtual loss, no search distortion, every game still
+reproducible from its own seed. Retrofitting that interface later would touch the whole loop.
+
+### Deferred: the `cli` / `nn` crate split
+
+The reference forward pass is hand-rolled f32 loops in `engine`, which keeps the crate's
+zero-dependency guarantee intact — and a BLAS would work *against* the reason for that
+guarantee, by introducing exactly the accumulation-order variability the project avoids. A
+GPU backend (ONNX Runtime, or `tch`) belongs at the CUDA handoff, in an `nn` crate alongside
+a `cli` crate that depends on `engine`. `Evaluator` is the seam that makes that swap cheap.
+**Known future refactor, deliberately not done now.**
 
 ## 10. Deliberately deferred
 

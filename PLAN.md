@@ -2,8 +2,11 @@
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Current phase: 3 (not started).** Phase 2 is complete: five agents, determinization, a
-frozen Elo ladder and the first strategic measurements are in `FINDINGS.md` F2.
+**Current phase: 3, step 1 complete.** Phase 2 delivered five agents, determinization, a
+frozen Elo ladder and the first strategic measurements (`FINDINGS.md` F2). Phase 3 step 1
+delivered the encoders, the network and the inference path: a randomly-initialised checkpoint
+can be built in Python, loaded in Rust, and played through the existing harness, with a test
+proving the Rust and PyTorch forward passes compute the same function (`FINDINGS.md` F3).
 
 **Still open from Phase 1, and it is the owner's:** the exit criterion. Nobody has played
 the engine yet and confirmed the rules by hand. That is now a better-value hour than it was
@@ -115,6 +118,12 @@ which is a cleaner premise for the belief modeling in Phase 3.
    ranks, because flipping your own base card turns it face-up and killing a face-down card
    sends its rank to the public discard. Even one-ply lookahead has to happen inside a
    sampled world. See `phase2_no_agent_reads_hidden_information`.
+
+   ⚠️ **A new agent is *not* covered automatically.** This document used to claim it was.
+   The test iterates a hardcoded `TEST_ROSTER` in `engine/tests/agents.rs`, not
+   `AgentSpec::LADDER`, so adding a rung means adding it to that roster by hand — corrected
+   when Phase 3's `netpolicy` arrived, which is now in it. The roster's doc comment says so
+   at the point where someone would edit it.
 2. **The legal action set is a function of the information set alone.** Every legality
    predicate reads a face-up rank, a slot position, the mover's own hand, or a global flag —
    never a hidden rank. That is what lets an agent enumerate actions on the real state and
@@ -129,17 +138,65 @@ which is a cleaner premise for the belief modeling in Phase 3.
 
 ---
 
-## Phase 3 — Neural self-play `[ ]`
+## Phase 3 — Neural self-play `[~]`
 
-- [ ] Observation + action encoders (`DESIGN.md` §4–5)
-- [ ] Residual MLP with policy + value heads
-- [ ] AZ-style loop: ISMCTS self-play → replay buffer → train → gated evaluation
+**Step 1 is done** (encoders, network, inference path — see below). Step 2 is net-guided
+search; step 3 is the training loop.
+
+- [x] Observation + action encoders (`DESIGN.md` §4–5) — `engine/src/encode.rs`, 3300 floats
+      and a 1325-logit head, both config-derived. Exposed to Python through
+      `Game.encode_observation` / `legal_mask` / `encode_action` / `decode_action`, with
+      `duel52.encoding_spec()` as the single source of shapes and layout hashes.
+- [x] Residual MLP with policy + value heads — `engine/src/nn/` (the Rust forward pass and
+      the `.d52nn` format) and `py/duel52/nn/` (the PyTorch definition). `test_parity.py`
+      asserts the two compute the same function.
+- [x] `netpolicy:<checkpoint>` as a sixth `AgentSpec`, so a checkpoint plays through the
+      existing `ladder` / `match` / `probe` / `play` harness. **The five Phase 2 rungs and
+      their budgets are untouched.**
+- [ ] Net-guided ISMCTS (PUCT over the policy prior, value in place of rollouts) — step 2
+- [ ] AZ-style loop: ISMCTS self-play → replay buffer → train → gated evaluation — step 3.
+      The buffer stores **trajectories** (`config`, seed, action-index sequence), not encoded
+      tensors: the engine is deterministic, so an encoder version bump costs a CPU replay
+      rather than a discarded corpus. F2.7 and F3.1 both expect the slot bound to move.
 - [ ] Checkpointing, resumability, config-driven throughout
 - [ ] **Duel52-mini** in OpenSpiel; validate the loop against exact CFR before trusting it
       on the full game
 - [ ] Local best-response as the exploitability proxy
 - [ ] **Deliverable:** a trained agent that clearly beats the Phase 2 ladder, with an Elo
       table and an LBR number
+
+**Open before step 3 — the encoding bound.** `FINDINGS.md` F3.1: `encoding_slots = 16`
+survives self-play (max 10) but not a mixed pairing against `random` (13–17), and `random` is
+the ladder's permanent anchor. The default is still 16; step 2 or 3 has to settle whether to
+raise it to the theoretical 21. See the recommendation in F3.1.
+
+### What step 1 turned up that the plan did not anticipate
+
+1. **Sprawl is set by the weakest agent in a pairing, not the strongest.** F2.7 measured
+   self-play and concluded 16 was comfortable. It is — in self-play. Against `random`, which
+   never kills anything, cards accumulate and the same net reaches 17. See F3.1.
+2. **`DESIGN.md` §4's action head was lossy against the engine**, in a way that would have
+   corrupted the policy target rather than merely weakened play. Replaced with an exact
+   slot-keyed encoding; §4 now records why.
+3. **The `first_player` field in `Game.observation()` was mislabelled** — it reported
+   `to_move == P0`, duplicating `to_move` and telling an observer nothing about its own seat.
+   Found because the encoder needed the feature. Now `observer_is_first_player`.
+
+### Decisions step 1 locked, so step 2 does not have to relitigate them
+
+`PHASE3_STEP1.md` carried the reasoning and was folded in here when the step landed. The five
+that constrain later work:
+
+- **Search and inference in Rust, training in Python.** `DESIGN.md` §9 has the argument.
+- **`Evaluator` is batch-shaped**, because self-play will batch across concurrent games — `G`
+  games in flight per worker, one simulation each per round, evaluated together. No virtual
+  loss, no search distortion, every game reproducible from its own seed.
+- **The action head is exact and slot-keyed**, 1325 logits. `DESIGN.md` §4.
+- **The checkpoint is a documented ~100-line binary format**, zero-dependency on both sides,
+  carrying layout hashes. Not ONNX (a C++ dependency for a five-layer MLP), not safetensors
+  (a JSON parser in a crate that has none).
+- **No new crates.** The `cli` / `nn` split waits for the CUDA handoff; `Evaluator` is the
+  seam that makes it cheap.
 
 ---
 

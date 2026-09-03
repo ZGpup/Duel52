@@ -2,8 +2,9 @@
 
 What we actually learn about the game. **This file is the point of the project.**
 
-**Status: Phase 2 measured.** Five agents on a frozen Elo ladder, plus instrumented
-self-play. Six of the eight hypotheses now have data:
+**Status: Phase 2 measured; Phase 3 step 1 built.** Five agents on a frozen Elo ladder, plus
+instrumented self-play. The encoders and the inference path are in (F3), but nothing is
+trained yet, so no hypothesis has moved since Phase 2. Six of the eight have data:
 
 | | verdict | where |
 |---|---|---|
@@ -594,6 +595,79 @@ numbers themselves: mean flip ply is conditioned on the card being flipped at al
 that springs its Trap returns face-up without a `Flip` action, so it is counted in neither
 column — which affects random and ISMCTS identically and so leaves the comparison sound.
 
+### F3 — The Phase 3 encoding path
+
+Step 1 of Phase 3 builds the encoders, the network and the inference path — no training. The
+one result worth recording is about the encoding bound, and it corrects a **methodological**
+mistake in F2.7 rather than its number.
+
+**F3.1 — Lane sprawl is set by the *weakest* agent in a pairing, so a self-play maximum does
+not bound the ladder.**
+
+F2.7 measured the widest lane side across **self-play** and concluded that 16 sat comfortably
+above every competent agent (ISMCTS peaked at 12 over 300 games). It does. But the Phase 3
+deliverable is an Elo ladder, and a ladder is not self-play: it keeps `random` as its
+permanent anchor rung, forever.
+
+| pairing | agent | games | seed | max cards on one side of one lane |
+|---|---|---:|---:|---:|
+| self-play | `netpolicy` (random init, 5.1M) | 100 | 1 | **10** |
+| vs `random` | `netpolicy` (random init, 5.1M, ×4 inits) | 200 each | 1 | 13, 15, 15, 15 |
+| vs `random` | `netpolicy` (random init, 64-wide, ×8 inits) | 200 each | 1 | 14–16 |
+| vs `random` | `netpolicy` (`checkpoints/init.d52nn`, seed 0) | 100 | 1 | **17 — asserts** |
+| self-play (F2.7) | `random` | 300 | — | 17 |
+| self-play (F2.7) | `ismcts:800` | 300 | — | 12 |
+
+Config: `variant=split two_power=bottom`, `encoding_slots=21` except the asserting row, which
+is the default 16. Reproduce the failure exactly with:
+
+```bash
+.venv/bin/python -m duel52.nn init --out checkpoints/init.d52nn
+./target/release/duel52 match --a netpolicy:checkpoints/init.d52nn --b random \
+    --games 100 --seed 1        # panics: lane 2 side P0 holds 17 cards
+```
+
+The mechanism is not subtle once stated: **`random` never kills anything.** It plays cards
+into lanes at the same rate as any agent and removes them at a far lower one, so a lane fills
+up. Two competent agents clear each other's boards and lanes stay short; one competent agent
+against a passive one produces the longest lanes of all, because one side is building and
+neither is demolishing. F2.7 could not see this because every row in its table was a
+*self-play* row.
+
+So the encoding bound is really two questions, and F2.7 answered only the first:
+
+1. **What does self-play need?** 10 here, 12 for ISMCTS in F2.7. 16 is comfortable, and the
+   43% tensor saving F2.7 identified is real.
+2. **What does the evaluation ladder need?** Higher, and not bounded by any measurement of
+   how the *net* plays — it is bounded by how `random` plays, which F1.7 put at 17–20 and
+   which no amount of training will improve.
+
+**Recommendation, not yet applied.** `encoding_slots` should be **21** — the theoretical
+maximum, and the value `max_slots_per_side` already uses, so the encoder provably cannot
+assert. The cost is `obs_dim` 3300 → 4290 (+30%) and `action_dim` 1325 → 2195. That is a real
+cost and it is smaller than the alternative, which is a training or evaluation run that dies
+partway through a ladder. `PHASE3_STEP1.md` §1.1 fixed the default at 16 and said not to
+relitigate it, so **the default is still 16** and this is flagged rather than changed; the
+call belongs to the owner. Both `duel52 --encoding-slots N` and `python -m duel52.nn init
+--encoding-slots N` exist, and the two must match — `encoding_slots` is what fixes `obs_dim`,
+so a mismatch is a refused checkpoint rather than a silent misread.
+
+Caveat on the agent used: a randomly-initialised policy played by argmax is not a trained
+agent and is not competent. It is included here because it is what step 3's *early*
+generations will look like, and because the mechanism above does not depend on the net being
+bad — it depends on `random` being passive. F2.7's instruction stands: re-measure the
+**distribution** against the trained agent, both in self-play and against the anchor rung.
+
+`encode::observed_max_slots()` is a process-wide high-water mark for exactly this, and
+`duel52 nn-dump` reports it.
+
+**F3.2 — Rust and PyTorch agree on the forward pass to well inside the thresholds.** Over 256
+sampled decision nodes from 20 seeded random games, with a 64-wide 3-block network:
+`max |Δlogit| < 1e-3`, `max |Δvalue| < 1e-4`, masked-argmax agreement on every row, and
+masked-softmax total-variation distance `< 1e-4`. Not a strategic finding — a claim that the
+two implementations of `DESIGN.md` §5 are the same function, which is what makes "train in
+Python, evaluate in Rust" safe. `py/tests/test_parity.py`.
+
 ### Learned card values — Phase 3/4
 From the value net and from ablation. F2.9 gives flip *priority* per rank, which is a
 different quantity and should not be quoted as a value table.
@@ -630,6 +704,20 @@ The methodological lesson generalises past this number: **random play is not a c
 upper bound on the shape of real play, it is a different distribution.** F1.7 assumed the
 first. Any Phase 3 sizing decision taken from Phase 1 statistics should be re-derived from
 F2.7's table instead.
+
+### F2.7 measured the wrong pairing (corrected by F3.1)
+
+The number was right and the experiment was not general enough. F2.7's table is entirely
+**self-play** rows, and it drew a conclusion about the encoding bound — a bound that has to
+hold everywhere the encoder runs, which includes the Elo ladder, which includes `random`.
+Sprawl turns out to be set by the *weakest* agent in a pairing, because `random` never kills
+anything, so a competent agent against `random` produces longer lanes than either produces
+against itself. 16 survives self-play and does not survive the ladder.
+
+The lesson is a sibling of F1.7's rather than a repeat: F1.7 measured the wrong *agent*, F2.7
+measured the wrong *pairing*. Both times the failure was assuming one distribution stood in
+for another. A bound that must hold under all conditions has to be measured under the
+condition that stresses it, not the condition that is most interesting.
 
 ### "More determinizations" is not a knob (F2.3)
 

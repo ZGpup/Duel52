@@ -399,8 +399,8 @@ impl<'a> Writer<'a> {
     }
     /// Per-rank counts, normalised by the copies of each rank the deck holds.
     fn counts(&mut self, counts: &[u8], width: usize, scale: f32) {
-        for i in 0..width {
-            self.push(counts[i] as f32 / scale);
+        for &n in &counts[..width] {
+            self.push(n as f32 / scale);
         }
     }
     fn written(&self) -> usize {

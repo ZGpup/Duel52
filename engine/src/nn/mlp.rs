@@ -154,9 +154,11 @@ impl MlpEvaluator {
             &mut scratch.v,
         );
         relu(&mut scratch.v);
+        // The final row is a single dot product, so it is written out rather than routed
+        // through `matvec` for a one-element output — same ascending order either way.
         let mut acc = w[i.value2_b][0];
-        for j in 0..arch.value_hidden {
-            acc += w[i.value2_w][j] * scratch.v[j];
+        for (&wj, &vj) in w[i.value2_w].iter().zip(scratch.v.iter()) {
+            acc += wj * vj;
         }
         acc.tanh()
     }
@@ -221,8 +223,11 @@ fn matvec(w: &[f32], bias: &[f32], x: &[f32], in_dim: usize, out: &mut [f32]) {
     for (i, o) in out.iter_mut().enumerate() {
         let row = &w[i * in_dim..(i + 1) * in_dim];
         let mut acc = bias[i];
-        for j in 0..in_dim {
-            acc += row[j] * x[j];
+        // Ascending `j`, one term at a time. `zip` rather than an index because it is
+        // clearer, not because it is faster — the *order* is the contract here, and any
+        // rewrite must preserve it.
+        for (&wj, &xj) in row.iter().zip(x.iter()) {
+            acc += wj * xj;
         }
         *o = acc;
     }

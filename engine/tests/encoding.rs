@@ -206,8 +206,10 @@ fn phase3_the_board_block_is_written_from_the_observers_side() {
 /// to turn (`FINDINGS.md` F2.7).
 #[test]
 fn phase3_encoding_slot_bound_asserts() {
-    let mut config = GameConfig::default();
-    config.encoding_slots = 4;
+    let config = GameConfig {
+        encoding_slots: 4,
+        ..GameConfig::default()
+    };
     let mut position = Position::new(config);
     for _ in 0..5 {
         position.face_up(0, Player::P0, Rank::SEVEN);

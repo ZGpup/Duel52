@@ -630,7 +630,7 @@ fn cmd_nn_dump(args: &[String]) -> Result<(), String> {
     for g in 0..games {
         let seed = opts.seed + g as u64;
         let mut state = GameState::new(opts.config, seed);
-        let mut rng = duel52_engine::Rng::derive(seed, 0xD0_9E_0000_0000_0001);
+        let mut rng = duel52_engine::Rng::derive(seed, 0xD09E_0000_0000_0001);
         while !state.outcome.is_over() {
             if seen % stride == 0 && rows < max_rows {
                 duel52_engine::encode::encode_observation(
@@ -721,7 +721,7 @@ fn cmd_nn_dump(args: &[String]) -> Result<(), String> {
 /// uses, so the two passes agree exactly.
 fn count_decisions(config: GameConfig, seed: u64) -> usize {
     let mut state = GameState::new(config, seed);
-    let mut rng = duel52_engine::Rng::derive(seed, 0xD0_9E_0000_0000_0001);
+    let mut rng = duel52_engine::Rng::derive(seed, 0xD09E_0000_0000_0001);
     let mut n = 0;
     while !state.outcome.is_over() {
         n += 1;

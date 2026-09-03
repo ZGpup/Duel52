@@ -10,11 +10,17 @@ analysis for this game. The agent is the instrument. The insight is the delivera
 
 ## Status
 
-**Phase 2 complete.** The engine plays the full game to spec, with 228 Rust tests named after
-the rule sections they check, 43 Python tests, PyO3 bindings, and a text CLI. On top of it
-there is now a frozen five-rung Elo ladder — random, greedy, flat Monte Carlo, PIMC and
-SO-ISMCTS — built on determinization, so every search agent reasons from its own information
-set rather than from the engine's ground truth. Next is Phase 3: neural self-play.
+**Phase 2 complete; Phase 3 step 1 in.** The engine plays the full game to spec, with 268
+Rust tests named after the rule sections they check, 64 Python tests, PyO3 bindings, and a
+text CLI. On top of it there is a frozen five-rung Elo ladder — random, greedy, flat Monte
+Carlo, PIMC and SO-ISMCTS — built on determinization, so every search agent reasons from its
+own information set rather than from the engine's ground truth.
+
+Phase 3 has started. The observation and action encoders, a residual MLP, and the checkpoint
+format that joins them are in: a network is defined and trained in PyTorch, and evaluated in
+Rust, so a checkpoint plays through the same `ladder` / `match` / `probe` harness every other
+agent uses. A test asserts the two forward passes compute the same function. Nothing is
+trained yet — that is step 3.
 
 ## Try it
 
@@ -26,6 +32,12 @@ cargo build --release
 ./target/release/duel52 stats --all                   # the Phase 1 numbers
 ./target/release/duel52 ladder --games 400            # the Phase 2 Elo table
 ./target/release/duel52 probe  --games 400            # how each agent actually plays
+
+# Phase 3: build a network in Python, play it in Rust. The two --encoding-slots must
+# match; 21 rather than the default 16 because of FINDINGS.md F3.1.
+.venv/bin/python -m duel52.nn init --out checkpoints/init.d52nn --encoding-slots 21
+./target/release/duel52 match --a netpolicy:checkpoints/init.d52nn --b random \
+    --games 100 --encoding-slots 21
 ```
 
 Every prompt names the rule it is applying, so if the engine does something that looks
@@ -95,8 +107,10 @@ text CLI to play against. Ends with random vs random statistics.
 rollouts, on determinized worlds. Frozen as a permanent Elo ladder, plus instrumented
 self-play for the first strategic measurements.
 
-**Phase 3: Neural self-play.** AlphaZero style loop using information set MCTS, validated
-against exact CFR on a scaled down variant before being trusted on the full game.
+**Phase 3: Neural self-play.** 🚧 AlphaZero style loop using information set MCTS, validated
+against exact CFR on a scaled down variant before being trusted on the full game. Step 1 —
+encoders, network, and the inference path — is done; net-guided search and the training loop
+are next.
 
 **Phase 4: Extract the insight.** Learned card values, opening frequencies, flip timing,
 lane commitment, and first player advantage with error bars.

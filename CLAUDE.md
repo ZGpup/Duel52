@@ -59,7 +59,8 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 228 tests: rules, determinism, information hiding
+cargo test                               # 268 tests: rules, determinism, information hiding,
+                                         # and the Phase 3 encoding path
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
@@ -79,11 +80,24 @@ cargo test                               # 228 tests: rules, determinism, inform
 ./target/release/duel52 match --a ismcts:800 --b pimc:32x1 --games 400
 ./target/release/duel52 probe --games 300 --markdown       # self-play behaviour per rung
 
+# Phase 3 step 1. A checkpoint is written in Python and played in Rust; the header's layout
+# hashes are what stop the two sides drifting apart.
+.venv/bin/python -m duel52.nn init --out checkpoints/init.d52nn
+.venv/bin/python -m duel52.nn inspect checkpoints/init.d52nn      # header + compatibility
+./target/release/duel52 match --a netpolicy:checkpoints/init.d52nn --b random --games 100
+./target/release/duel52 nn-dump --checkpoint checkpoints/init.d52nn \
+    --games 20 --seed 1 --out /tmp/parity.bin                     # feeds test_parity.py
+
 # Python. Needs a venv; `maturin develop` drops the extension into py/duel52/.
-python3 -m venv .venv && .venv/bin/pip install -q maturin pytest
+python3 -m venv .venv && .venv/bin/pip install -q maturin pytest torch numpy
 .venv/bin/maturin develop --release
 .venv/bin/python -m pytest py/tests -q
 ```
+
+⚠️ `encoding_slots` defaults to **16** and the encoder **asserts** rather than truncating.
+A `netpolicy` checkpoint played against `random` can exceed it — see `FINDINGS.md` F3.1.
+Add `--encoding-slots 21` to both the `init` and the `duel52` command if you hit it; the two
+must match, because `encoding_slots` is what fixes `obs_dim`.
 
 Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
 `split-raw-two.toml` (the control for the §10a house rule).
@@ -100,11 +114,14 @@ Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.t
 | `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and slots are numbered from 1 |
 | `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's pick-a-card-then-act tree |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
-| `engine/src/agents/` | The five ladder rungs, and the hand-written evaluation in `eval.rs` |
+| `engine/src/encode.rs` | Observation and action tensors, and the layout hashes that pin them |
+| `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass |
+| `engine/src/agents/` | The five ladder rungs plus `netpolicy`, and the evaluation in `eval.rs` |
 | `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit |
 | `engine/src/probe.rs` | Instrumented play — where the Phase 2 findings come from |
 | `engine/tests/` | One named test per ruling, named for its rule section |
 | `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
+| `py/duel52/nn/` | The PyTorch model and checkpoint I/O. **Never an encoder** — see below |
 
 Three structural points that are easy to undo by accident:
 
@@ -115,8 +132,12 @@ Three structural points that are easy to undo by accident:
   as the real one, so an honest agent must return the same action from either. This is not
   only about search — it caught the *greedy* agent, because applying a candidate action to
   the real state reveals ranks (flipping your own base card, killing a face-down card into
-  the public discard). If you add an agent, that test covers it automatically; if it fails,
-  the agent is cheating, not the test.
+  the public discard). If it fails, the agent is cheating, not the test.
+  **Adding an agent does not enrol it automatically** — the test iterates the hardcoded
+  `TEST_ROSTER` in `engine/tests/agents.rs`, so a new rung has to be added there by hand.
+  The Phase 3 encoder has the same obligation and its own version of the test:
+  `phase3_observation_is_a_function_of_the_information_set`, which asserts the observation
+  tensor is bit-identical between a state and a determinized world.
 
 - **Sub-decisions are separate zero-cost decision nodes on a stack** (`DESIGN.md` §4). A 5
   that flips a King that re-empowers the lane resolves correctly because of this. Collapsing
@@ -124,3 +145,11 @@ Three structural points that are easy to undo by accident:
   ordering.
 - **Cards are tracked by `CardId`, never by slot.** Slots compact on death and shift when a
   Queen moves a card, so anything remembered across a resolution step holds ids.
+
+- **There is exactly one encoder, and it is in Rust.** `engine/src/encode.rs` owns the
+  feature layout; Python reaches it through `Game.encode_observation()` and gets its
+  dimensions and layout hashes from `duel52.encoding_spec()`. A second copy of the layout in
+  Python would let the trained function and the evaluated function drift apart *silently* —
+  nothing crashes, the agent is merely bad, and the natural suspect is the training run. The
+  checkpoint header carries both layout hashes and `Weights::load` refuses a mismatch, which
+  turns that into a one-line error. Never compute a layout hash outside `encode.rs`.
