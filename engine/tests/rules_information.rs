@@ -158,23 +158,30 @@ fn rule_5_a_peeked_card_renders_only_to_the_peeker() {
 /// §5: "**Damage is public**, including on face-down cards — a damaged card is turned
 /// sideways, which both players can see. So 'face-down and damaged' is a visible state."
 ///
-/// But the *rank* must not leak with it: printing "1/3 hp" on a face-down card would
-/// announce a Jack, since only a Jack has 3 HP.
+/// Hit points are public too, and safely so: every face-down card is a blank 2-HP card
+/// whatever its rank, so "1/2 hp" on a face-down card says nothing about what it is. A
+/// face-down Jack and a face-down 4 render identically.
 #[test]
-fn rule_5_damage_is_public_but_max_hp_is_not_shown_for_an_unknown_card() {
-    let mut p = Position::empty();
-    p.face_down(0, P1, Rank::JACK);
-    p.damage(0, P1, 0, 1);
-    let s = p.build();
+fn rule_5_damage_and_hit_points_are_both_public_and_neither_reveals_a_rank() {
+    let mut jack_pos = Position::empty();
+    jack_pos.face_down(0, P1, Rank::JACK);
+    jack_pos.damage(0, P1, 0, 1);
+    let jack_state = jack_pos.build();
 
-    let text = render(&s, Some(P0));
-    assert!(text.contains("dmg1"), "the damage is visible\n{text}");
-    assert!(
-        !text.contains("hp"),
-        "but never the hit points, which would reveal the Jack\n{text}"
+    let mut four_pos = Position::empty();
+    four_pos.face_down(0, P1, Rank::FOUR);
+    four_pos.damage(0, P1, 0, 1);
+    let four_state = four_pos.build();
+
+    let jack_text = render(&jack_state, Some(P0));
+    assert!(jack_text.contains("1/2hp"), "the damage is visible\n{jack_text}");
+    assert_eq!(
+        jack_text,
+        render(&four_state, Some(P0)),
+        "a damaged face-down Jack must be indistinguishable from a damaged face-down 4"
     );
 
-    // A face-up card publishes both, because its rank is public anyway.
+    // Flipped, the Jack's ceiling rises and the board says so — its rank is public now.
     let mut p = Position::empty();
     p.face_up(0, P1, Rank::JACK);
     p.damage(0, P1, 0, 1);

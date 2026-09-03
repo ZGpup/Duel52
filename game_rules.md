@@ -112,6 +112,21 @@ There is **no hand-size limit**. **[RULING]**
 ## 5. Combat, damage, and pairs
 
 - Every card has **2 hit points**, except the Jack, which has **3**. **[RAW]**
+- **A face-down card is a blank 2-HP card, whatever its rank.** **[RULING]** The Jack's
+  third hit point arrives when it is flipped, exactly as its Taunt does — face-down, it
+  dies to two hits like anything else. Hit points are not an exception to "powers are inert
+  while face-down" (§6); they follow the same line.
+  - This is load-bearing for hidden information, not a detail. Damage is **public** (see
+    below), so if a face-down Jack really had 3 HP, watching a face-down card survive two
+    hits would identify it as the Jack — for free, to both players. The blank-card rule
+    removes that leak: attacking a face-down card can never tell you what it is.
+  - **Damage persists through the flip** and the ceiling rises with it: a face-down Jack on
+    1 damage becomes a face-up Jack on **2 of 3** hit points. Nothing ever turns a card
+    face-down again (§7), so a card can never be retroactively killed by losing hit points
+    it had already spent.
+  - Everything that keys on a target *being a Jack* therefore reads the **live power**, not
+    the bare rank: the Taunt, the 10's blocked split, and the 9's double damage all agree.
+    A 9 attacking a face-down Jack deals its ordinary **1**.
 - A normal attack deals **1 damage**. A damaged card is turned sideways but remains fully
   functional — powers, attacks, everything. **[RAW]**
 - A card that has taken damage equal to its hit points is **killed** and goes to the
@@ -194,9 +209,9 @@ active while the card is face-up.
 | **6** | Freeze | one-shot | **All enemy cards in the lane are frozen**: they may not attack, and **cannot be flipped at all** — not by themselves, and not by an enemy or allied 5. **Cannot freeze a 9**, ever, including a 9 already in the lane when the 6 resolves. **[RAW]** + **[RULING]** Cards that enter the lane *after* the 6 resolves are **not** frozen. **[RULING]** A frozen card can still be **reactivated by a King**, since reactivation is not a flip. **[RULING]** Duration and Queen moves: see §8. |
 | **7** | Heal All | one-shot | **Heal all your damaged cards 2 HP**, in all lanes, face-up and face-down. **[RAW]** Includes base cards **once the draw pile is empty**. **[RULING]** Healing is capped at the card's maximum HP — a Jack on 1 HP heals to 3, not 5. **[RULING]** |
 | **8** | Retaliate | constant | Any card that attacks this 8 **takes 1 damage** — except a 9. **[RAW]** A pair attacking an 8: both members take 1. **[RULING]** Retaliate fires **even when the attack kills the 8**. **[RULING]** |
-| **9** | Nimble | constant | Cannot be frozen by a 6. Takes no damage when attacking an 8. Blocks a 10's twinstrike from splitting (see 10). **Deals 2 damage to Jacks.** **[RAW]** |
+| **9** | Nimble | constant | Cannot be frozen by a 6. Takes no damage when attacking an 8. Blocks a 10's twinstrike from splitting (see 10). **Deals 2 damage to Jacks** — to *face-up* Jacks; a face-down card is a blank 2-HP card with no Taunt to punish, so a 9 deals it the ordinary 1 (§5). **[RAW]** + **[RULING]** |
 | **10** | Twinstrike | constant | When attacking, deals **1 damage each to two cards** in the opposing lane. **If an intended target is a 9 or a Jack, only that card is damaged** — both block the split, but for different reasons. **[RULING]** With **two Jacks**, taunt already confines both halves to Jacks, nothing can leak past, and the 10 deals **1 to each**. With **two 9s** it is still **1 to one 9** — Nimble dodges the spread personally, not positionally. **[RULING]** A pair of 10s splits the pair's 2 as 1 + 1, and keeps it whole at 2 whenever it cannot split (§5). **[RULING]** |
-| **J** | Taunt | constant | **Must be killed before any other card in his lane can be attacked.** Has **3 HP**. **[RAW]** With two Jacks in a lane, the attacker chooses which one to hit. **[RULING]** |
+| **J** | Taunt | constant | **Must be killed before any other card in his lane can be attacked.** Has **3 HP** — face-up. Face-down he is a blank 2-HP card with no taunt (§5), so both halves of the Jack arrive on the flip together. **[RAW]** + **[RULING]** With two Jacks in a lane, the attacker chooses which one to hit. **[RULING]** |
 | **Q** | Move | one-shot | **Move one allied card from another lane into the Queen's lane**, face-down or face-up. The moved card **keeps its damage**, does **not** reactivate its one-shot power, keeps constant powers, and **may attack after the move** if it has not already attacked this turn. **[RAW]** + **[RULING]** Can move a base card **once the draw pile is empty**; a moved base card **becomes a normal card** (§3). **[RULING]** Moving a paired card breaks the pair. **[RULING]** A card may be moved into a lane a Queen was herself just moved into — no restriction. **[RULING]** |
 | **K** | Empower | one-shot | **All your face-up cards in this lane reactivate their powers.** Does **not** affect other Kings. Does **not** affect constant powers (8, 9, 10, J). **[RAW]** |
 
@@ -321,7 +336,8 @@ Nobody commits and the game never ends on its own.
   So the 5 becomes a *committal* card once the pile empties — it forces a reveal you may not
   want, which is a real cost against holding it for the endgame. The sole exception is frozen
   cards, which the 5 cannot touch and simply skips. **[RULING]**
-- A 9 attacking a Jack deals 2 damage in a single attack action.
+- A 9 attacking a **face-up** Jack deals 2 damage in a single attack action. Against a
+  face-down one it deals 1, because a face-down card is blank (§5).
 - Jack taunt applies to *any* attack targeting the lane, including a 10's twinstrike. Against
   a **single** Jack the 10 deals 1 to the Jack only; against **two** Jacks it deals 1 to each,
   because taunt has already confined both halves of the split to Jacks and there is nothing

@@ -33,12 +33,12 @@ Details and provenance in [FINDINGS.md](FINDINGS.md). Random play characterises 
 *tree*, not strategy, so none of this speaks to how the game should be played:
 
 - Games are short and tightly clustered: **45 plies**, median and mean, in every variant.
-- **First-player advantage is real but small** — P0 scores 0.512, about +1.2 points.
+- **First-player advantage is real but small** — P0 scores 0.514, about +1.4 points.
 - **The stalemate rule never fired once in 1.2M games**, because the stall the rules
   describe is strategic and random agents attack constantly. It remains untested.
 - **The house rule for the 2 fixes a real artifact.** Rules-as-written, the 2 discards a
   card from a *shared* pile, which hands the first player half an extra draw per game and
-  +0.9 points of score. Bottoming instead makes it exactly zero. The artifact turns out to
+  +0.8 points of score. Bottoming instead makes it exactly zero. The artifact turns out to
   be about pile *sharing*, so it does not exist in the split-deck variant at all.
 - The mutual-lane-win draw the rules call "astronomically rare" happens in **1 game in
   220** at this level of play. `duel52 demo --seed 86` replays one.

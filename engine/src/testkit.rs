@@ -102,14 +102,17 @@ impl Position {
 
     /// Set a card's damage. Panics if that would already have killed it, because a dead
     /// card in play is exactly the invariant the engine asserts against.
+    ///
+    /// Note the ceiling depends on face-up state: a face-down Jack is a blank 2-HP card
+    /// (`game_rules.md` §5), so 2 damage kills it and only a *face-up* Jack can sit on 2.
     pub fn damage(&mut self, lane: usize, owner: Player, slot: usize, damage: u8) -> &mut Self {
         let card = &mut self.state.lanes[lane].side_mut(owner)[slot];
         assert!(
-            damage < card.rank.max_hp(),
-            "{} damage would kill a {} ({} HP)",
-            damage,
+            damage < card.max_hp(),
+            "{damage} damage would kill a {} {} ({} HP)",
+            if card.face_up { "face-up" } else { "face-down" },
             card.rank,
-            card.rank.max_hp()
+            card.max_hp()
         );
         card.damage = damage;
         self

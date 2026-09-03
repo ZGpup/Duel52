@@ -56,19 +56,25 @@ Three things worth carrying forward, all in `FINDINGS.md` F1:
 3. **The mutual-lane-win draw is reachable, not astronomical** — 0.4–0.5% of random games,
    and the only source of draws at this level of play.
 
-### Three `[ASSUMED]` calls made while implementing
+### Assumptions flagged during implementation, and how they resolved
 
-Per `CLAUDE.md`'s "make a defensible call, document it, flag it". Each is flagged in the
-code and pinned by a named test; none is load-bearing enough to block on, and all three are
-cheap to flip if the owner disagrees.
+Per `CLAUDE.md`'s "make a defensible call, document it, flag it". Three were raised; the
+owner ruled on all three on 2026-09-03. Each is now pinned by a named test.
 
-- **A face-down 9 can be frozen by a 6.** Nimble is a power, and §6 says powers are inert
-  face-down; the rulebook's "cannot freeze a 9, ever" reads as being about *timing* (a 9
-  already in the lane is still immune), not about face-up-ness.
-- **A 9 deals 2 damage to a face-down Jack.** The doubling keys on the target being
-  physically a Jack, as hit points do, rather than on the Jack's taunt being live.
-- **A 10 whose twinstrike hits two 8s takes 1 retaliate from each, and dies.** §6 says "any
-  card that attacks this 8 takes 1 damage" and the 10 attacked both, so the damage adds.
+- **A face-down 9 can be frozen by a 6.** ✅ Confirmed. Nimble is a power, and §6 says
+  powers are inert face-down.
+- **A 9 deals 2 damage to a face-down Jack.** ❌ **Wrong — overturned.** The owner's ruling:
+  *all face-down cards are blank 2-HP cards.* A face-down Jack has 2 hit points, not 3, and
+  a 9 deals it the ordinary 1. The engine now derives hit points from the card's face-up
+  state rather than from its rank, and everything that keys on a target being a Jack reads
+  the live power. Written into `game_rules.md` §5 as a **[RULING]**.
+- **A 10 whose twinstrike hits two 8s takes 1 retaliate from each, and dies.** ✅ Confirmed.
+
+The overturned one was the most consequential of the three, and in the right direction: it
+*removes* an information leak rather than adding one. Under the assumed rule, damage being
+public meant that watching a face-down card survive two hits would identify it as the Jack
+for free. Under the correct rule, attacking a face-down card can never tell you what it is —
+which is a cleaner premise for the belief modeling in Phase 3.
 
 ---
 

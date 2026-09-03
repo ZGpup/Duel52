@@ -130,8 +130,14 @@ def test_observation_hides_base_cards_from_their_owner():
         assert not card["rank_known"]
 
 
-def test_observation_publishes_damage_but_not_the_rank_behind_it():
-    """§5: damage is public even on face-down cards; max HP would give away a Jack."""
+def test_observation_publishes_damage_and_hit_points_without_leaking_a_rank():
+    """§5: damage and hit points are both public, and neither identifies a card.
+
+    Every face-down card is a blank 2-HP card whatever its rank, so publishing max HP is
+    safe — a face-down Jack is indistinguishable from a face-down 4. Rank itself stays
+    hidden.
+    """
+    saw_face_down = False
     for seed in range(30):
         rng = random.Random(seed)
         g = Game(seed=seed)
@@ -139,13 +145,25 @@ def test_observation_publishes_damage_but_not_the_rank_behind_it():
             for observer in ("p0", "p1"):
                 for card in g.observation(observer)["board"]:
                     assert isinstance(card["damage"], int), "damage is always visible"
-                    if not card["rank_known"]:
-                        assert card["rank"] is None
-                        assert card["max_hp"] is None, (
-                            "max HP on an unknown card leaks the Jack"
+                    if not card["face_up"]:
+                        saw_face_down = True
+                        assert card["max_hp"] == 2, (
+                            "a face-down card is a blank 2-HP card whatever its rank"
                         )
+                    if not card["rank_known"]:
+                        assert card["rank"] is None, "the rank itself stays hidden"
             actions = g.legal_actions()
             g.apply_index(rng.randrange(len(actions)))
+    assert saw_face_down
+
+
+def test_a_face_down_jack_reports_two_hit_points_until_it_is_flipped():
+    """The rank is known to its owner, but the hit points are still the blank 2 (§5)."""
+    g = Game(seed=4)
+    # Base cards are face-down; whatever they are, every one reports 2 HP.
+    for card in g.observation("p0")["board"]:
+        assert not card["face_up"]
+        assert card["max_hp"] == 2
 
 
 def test_observation_hides_the_removed_pool_except_in_the_mirrored_variant():

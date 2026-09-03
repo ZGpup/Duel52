@@ -52,6 +52,18 @@ else. In an action-constrained game that is enormous. The 9's "2 damage to Jacks
 precisely because of this. Prediction: Jack tops the learned rank values; the 9's real value
 is mostly its Jack-counter clause.
 
+> **Sharpened by a rules correction (2026-09-03), not yet by data.** A face-down card is a
+> blank 2-HP card (`game_rules.md` §5), so **both** halves of the Jack — the third hit point
+> and the taunt — arrive only on the flip. A face-down Jack is an ordinary body that dies to
+> two hits and protects nothing.
+>
+> That makes H5 a claim about *flipped* Jacks specifically, and it cuts against the
+> hypothesis in a way the original framing missed: extracting the Jack's value requires
+> spending an action to flip him, and flipping announces him to an opponent holding a 9.
+> So the Jack's value is entangled with flip timing (H4) rather than being a flat property
+> of the card. Worth testing whether strong agents hold Jacks face-down as cheap bodies and
+> flip them only to answer a specific threat.
+
 ### H6 — The 7 scales with board commitment
 Heal-all across every lane is a blowout when you have many damaged cards and nearly dead
 otherwise. Prediction: the 7's value has the highest variance of any card, and strong agents
@@ -68,7 +80,7 @@ early), the tempo edge may not compensate. Prediction: near-even, and the split-
 is where we can measure it cleanly.
 
 > **First data point (F1.4): small, and positive rather than negative.** Under random play
-> P0 scores 0.5119 ± 0.0022 in the split variant — a real edge, ~5σ from even, but a
+> P0 scores 0.5139 ± 0.0022 in the split variant — a real edge, ~12σ from even, but a
 > genuinely small one. "Small" holds; "possibly negative" does not, at least here.
 >
 > This is weak evidence for the hypothesis as stated, because H8's reasoning is about
@@ -93,12 +105,12 @@ duel52 stats --all --games 200000 --seed 1 --markdown
 
 | variant | 2's power | games | P0 score (95% CI) | draw | stalemate | mean plies | P0 draw edge | max lane |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| base | bottom | 200000 | 0.5149 ± 0.0022 | 0.4% | 0.0% | 45 | +0.053 | 20 |
-| split | bottom | 200000 | 0.5119 ± 0.0022 | 0.4% | 0.0% | 45 | +0.003 | 19 |
-| mirrored | bottom | 200000 | 0.5149 ± 0.0022 | 0.5% | 0.0% | 45 | −0.000 | 19 |
-| base | discard | 200000 | 0.5242 ± 0.0022 | 0.4% | 0.0% | 44 | +0.522 | 19 |
-| split | discard | 200000 | 0.5138 ± 0.0022 | 0.5% | 0.0% | 44 | +0.000 | 19 |
-| mirrored | discard | 200000 | 0.5168 ± 0.0022 | 0.5% | 0.0% | 44 | +0.000 | 19 |
+| base | bottom | 200000 | 0.5154 ± 0.0022 | 0.4% | 0.0% | 45 | +0.054 | 20 |
+| split | bottom | 200000 | 0.5139 ± 0.0022 | 0.5% | 0.0% | 45 | +0.001 | 19 |
+| mirrored | bottom | 200000 | 0.5148 ± 0.0022 | 0.5% | 0.0% | 45 | −0.001 | 19 |
+| base | discard | 200000 | 0.5232 ± 0.0022 | 0.4% | 0.0% | 43 | +0.523 | 19 |
+| split | discard | 200000 | 0.5147 ± 0.0022 | 0.5% | 0.0% | 44 | +0.000 | 19 |
+| mirrored | discard | 200000 | 0.5166 ± 0.0022 | 0.5% | 0.0% | 44 | +0.000 | 19 |
 
 "P0 draw edge" is the mean number of extra cards P0 drew relative to P1, per game.
 
@@ -121,11 +133,11 @@ lane attacks P1's last card, an 8, and retaliate kills the attacker as the attac
 8. Random play throws away material freely, so this rate should fall sharply with agent
 strength; the point is that the case is reachable and the terminal check has to be total.
 
-**F1.4 — First-player advantage is real but small: P0 scores ≈ 0.512–0.515.** About a
-+1.2 to +1.5 percentage-point edge, ~7σ from even at this sample size, consistent across
-all three variants under the house rule. So the opening turn's missing action does *not*
-compensate for moving first. See H8 below — this is a first data point, not a verdict:
-random play is a poor proxy for whether tempo matters.
+**F1.4 — First-player advantage is real but small: P0 scores ≈ 0.514–0.515.** About a
++1.4 to +1.5 percentage-point edge, ~13σ from even at this sample size, and statistically
+indistinguishable across the three variants under the house rule. So the opening turn's
+missing action does *not* compensate for moving first. See H8 below — this is a first data
+point, not a verdict: random play is a poor proxy for whether tempo matters.
 
 **F1.5 — The `two_power` house rule is vindicated on its own terms, and only in the base
 game.** `game_rules.md` §10a adopted bottoming over discarding on the argument that the RAW
@@ -134,12 +146,12 @@ draw count". Measured directly rather than inferred:
 
 | | base (shared pile) | split / mirrored (own pile) |
 |---|---:|---:|
-| `bottom` (house) | +0.053 | +0.003 / −0.000 |
-| `discard` (RAW) | **+0.522** | +0.000 / +0.000 |
+| `bottom` (house) | +0.054 | +0.001 / −0.001 |
+| `discard` (RAW) | **+0.523** | +0.000 / +0.000 |
 
 The RAW discard hands the first player half an extra card per game in the base variant, ten
-times the structural residual, and it moves P0's score from 0.5149 to 0.5242 (+0.0093,
-≈6σ). The mechanism is exactly as §10a described: P0 draws first from the shared pile, so
+times the structural residual, and it moves P0's score from 0.5154 to 0.5232 (+0.0078,
+≈5σ). The mechanism is exactly as §10a described: P0 draws first from the shared pile, so
 every card the 2 destroys flips the pile's parity against P1. In the split variants you
 discard into your own pile, so there is no shared parity to flip and the effect is exactly
 zero. **The house rule fixes a real artifact, and it is an artifact of pile *sharing*, not

@@ -514,10 +514,12 @@ impl PyGame {
                     c.set_item("face_up", card.face_up)?;
                     c.set_item("is_base", card.is_base)?;
                     c.set_item("entered_as_base", card.entered_as_base)?;
-                    // Damage is public even on face-down cards (§5). Max HP is not
-                    // published for an unknown card, because it would give away a Jack.
+                    // Both are public (§5). Damage is visible on face-down cards because
+                    // the card is turned sideways, and max HP leaks nothing because every
+                    // face-down card is a blank 2-HP card whatever its rank — so a Jack
+                    // cannot be identified by watching it survive.
                     c.set_item("damage", card.damage)?;
-                    c.set_item("max_hp", if known { Some(card.rank.max_hp()) } else { None })?;
+                    c.set_item("max_hp", card.max_hp())?;
                     c.set_item("frozen", card.is_frozen(s.ply))?;
                     c.set_item("attacks_used", card.attacks_used)?;
                     c.set_item("attack_allowance", card.attack_allowance)?;

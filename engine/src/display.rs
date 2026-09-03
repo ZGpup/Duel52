@@ -9,13 +9,15 @@
 //!   you, and the identity/position of a card you bottomed with a 2;
 //! - hidden from **everyone**: base cards, and the cards removed unseen at setup.
 //!
-//! Two details are easy to leak by accident and are handled explicitly below:
+//! One detail is easy to get wrong and is handled explicitly below: **`(?)` must be used
+//! for the owner's own base cards.** Base cards are hidden from their owner too (§3), which
+//! is exactly the fact a careless renderer misses.
 //!
-//! 1. **Never print max HP for a card whose rank the observer does not know.** A face-down
-//!    card on 1 damage shows one damage marker at the table; rendering it as "1/3 hp" would
-//!    announce that it is a Jack.
-//! 2. **`??` must be used for the owner's own base cards.** Base cards are hidden from their
-//!    owner too (§3), which is exactly the fact a careless renderer gets wrong.
+//! Hit points, by contrast, need no filtering at all: §5 makes every face-down card a blank
+//! 2-HP card whatever its rank, so a face-down card's hit points are common knowledge and
+//! printing them reveals nothing. (Were it otherwise — were a face-down Jack really 3 HP —
+//! then rendering "1/3 hp" would announce the Jack, and so would simply watching it survive
+//! two hits, since damage is public.)
 
 use crate::action::{Action, Side};
 use crate::card::Card;
@@ -59,12 +61,9 @@ fn card_token(state: &GameState, card: &Card, observer: Observer) -> String {
         tags.push("ex-base".to_string());
     }
     if card.damage > 0 {
-        if visible {
-            tags.push(format!("{}/{}hp", card.hp_remaining(), card.rank.max_hp()));
-        } else {
-            // Damage is public; max HP would give the rank away. See the module docs.
-            tags.push(format!("dmg{}", card.damage));
-        }
+        // Safe to print for any card: damage is public (§5), and so is max HP, because a
+        // face-down card is always 2 HP regardless of rank. There is nothing to leak.
+        tags.push(format!("{}/{}hp", card.hp_remaining(), card.max_hp()));
     }
     if card.is_frozen(state.ply) {
         tags.push("FROZEN".to_string());
@@ -398,7 +397,7 @@ pub fn describe_action(state: &GameState, action: Action, observer: Observer) ->
                     notes.push("8 retaliates for 1".to_string());
                 }
                 if def.has_live_power(Rank::JACK) {
-                    notes.push("Jack, 3 HP".to_string());
+                    notes.push(format!("Jack, {} HP left of 3", def.hp_remaining()));
                 }
                 if def.has_live_power(Rank::NINE) {
                     notes.push("9 blocks the twinstrike split".to_string());
@@ -503,7 +502,11 @@ pub fn power_reference() -> String {
             rank.power_text()
         ));
     }
-    out.push_str("\nHit points: 2 for every card, 3 for the Jack (face-down too).\n");
+    out.push_str(
+        "\nHit points: every FACE-DOWN card is a blank 2 HP card, whatever its rank. Face-up, \
+         a card has 2 HP — 3 for the Jack. So flipping a Jack raises its ceiling, and a \
+         face-down Jack dies to two hits like anything else.\n",
+    );
     out.push_str(
         "Lane wins need ALL of: opponent's side of the lane empty, every draw pile empty, \
          and the opponent's hand empty. Win two lanes to win.\n",

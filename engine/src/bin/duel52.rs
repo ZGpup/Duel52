@@ -431,8 +431,9 @@ Reading the board:
   #2         the slot number to use when choosing an attacker or target
   base       still a base card: untouchable until every draw pile is empty
   ex-base    entered play as a base card and was moved by a Queen; you still cannot see it
-  dmg1       one damage, on a card whose rank you do not know (max HP would give it away)
-  1/3hp      one hit point left of three — so this is a Jack
+  1/2hp      one hit point left of two. Every FACE-DOWN card is 2 HP whatever it really is,
+             so this tells you nothing about its rank — and a face-down Jack dies to two
+             hits like anything else. Flip it and its ceiling rises to 3.
   FROZEN     cannot attack and cannot be flipped, by anyone, until its next turn ends
   pair3      member of declared pair #3: attacks only together, and only a Queen or a
              death can break it
@@ -456,7 +457,9 @@ The five that trip people up (CLAUDE.md):
    from your own 13-card pile.
 
 Combat quick reference:
-  * Every card has 2 HP. The Jack has 3, face-down included.
+  * Every FACE-DOWN card is a blank 2 HP card, whatever its rank — so nothing about a
+     face-down card can be learned by attacking it. Face-up, a card has 2 HP, or 3 for the
+     Jack. Flipping a damaged Jack raises its ceiling; the damage stays.
   * A pair costs one action, deals 2 damage to ONE target, and both members spend their
      attack. Rank powers still apply: a pair of 9s deals 4 to a Jack, a pair of 10s is
      forced to split 1+1.

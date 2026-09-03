@@ -35,7 +35,8 @@ pub struct Card {
     pub owner: Player,
 
     /// Face-up cards have live powers; face-down cards' powers are inert (`game_rules.md`
-    /// §6). Hit points are *not* a power, so a face-down Jack still has 3 HP.
+    /// §6). Hit points follow the same line: a face-down card is a blank 2-HP card whatever
+    /// its rank (§5), so this flag drives [`Card::max_hp`] as well as every power check.
     pub face_up: bool,
 
     /// Still a base card *right now*: untouchable while the draw pile is non-empty, and
@@ -53,7 +54,7 @@ pub struct Card {
     /// your own base, which is the wrong game (`DESIGN.md` §3).
     pub entered_as_base: bool,
 
-    /// Damage taken. Killed when `damage >= rank.max_hp()`.
+    /// Damage taken. Killed when `damage >= self.max_hp()`.
     ///
     /// `game_rules.md` §5: damage is **public**, including on face-down cards — a damaged
     /// card is turned sideways and both players can see that.
@@ -132,17 +133,43 @@ impl Card {
         }
     }
 
+    /// Maximum hit points **right now**.
+    ///
+    /// `game_rules.md` §5: every card has 2 hit points except the Jack, which has 3 — but
+    /// **a face-down card is a blank 2-HP card whatever its rank**. Hit points behave like
+    /// a power in this respect: the Jack's third point is inert until the card is flipped.
+    ///
+    /// Two consequences the engine depends on:
+    ///
+    /// - A face-down Jack dies to two hits, exactly like a face-down 4. There is therefore
+    ///   **no way to identify a Jack by chipping it**, which matters for belief modeling:
+    ///   damage is public (§5), and if a face-down card could survive two hits that fact
+    ///   would leak its rank to both players.
+    /// - Flipping a damaged Jack *raises* its ceiling from 2 to 3. Damage persists through
+    ///   the flip (§5), so a face-down Jack on 1 damage becomes a face-up Jack on 2 of 3
+    ///   hit points. The reverse transition cannot happen — §7 notes that "nothing ever
+    ///   turns a card face-down again" — so a card can never be retroactively killed by
+    ///   losing hit points it had already spent.
+    #[inline]
+    pub fn max_hp(&self) -> u8 {
+        if self.face_up {
+            self.rank.face_up_max_hp()
+        } else {
+            2
+        }
+    }
+
     /// Remaining hit points.
     #[inline]
     pub fn hp_remaining(&self) -> u8 {
-        self.rank.max_hp().saturating_sub(self.damage)
+        self.max_hp().saturating_sub(self.damage)
     }
 
     /// True once damage has reached max HP. Note that a face-down 3 in this condition does
     /// not die — its Trap fires instead (`game_rules.md` §6).
     #[inline]
     pub fn is_dead(&self) -> bool {
-        self.damage >= self.rank.max_hp()
+        self.damage >= self.max_hp()
     }
 
     /// Frozen as of `ply`?

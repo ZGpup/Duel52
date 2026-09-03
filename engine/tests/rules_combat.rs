@@ -39,19 +39,57 @@ fn rule_5_two_attacks_kill_a_normal_card() {
     assert_eq!(discard_ranks(&s, P1), vec![Rank::SEVEN]);
 }
 
-/// §5: hit points are physical, not a power, so a **face-down** Jack still has 3 HP.
+/// §5: "A **face-down card is a blank 2-HP card** whatever its rank." So a face-down Jack
+/// dies to two hits, exactly like a face-down 4 — the third hit point arrives on the flip.
 #[test]
-fn rule_5_a_face_down_jack_still_has_three_hit_points() {
+fn rule_5_a_face_down_jack_is_a_blank_two_hp_card() {
     let mut p = Position::empty();
     p.face_up(0, P0, Rank::FOUR);
     p.face_up(0, P0, Rank::FIVE);
     p.face_down(0, P1, Rank::JACK);
     let mut s = p.build();
 
+    assert_eq!(card_at(&s, 0, P1, 0).max_hp(), 2);
     go(&mut s, atk(0, 0));
     go(&mut s, atk(1, 0));
-    assert_eq!(occupancy(&s, 0, P1), 1, "2 damage does not kill a Jack");
-    assert_eq!(damage_at(&s, 0, P1, 0), 2);
+    assert_eq!(occupancy(&s, 0, P1), 0, "two hits kill a face-down Jack");
+    assert_eq!(discard_ranks(&s, P1), vec![Rank::JACK]);
+}
+
+/// The corollary that makes the rule matter for belief modeling: because every face-down
+/// card has the same hit points, **a Jack cannot be identified by chipping it**. Damage is
+/// public (§5), so if a face-down card could survive two hits that fact alone would leak
+/// its rank to both players.
+#[test]
+fn rule_5_you_cannot_identify_a_face_down_jack_by_damaging_it() {
+    let mut p = Position::empty();
+    p.face_down(0, P1, Rank::JACK);
+    p.face_down(0, P1, Rank::FOUR);
+    let s = p.build();
+
+    let jack = card_at(&s, 0, P1, 0);
+    let four = card_at(&s, 0, P1, 1);
+    assert_eq!(jack.max_hp(), four.max_hp(), "indistinguishable");
+    assert_eq!(jack.hp_remaining(), four.hp_remaining());
+}
+
+/// §5: "Damage persists through flipping" — and flipping a Jack *raises* its ceiling from
+/// 2 to 3. So a face-down Jack on 1 damage becomes a face-up Jack on 2 of 3, and needs two
+/// more hits rather than one.
+#[test]
+fn rule_5_flipping_a_damaged_jack_raises_its_ceiling_and_keeps_the_damage() {
+    let mut p = Position::empty();
+    p.face_down(0, P0, Rank::JACK);
+    p.damage(0, P0, 0, 1);
+    let mut s = p.build();
+
+    assert_eq!(card_at(&s, 0, P0, 0).hp_remaining(), 1, "1 of 2 while face-down");
+
+    go(&mut s, Action::Flip { lane: 0, slot: 0 });
+    let jack = card_at(&s, 0, P0, 0);
+    assert_eq!(jack.damage, 1, "the damage persists");
+    assert_eq!(jack.max_hp(), 3, "but the ceiling rose");
+    assert_eq!(jack.hp_remaining(), 2, "so it now has 2 of 3");
 }
 
 /// §4: "**Each card may attack only once per turn.**"
@@ -215,25 +253,42 @@ fn rule_6_a_nine_deals_two_damage_to_a_jack() {
     assert_eq!(s.actions_remaining, 2, "and it cost one action");
 }
 
-/// The 9's doubling reads the target's **rank**, so it applies to a face-down Jack too.
+/// §5 + §6: a 9 deals its ordinary **1** to a face-down Jack. A face-down card is a blank
+/// 2-HP card, so there is no Jack there for the 9 to be good against — and the 9 kills it
+/// in two hits like any other card.
 ///
-/// **[ASSUMED]** This is the mirror image of the twinstrike rule: there the *target's*
-/// power does the blocking and goes inert face-down, but here the *attacker's* power keys
-/// on a physical fact about the target — the same way hit points do, and a face-down Jack
-/// keeps its 3 HP. The rules do not address the case directly.
+/// Everything that keys on a target being a Jack reads the *live power*, never the bare
+/// rank: the taunt, the twinstrike block, and this doubling all agree.
 #[test]
-fn rule_6_assumed_a_nine_deals_two_to_a_face_down_jack() {
+fn rule_6_a_nine_deals_only_one_to_a_face_down_jack() {
     let mut p = Position::empty();
+    p.face_up(0, P0, Rank::NINE);
     p.face_up(0, P0, Rank::NINE);
     p.face_down(0, P1, Rank::JACK);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0));
-    assert_eq!(damage_at(&s, 0, P1, 0), 2);
+    assert_eq!(damage_at(&s, 0, P1, 0), 1, "no doubling against a blank card");
     assert!(
         !card_at(&s, 0, P1, 0).face_up,
         "and the attack does not reveal it"
     );
+
+    go(&mut s, atk(1, 0));
+    assert_eq!(occupancy(&s, 0, P1), 0, "two ordinary hits kill it");
+}
+
+/// The contrast, so the rule is pinned from both sides: flip that same Jack and the 9's
+/// doubling comes back on.
+#[test]
+fn rule_6_a_nine_deals_two_once_the_jack_is_face_up() {
+    let mut p = Position::empty();
+    p.face_up(0, P0, Rank::NINE);
+    p.face_up(0, P1, Rank::JACK);
+    let mut s = p.build();
+
+    go(&mut s, atk(0, 0));
+    assert_eq!(damage_at(&s, 0, P1, 0), 2);
 }
 
 /// The 9's doubling keys on the target being a Jack, not on anything else.

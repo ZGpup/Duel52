@@ -484,13 +484,14 @@ impl GameState {
     /// so a lone 9 deals 2 to a Jack and a **pair of 9s deals 4**, one-shotting a 3-HP Jack
     /// (§5).
     ///
-    /// The doubling reads the target's **rank**, not the target's power, so it applies to a
-    /// face-down Jack too. That is the mirror image of the twinstrike rule above: there the
-    /// *target's* power does the blocking and goes inert face-down; here the *attacker's*
-    /// power keys on a physical fact about the target. **[ASSUMED]**
+    /// It applies only to a **face-up** Jack. §5 is explicit that a face-down card is a
+    /// blank 2-HP card whatever its rank, so there is no Jack there for the 9 to be good
+    /// against — a 9 hitting a face-down Jack deals its ordinary 1, and kills it in two
+    /// like anything else. This is consistent with the twinstrike rule: everything that
+    /// keys on a target being a Jack reads `has_live_power`, never the bare rank.
     pub fn attack_damage(&self, attacker_rank: Rank, target: &Card, is_pair: bool) -> u8 {
         let base = if is_pair { 2 } else { 1 };
-        if attacker_rank == Rank::NINE && target.rank == Rank::JACK {
+        if attacker_rank == Rank::NINE && target.has_live_power(Rank::JACK) {
             base * 2
         } else {
             base
@@ -570,10 +571,11 @@ impl GameState {
                     for c in side {
                         assert_eq!(c.owner, p, "card {:?} filed on the wrong side", c.id);
                         assert!(
-                            c.damage < c.rank.max_hp(),
-                            "dead card {:?} still in play with {} damage",
+                            c.damage < c.max_hp(),
+                            "dead card {:?} still in play with {} damage against {} max HP",
                             c.id,
-                            c.damage
+                            c.damage,
+                            c.max_hp()
                         );
                         assert!(
                             !(c.is_base && !c.entered_as_base),

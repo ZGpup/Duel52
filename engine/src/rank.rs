@@ -78,16 +78,19 @@ impl Rank {
         self.0 as usize
     }
 
-    /// Maximum hit points.
+    /// Maximum hit points **while face-up**.
     ///
     /// `game_rules.md` §5: "Every card has 2 hit points, except the Jack, which has 3."
     ///
-    /// Hit points are a *physical* property of the card, not a power, so a **face-down**
-    /// Jack also has 3 HP. That is deliberate and observable at the table: you can chip a
-    /// face-down card twice and watch it survive, which tells you it is a Jack. Powers are
-    /// what go inert while face-down (§6), not hit points.
+    /// # Do not call this on a card in play — use [`crate::card::Card::max_hp`]
+    ///
+    /// A **face-down card is a blank 2-HP card regardless of rank** (§5), so a face-down
+    /// Jack dies to two hits like anything else. The Jack's third hit point arrives when it
+    /// is flipped. This method knows nothing about face-up state, which is why it is named
+    /// for the case it describes; combat, death, healing and rendering all go through
+    /// `Card::max_hp` instead.
     #[inline]
-    pub const fn max_hp(self) -> u8 {
+    pub const fn face_up_max_hp(self) -> u8 {
         if self.0 == Rank::JACK.0 {
             3
         } else {
@@ -149,7 +152,7 @@ impl Rank {
             7 => "constant: any card that attacks this 8 takes 1 damage (a 9 does not)",
             8 => "constant: cannot be frozen; no retaliate damage; deals 2 to Jacks",
             9 => "constant: attacks split 1 damage across two enemy cards",
-            10 => "constant: must be killed before anything else in the lane; 3 HP",
+            10 => "constant: must be killed before anything else in the lane; 3 HP face-up",
             11 => "one-shot: move one allied card from another lane into this lane",
             12 => "one-shot: all your other face-up cards in this lane refire their powers",
             _ => "?",
@@ -220,11 +223,13 @@ pub fn rank_counts(ranks: &[Rank]) -> RankCounts {
 mod tests {
     use super::*;
 
+    /// `game_rules.md` §5: "Every card has 2 hit points, except the Jack, which has 3."
+    /// This is the *face-up* table; the face-down case is uniform and lives on `Card`.
     #[test]
-    fn jack_has_three_hp_everything_else_has_two() {
+    fn rule_5_face_up_jack_has_three_hp_everything_else_has_two() {
         for r in Rank::ALL {
             let expected = if r == Rank::JACK { 3 } else { 2 };
-            assert_eq!(r.max_hp(), expected, "wrong max HP for {r}");
+            assert_eq!(r.face_up_max_hp(), expected, "wrong face-up max HP for {r}");
         }
     }
 
