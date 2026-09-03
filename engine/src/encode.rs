@@ -565,6 +565,21 @@ impl Offsets {
     }
 }
 
+/// Bounds-check a rank against the configured deck.
+///
+/// `Rank` is always `0..13`, but a block is only `config.rank_count()` wide — so in a
+/// reduced-deck configuration (Duel52-mini, `DESIGN.md` §7) an out-of-range rank would not
+/// be caught by `Rank`'s own invariant and would index into the *next* block instead. A real
+/// deal cannot produce one; `testkit` can.
+fn checked_rank(config: &GameConfig, rank: Rank, what: &str) -> usize {
+    assert!(
+        rank.index() < config.rank_count(),
+        "{what}: rank {rank} is outside the configured deck of {} ranks",
+        config.rank_count()
+    );
+    rank.index()
+}
+
 /// Bounds-check a lane/slot pair coming out of an [`Action`], with a message that names the
 /// config key a training run would have to change.
 fn checked(config: &GameConfig, lane: usize, slot: usize, what: &str) -> (usize, usize) {
@@ -601,7 +616,7 @@ pub fn encode_action(action: &Action, state: &GameState) -> usize {
         Action::Play { rank, lane } => {
             let lane = lane as usize;
             assert!(lane < o.lanes, "play: lane {lane} is out of range");
-            o.play + rank.index() * o.lanes + lane
+            o.play + checked_rank(config, rank, "play") * o.lanes + lane
         }
         Action::Flip { lane, slot } => {
             let (lane, slot) = checked(config, lane as usize, slot as usize, "flip");
@@ -643,7 +658,7 @@ pub fn encode_action(action: &Action, state: &GameState) -> usize {
             let (lane, slot) = checked(config, lane as usize, slot as usize, "choose slot");
             o.choose_slot(Side::Mine, lane, slot)
         }
-        Action::GiveBack { rank } => o.choose_rank + rank.index(),
+        Action::GiveBack { rank } => o.choose_rank + checked_rank(config, rank, "give back"),
         Action::SplitTarget { slot } => {
             let lane = pending_split_lane(state)
                 .expect("a split target only exists while a 10's twinstrike is pending");

@@ -57,7 +57,11 @@ impl NetPolicyAgent {
     }
 
     fn ensure_loaded(&mut self, config: &GameConfig) {
-        if self.evaluator.is_some() {
+        // Reload if the shape moved. An agent is normally built per game and plays one
+        // configuration, so this fires only if one instance is reused across configs — but
+        // silently encoding into a buffer sized for a different `obs_dim` is the kind of
+        // thing that would surface as a bad agent rather than as an error.
+        if self.evaluator.is_some() && self.obs.len() == obs_dim(config) {
             return;
         }
         let weights = load_cached(&self.checkpoint, config).unwrap_or_else(|e| {

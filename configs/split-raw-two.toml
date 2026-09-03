@@ -23,6 +23,8 @@ two_power = "discard"
 lanes = 3
 lanes_to_win = 2
 max_slots_per_side = 21
+# The NN encoder's slot bound — see configs/split.toml, and FINDINGS.md F2.7 and F3.1.
+encoding_slots = 16
 max_rank_index = 12
 copies_per_rank = 4
 hand_size = 5

@@ -25,6 +25,15 @@ lanes_to_win = 2
 # theoretical maximum (26 owned minus 5 removed), so the engine's assertion can never fire.
 max_slots_per_side = 21
 
+# Slots the neural-network encoder reserves. Separate from the legality bound above, and
+# what fixes obs_dim — a checkpoint is only loadable under the value it was built with.
+#
+# 16 comes from FINDINGS.md F2.7 (competent self-play tops out at 8-12). F3.1 is the
+# caveat: it holds in self-play and does NOT hold on the Elo ladder, because `random` never
+# kills anything and a net played against it reaches 17. Set this to 21 to match the
+# legality bound if a run has to be assertion-proof.
+encoding_slots = 16
+
 max_rank_index = 12
 copies_per_rank = 4
 hand_size = 5
