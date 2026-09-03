@@ -1,0 +1,20 @@
+[package]
+name = "duel52-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rules-exact engine for the card game Duel 52 (Judd Madden & Nina Riddell, 2017)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "duel52_engine"
+path = "src/lib.rs"
+
+# The text CLI the project owner uses to play the engine and spot-check the rules.
+[[bin]]
+name = "duel52"
+path = "src/bin/duel52.rs"
+
+# Intentionally empty. See the comment in the workspace Cargo.toml.
+[dependencies]

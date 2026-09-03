@@ -1,0 +1,32 @@
+# Cargo workspace root.
+#
+# `engine`   — the rules-exact Duel 52 engine (pure Rust, zero dependencies) plus the
+#              `duel52` command-line binary. This is the sole authority on legality.
+# `bindings` — PyO3 wrapper that exposes the engine to Python for Phase 2+ training.
+#              Kept in a separate crate so the engine itself never depends on Python.
+#
+# Zero dependencies in `engine` is deliberate: `game_rules.md` requires that the same
+# seed always reproduces the same game, and third-party RNGs do not promise stability
+# across versions. The engine ships its own documented PRNG (see engine/src/rng.rs).
+
+[workspace]
+resolver = "2"
+members = ["engine", "bindings"]
+# Plain `cargo build` / `cargo test` at the root works on the engine only, so the everyday
+# loop does not pay for compiling PyO3. Build the bindings explicitly with
+# `cargo build -p duel52-py`, or (normally) via `maturin develop`.
+default-members = ["engine"]
+
+[profile.release]
+# Self-play throughput matters (DESIGN.md §8 targets >=10k random games/sec/core),
+# so allow the optimiser to work across the whole crate graph.
+lto = "thin"
+codegen-units = 1
+# NOTE: deliberately *not* `panic = "abort"`. The PyO3 bindings turn a Rust panic into a
+# Python exception, which is impossible if panics abort the process.
+
+[profile.test]
+# The engine's debug assertions (the state invariant checks) are the point of the test
+# suite, so tests stay in debug mode — but at -O1, because several tests play thousands of
+# random games and unoptimised is needlessly slow.
+opt-level = 1
