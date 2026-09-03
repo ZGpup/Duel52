@@ -15,6 +15,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use duel52_engine::agents::Agent;
 use duel52_engine::display::{describe_action, describe_move, power_reference, render};
+use duel52_engine::nn::Evaluator;
 use duel52_engine::{
     ladder, menu, stats, Action, AgentSpec, GameConfig, GameState, Outcome, Player, Rank,
     RandomAgent, TwoPower, Variant, VERSION,
@@ -31,6 +32,7 @@ fn main() {
         "ladder" => cmd_ladder(&args[1..]),
         "match" => cmd_match(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
+        "nn-dump" => cmd_nn_dump(&args[1..]),
         "powers" => {
             print!("{}", power_reference());
             Ok(())
@@ -64,6 +66,7 @@ USAGE
   duel52 ladder  [options]        round-robin Elo over the agent ladder (Phase 2)
   duel52 match   [options]        one head-to-head, with behavioural statistics
   duel52 probe   [options]        self-play instrumentation per agent (Phase 2 findings)
+  duel52 nn-dump [options]        encode + forward-pass dump for the Python parity test
   duel52 powers                   print the card-power reference
   duel52 config  <file>           validate a config file and print what it resolves to
   duel52 version
@@ -74,6 +77,7 @@ AGENTS
   flatmc[:playouts] random playouts per action, no tree            (default 600)
   pimc[:worldsxdepth]  alpha-beta per sampled world                (default 8x1)
   ismcts[:iters]    information-set MCTS, random rollouts          (default 800)
+  netpolicy:<path>  a .d52nn checkpoint played by argmax, no search
 
 OPTIONS
   --variant <base|split|mirrored> which configuration (default: split — the project default)
@@ -81,6 +85,9 @@ OPTIONS
   --seed <n>                      game seed; the same seed always deals the same game
   --config <file>                 load a config file (overrides --variant/--two-power)
   --stalemate <plies>             quiet plies before a draw is declared (default 20)
+  --encoding-slots <n>            slots per side per lane the NN encoder reserves
+                                  (default 16, FINDINGS.md F2.7). Must match the
+                                  checkpoint: it is what fixes obs_dim.
 
   play only:
   --as <p0|p1>                    which side you take (default: p0, who moves first)
@@ -101,6 +108,11 @@ OPTIONS
   --agents <a,b,...>              roster for ladder/probe (default: the frozen ladder)
   --a <agent> --b <agent>         the two sides of a `match`
   --markdown                      emit Markdown, for pasting into FINDINGS.md
+
+  nn-dump only:
+  --checkpoint <file>             the .d52nn checkpoint to run (required)
+  --out <file>                    where to write the dump (required)
+  --max-rows <n>                  rows to keep, sampled evenly across the run (default 512)
 
 EXAMPLES
   duel52 play --seed 1                     play the default variant as first player
@@ -207,6 +219,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut variant: Option<Variant> = None;
     let mut two_power: Option<TwoPower> = None;
     let mut stalemate: Option<u32> = None;
+    let mut encoding_slots: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -226,6 +239,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--stalemate" => stalemate = Some(next_number(args, &mut i, "--stalemate")?),
+            "--encoding-slots" => {
+                encoding_slots = Some(next_number(args, &mut i, "--encoding-slots")?)
+            }
             "--seed" => opts.seed = next_number(args, &mut i, "--seed")?,
             "--games" => opts.games = Some(next_number(args, &mut i, "--games")?),
             "--threads" => {
@@ -290,6 +306,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     }
     if let Some(s) = stalemate {
         opts.config.stalemate_quiet_plies = s;
+    }
+    if let Some(n) = encoding_slots {
+        opts.config.encoding_slots = n;
     }
     opts.config
         .validate()
@@ -542,6 +561,174 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
     println!("{}", render(&state, None));
     println!("Result: {}", state.outcome);
     Ok(())
+}
+
+// ================================================================ Phase 3: the parity dump ==
+
+/// Play seeded random games, encode every decision node, run the Rust forward pass, and
+/// write observations, masks, logits and values for `py/tests/test_parity.py` to check.
+///
+/// **The direction matters.** Rust produces the observations, because it owns the encoder;
+/// PyTorch is the reference for the *forward pass*, because it owns the architecture. So
+/// this dump is Rust's answer, and the Python test recomputes the same function from the
+/// same checkpoint and the same inputs. Neither side re-derives the other's half.
+///
+/// Rows are sampled evenly across the whole run rather than taken from the opening plies: a
+/// dump of the first `max_rows` decisions would be twenty near-identical fresh deals, which
+/// would exercise almost none of the encoder. Two passes make that possible without holding
+/// every observation in memory — the engine is deterministic, so the second pass replays the
+/// first exactly, which is the same property `PHASE3_STEP1.md` §4 relies on for the replay
+/// buffer.
+fn cmd_nn_dump(args: &[String]) -> Result<(), String> {
+    let mut checkpoint: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut max_rows = 512usize;
+
+    // Only the flags this command uses, so a typo is an error rather than a silent default.
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--checkpoint" => checkpoint = Some(next_value(args, &mut i, "--checkpoint")?),
+            "--out" => out_path = Some(next_value(args, &mut i, "--out")?),
+            "--max-rows" => max_rows = next_number(args, &mut i, "--max-rows")?,
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let opts = parse_options(&rest)?;
+    let checkpoint = checkpoint.ok_or("nn-dump needs --checkpoint <path>")?;
+    let out_path = out_path.ok_or("nn-dump needs --out <path>")?;
+    let games = opts.games_or(20);
+    if max_rows == 0 {
+        return Err("--max-rows must be at least 1".to_string());
+    }
+
+    let weights = duel52_engine::nn::Weights::load(std::path::Path::new(&checkpoint), &opts.config)?;
+    let arch = weights.arch;
+    let evaluator = duel52_engine::nn::MlpEvaluator::new(weights);
+
+    // Pass 1: how many decision nodes are there? Cheap — no encoding, no forward pass.
+    let total: usize = (0..games)
+        .map(|g| count_decisions(opts.config, opts.seed + g as u64))
+        .sum();
+    if total == 0 {
+        return Err("the games produced no decision nodes".to_string());
+    }
+    let stride = total.div_ceil(max_rows).max(1);
+
+    // Pass 2: replay the same games and record every `stride`-th decision.
+    let obs_dim = duel52_engine::encode::obs_dim(&opts.config);
+    let action_dim = duel52_engine::encode::action_dim(&opts.config);
+    let mut observations: Vec<f32> = Vec::new();
+    let mut masks: Vec<u8> = Vec::new();
+    let mut seen = 0usize;
+    let mut rows = 0usize;
+
+    let mut obs = vec![0.0f32; obs_dim];
+    let mut mask = vec![false; action_dim];
+    for g in 0..games {
+        let seed = opts.seed + g as u64;
+        let mut state = GameState::new(opts.config, seed);
+        let mut rng = duel52_engine::Rng::derive(seed, 0xD0_9E_0000_0000_0001);
+        while !state.outcome.is_over() {
+            if seen % stride == 0 && rows < max_rows {
+                duel52_engine::encode::encode_observation(
+                    &state,
+                    state.acting_player(),
+                    &mut obs,
+                );
+                duel52_engine::encode::legal_mask(&state, &mut mask);
+                observations.extend_from_slice(&obs);
+                masks.extend(mask.iter().map(|&m| u8::from(m)));
+                rows += 1;
+            }
+            seen += 1;
+            let legal = state.legal_actions();
+            state.apply_trusted(*rng.choose(&legal).expect("a running game has actions"));
+        }
+    }
+
+    // One forward pass over the whole dump, which is also a smoke test of the batch path.
+    let mut logits = vec![0.0f32; rows * action_dim];
+    let mut values = vec![0.0f32; rows];
+    evaluator.eval_batch(&observations, rows, &mut logits, &mut values);
+
+    let mut header = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(header, "rows={rows}");
+    let _ = writeln!(header, "obs_dim={obs_dim}");
+    let _ = writeln!(header, "action_dim={action_dim}");
+    let _ = writeln!(header, "checkpoint={checkpoint}");
+    let _ = writeln!(header, "variant={}", opts.config.variant.label());
+    let _ = writeln!(header, "encoding_slots={}", opts.config.encoding_slots);
+    let _ = writeln!(header, "games={games}");
+    let _ = writeln!(header, "first_seed={}", opts.seed);
+    let _ = writeln!(header, "stride={stride}");
+    let _ = writeln!(header, "decisions={total}");
+    let _ = writeln!(header, "width={}", arch.width);
+    let _ = writeln!(header, "blocks={}", arch.blocks);
+    let _ = writeln!(header, "value_hidden={}", arch.value_hidden);
+    let _ = writeln!(
+        header,
+        "obs_layout_hash={:016x}",
+        duel52_engine::encode::obs_layout_hash(&opts.config)
+    );
+    let _ = writeln!(
+        header,
+        "action_layout_hash={:016x}",
+        duel52_engine::encode::action_layout_hash(&opts.config)
+    );
+    // `payload_order` plays the part `param_order` plays in a checkpoint: the reader walks
+    // it rather than assuming a layout.
+    let _ = writeln!(header, "payload_order=obs:f32,mask:u8,logits:f32,values:f32");
+
+    // Same container as a checkpoint (§1.4), different magic — so a dump handed to
+    // `Weights::load` by mistake is rejected by magic rather than misread as weights.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"D52DMP");
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for v in &observations {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes.extend_from_slice(&masks);
+    for v in &logits {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in &values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(&out_path, &bytes)
+        .map_err(|e| format!("cannot write `{out_path}`: {e}"))?;
+
+    println!(
+        "wrote {out_path} — {rows} rows of {} decisions across {games} games (stride {stride}), \
+         {:.1} MB",
+        total,
+        bytes.len() as f64 / 1e6
+    );
+    println!(
+        "  widest lane side the encoder saw: {} (bound {})",
+        duel52_engine::encode::observed_max_slots(),
+        opts.config.encoding_slots
+    );
+    Ok(())
+}
+
+/// Decision nodes in one seeded random game. The same stream `cmd_nn_dump`'s second pass
+/// uses, so the two passes agree exactly.
+fn count_decisions(config: GameConfig, seed: u64) -> usize {
+    let mut state = GameState::new(config, seed);
+    let mut rng = duel52_engine::Rng::derive(seed, 0xD0_9E_0000_0000_0001);
+    let mut n = 0;
+    while !state.outcome.is_over() {
+        n += 1;
+        let legal = state.legal_actions();
+        state.apply_trusted(*rng.choose(&legal).expect("a running game has actions"));
+    }
+    n
 }
 
 /// One line of the move log.

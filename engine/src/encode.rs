@@ -212,6 +212,7 @@ pub fn encode_observation(state: &GameState, observer: Player, out: &mut [f32]) 
                  refuses to truncate, because a dropped card is a different position.",
                 side.len(),
             );
+            note_occupancy(side.len());
             for (slot, card) in side.iter().enumerate() {
                 let base = ((lane * 2 + side_idx) * s + slot) * f;
                 encode_slot(state, observer, card, owner == observer, &mut out[base..base + f]);
@@ -288,6 +289,39 @@ pub fn encode_observation(state: &GameState, observer: Player, out: &mut [f32]) 
         scalar_len(config),
         "the scalar block wrote a different number of floats than `scalar_fields` declares"
     );
+}
+
+// ============================================================ the occupancy high-water ==
+
+/// The widest lane side any call to [`encode_observation`] has seen in this process.
+///
+/// `FINDINGS.md` F2.7 asks for the encoding bound to be re-measured against the *trained*
+/// agent — and for the **distribution**, not the maximum, because "a maximum is not a
+/// statistic: it grows with the sample". This counter is the cheap half of that: a
+/// high-water mark that says immediately whether a run is anywhere near the bound, without
+/// having to instrument the caller.
+///
+/// It is process-wide and monotonic, so it says nothing about *which* run produced the
+/// maximum. Call [`reset_observed_max_slots`] between runs if that matters.
+static OBSERVED_MAX_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn note_occupancy(n: usize) {
+    // Relaxed: this is instrumentation, and the only thing that reads it is a report at the
+    // end of a run. Next to a five-million-parameter forward pass the cost is not
+    // measurable, and an exact ordering would buy nothing.
+    OBSERVED_MAX_SLOTS.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The widest lane side the encoder has seen since this process started, or since the last
+/// [`reset_observed_max_slots`].
+pub fn observed_max_slots() -> usize {
+    OBSERVED_MAX_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the high-water mark, so a measurement can be scoped to one run.
+pub fn reset_observed_max_slots() {
+    OBSERVED_MAX_SLOTS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One slot's features. `out` is exactly [`slot_features`] long and starts zeroed.

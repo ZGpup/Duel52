@@ -25,6 +25,7 @@ use pyo3::types::{PyDict, PyList};
 use duel52_engine::action::Side;
 use duel52_engine::config::{GameConfig, TwoPower, Variant};
 use duel52_engine::display;
+use duel52_engine::encode;
 use duel52_engine::outcome::{DrawReason, Outcome};
 use duel52_engine::player::Player;
 use duel52_engine::rank::Rank;
@@ -457,7 +458,12 @@ impl PyGame {
         out.set_item("stalemate_quiet_plies", s.config.stalemate_quiet_plies)?;
         out.set_item("is_over", s.outcome.is_over())?;
         out.set_item("outcome", outcome_name(s.outcome))?;
-        out.set_item("first_player", s.to_move == Player::P0)?;
+        // Which *seat* the observer holds. P0 moves first and takes only two actions on the
+        // opening turn (`game_rules.md` §2), so the seat is a real asymmetry and the encoder
+        // wants it. This used to be `first_player = (to_move == P0)`, which was a mislabelled
+        // duplicate of `to_move` and told an observer nothing about itself; nothing consumed
+        // it, so it was corrected rather than kept alongside.
+        out.set_item("observer_is_first_player", me == Player::P0)?;
 
         out.set_item("hand", s.hand_counts(me).to_vec())?;
         out.set_item("hand_size", s.hand(me).len())?;
@@ -486,6 +492,11 @@ impl PyGame {
         } else {
             out.set_item("removed_counts", py.None())?;
         }
+
+        // Belief: how many of each rank this observer cannot place. `DESIGN.md` §5, and the
+        // same bag `determinize` deals from, so the encoder and the sampler cannot disagree
+        // about what is unknown. §2: outside the mirrored variant these never reach zero.
+        out.set_item("unseen_counts", s.unseen_counts(me).to_vec())?;
 
         // Private knowledge from the 2's scry (§10a): what this observer put on the bottom
         // of a pile, bottom-most first.
@@ -533,6 +544,63 @@ impl PyGame {
         }
         out.set_item("board", board)?;
         Ok(out)
+    }
+
+    // ------------------------------------------------------- Phase 3 encoding --
+
+    /// The observation tensor for `observer`, as a flat list of `obs_dim` floats.
+    ///
+    /// **This is the only encoder.** `CLAUDE.md` puts rules logic in Rust for one reason and
+    /// the same reason applies here with more force: a second copy of the feature layout on
+    /// the Python side could drift from this one silently, and the trained function would
+    /// stop matching the evaluated function with nothing crashing to say so. The training
+    /// code calls this; it never builds a tensor itself.
+    ///
+    /// The layout is documented in `engine/src/encode.rs` and pinned by
+    /// `obs_layout_hash` in [`encoding_spec`].
+    fn encode_observation(&self, observer: &str) -> PyResult<Vec<f32>> {
+        let me = parse_player(observer)?;
+        let mut out = vec![0.0f32; encode::obs_dim(&self.state.config)];
+        encode::encode_observation(&self.state, me, &mut out);
+        Ok(out)
+    }
+
+    /// The legality mask for the current decision: `action_dim` booleans, true exactly at
+    /// the indices of the legal actions.
+    ///
+    /// Built from the engine's own `legal_actions()`, never from a second implementation of
+    /// legality.
+    fn legal_mask(&self) -> Vec<bool> {
+        let mut out = vec![false; encode::action_dim(&self.state.config)];
+        encode::legal_mask(&self.state, &mut out);
+        out
+    }
+
+    /// The policy-head index for an action dict.
+    ///
+    /// Takes the position as well as the action because a `split_target` carries no lane —
+    /// the lane comes from the twinstrike already in flight.
+    fn encode_action(&self, action: &Bound<'_, PyDict>) -> PyResult<usize> {
+        let a = action_from_dict(action)?;
+        Ok(encode::encode_action(&a, &self.state))
+    }
+
+    /// The action a policy index names in this position, or `None` if the index means
+    /// nothing here.
+    ///
+    /// `None` is not an error: most of the 1325 indices are meaningless in any given
+    /// position, which is what the mask is for. The `CHOOSE_SLOT` block is shared between
+    /// four sub-decisions whose phases are mutually exclusive, so the answer depends on the
+    /// phase.
+    fn decode_action<'py>(
+        &self,
+        py: Python<'py>,
+        index: usize,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match encode::decode_action(index, &self.state) {
+            Some(a) => Ok(Some(action_to_dict(py, a)?)),
+            None => Ok(None),
+        }
     }
 
     /// The board as text, from `observer`'s point of view. Pass `None` to reveal
@@ -583,11 +651,8 @@ impl PyGame {
     #[pyo3(signature = (agent, seed=0))]
     fn agent_action_index(&self, agent: &str, seed: u64) -> PyResult<usize> {
         let spec = AgentSpec::parse(agent).map_err(PyValueError::new_err)?;
-        PyAgent {
-            spec,
-            inner: spec.build(seed, 0),
-        }
-        .choose_index(self)
+        let inner = spec.build(seed, 0);
+        PyAgent { spec, inner }.choose_index(self)
     }
 }
 
@@ -623,10 +688,8 @@ impl PyAgent {
     #[pyo3(signature = (name, seed=0))]
     fn new(name: &str, seed: u64) -> PyResult<PyAgent> {
         let spec = AgentSpec::parse(name).map_err(PyValueError::new_err)?;
-        Ok(PyAgent {
-            spec,
-            inner: spec.build(seed, 0),
-        })
+        let inner = spec.build(seed, 0);
+        Ok(PyAgent { spec, inner })
     }
 
     #[getter]
@@ -718,6 +781,67 @@ fn ladder_agents() -> Vec<String> {
     AgentSpec::LADDER.iter().map(|s| s.name()).collect()
 }
 
+/// The tensor shapes and layout hashes the training side must build against.
+///
+/// **This is what makes "Python never writes its own encoder" enforceable.** The two hashes
+/// are computed once, in `engine/src/encode.rs`, from the feature table and the action
+/// blocks; Python stamps whatever it reads here into the checkpoint header, and
+/// `Weights::load` refuses a checkpoint whose hashes do not match the build that is about to
+/// evaluate it. Nothing on the Python side ever computes a hash, so the two cannot disagree
+/// about what the layout is — only about whether they are the same.
+///
+/// The layout is identical across the three variants (same lanes, same rank count, same
+/// `encoding_slots`), so one checkpoint plays all three; `variant` is accepted anyway
+/// because Duel52-mini (`DESIGN.md` §7) will not share it.
+#[pyfunction]
+#[pyo3(signature = (variant="split", encoding_slots=None))]
+fn encoding_spec<'py>(
+    py: Python<'py>,
+    variant: &str,
+    encoding_slots: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let v = Variant::parse(variant)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
+    let mut config = GameConfig::preset(v);
+    if let Some(n) = encoding_slots {
+        config.encoding_slots = n;
+    }
+    config
+        .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+
+    let d = PyDict::new(py);
+    d.set_item("variant", config.variant.label())?;
+    d.set_item("obs_dim", encode::obs_dim(&config))?;
+    d.set_item("action_dim", encode::action_dim(&config))?;
+    d.set_item("encoding_slots", config.encoding_slots)?;
+    d.set_item("lanes", config.lanes)?;
+    d.set_item("ranks", config.rank_count())?;
+    d.set_item("slot_features", encode::slot_features(&config))?;
+    // Rendered as 16 hex characters, the same way they appear in a checkpoint header, so a
+    // mismatch can be read straight off the two strings.
+    d.set_item("obs_layout_hash", format!("{:016x}", encode::obs_layout_hash(&config)))?;
+    d.set_item(
+        "action_layout_hash",
+        format!("{:016x}", encode::action_layout_hash(&config)),
+    )?;
+    // The full descriptions, for a diff when the hashes disagree and you need to know
+    // *which* feature moved.
+    d.set_item("obs_layout", encode::obs_layout_string(&config))?;
+    d.set_item("action_layout", encode::action_layout_string(&config))?;
+
+    let blocks = PyList::empty(py);
+    for b in encode::action_blocks(&config) {
+        let e = PyDict::new(py);
+        e.set_item("name", b.name)?;
+        e.set_item("offset", b.offset)?;
+        e.set_item("len", b.len)?;
+        blocks.append(e)?;
+    }
+    d.set_item("action_blocks", blocks)?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", "Rust engine for Duel 52. Imported via the `duel52` package.")?;
@@ -727,5 +851,6 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random_play_stats, m)?)?;
     m.add_function(wrap_pyfunction!(power_reference, m)?)?;
     m.add_function(wrap_pyfunction!(ladder_agents, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding_spec, m)?)?;
     Ok(())
 }
