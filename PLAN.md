@@ -2,7 +2,9 @@
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Current phase: 1 (not started).** Rules are specified; no code exists yet.
+**Current phase: 1 (complete, pending the owner's rules review).** The engine, the CLI, the
+PyO3 bindings and the baseline statistics all exist. The one remaining item is the exit
+criterion itself: the owner plays a few games and confirms the rules are right.
 
 ---
 
@@ -15,29 +17,58 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ---
 
-## Phase 1 — Engine + rules validation `[ ]`
+## Phase 1 — Engine + rules validation `[~]`
 
 The only phase that needs meaningful owner input.
 
-- [ ] Rust crate: state, legal-action enumeration, action application, terminal detection
-- [ ] All three configurations behind one config flag: base / split-deck / mirrored-removal
-- [ ] `two_power: bottom | discard` flag for the §10a house rule, so the parity claim behind
-      it is measurable rather than assumed
-- [ ] Seeded determinism — same seed + config produces an identical game
-- [ ] One named test per ruling in `game_rules.md` (e.g. `rule_6_king_reactivates_ace_grants_one_action`)
-- [ ] Edge-case tests: 8 × 9 interaction, 10 blocked by 9/J, pair vs 8 double retaliate, 3-trap resurrection, Queen breaking a pair, 5 and 7 reaching base cards post-unlock
-- [ ] Edge-case tests, second batch (all settled 2026-09-03): 10 vs two Jacks is 1+1 but 10 vs
+- [x] Rust crate: state, legal-action enumeration, action application, terminal detection
+- [x] All three configurations behind one config flag: base / split-deck / mirrored-removal
+- [x] `two_power: bottom | discard` flag for the §10a house rule, so the parity claim behind
+      it is measurable rather than assumed — **measured, and it holds**; see `FINDINGS.md` F1.5
+- [x] Seeded determinism — same seed + config produces an identical game
+- [x] One named test per ruling in `game_rules.md` (e.g. `rule_6_king_reactivates_ace_grants_one_action`)
+- [x] Edge-case tests: 8 × 9 interaction, 10 blocked by 9/J, pair vs 8 double retaliate, 3-trap resurrection, Queen breaking a pair, 5 and 7 reaching base cards post-unlock
+- [x] Edge-case tests, second batch (all settled 2026-09-03): 10 vs two Jacks is 1+1 but 10 vs
       two 9s is 1 to one; 9-pair deals 4 to a Jack and takes no retaliate from an 8; 10-pair
       splits 1+1 and consolidates to 2 when blocked; a 5 skips frozen cards but a King still
       reactivates them; King resets an Ace's attack counter rather than stacking it; the 2 is
       pile-neutral so turns-to-unlock is invariant; mutual lane win via retaliate is a draw
-- [ ] PyO3 bindings
-- [ ] Text CLI so the owner can play the engine and spot-check rules
+- [x] PyO3 bindings
+- [x] Text CLI so the owner can play the engine and spot-check rules
 - [x] Resolve outstanding items in `OPEN_QUESTIONS.md` — done 2026-09-03, nothing open
-- [ ] **Deliverable:** random-vs-random statistics — game length distribution, first-player
-      win rate, how often games reach the stalemate cutoff, across all three variants
+- [x] **Deliverable:** random-vs-random statistics — game length distribution, first-player
+      win rate, how often games reach the stalemate cutoff, across all three variants —
+      logged as `FINDINGS.md` F1, 1.2M games
+- [ ] **Exit criterion:** the owner plays a few games against the CLI and finds no rules errors
 
-**Exit criterion:** the owner plays a few games against the CLI and finds no rules errors.
+**Play it with:** `cargo build --release && ./target/release/duel52 play --seed 1`
+
+### What Phase 1 turned up that the plan did not anticipate
+
+Three things worth carrying forward, all in `FINDINGS.md` F1:
+
+1. **The stalemate rule is still untested.** It fired zero times in 1.2M random games,
+   because the stall `game_rules.md` §7 describes is *strategic* and random agents attack
+   constantly. The default of 20 quiet plies is unvalidated — re-measure in Phase 2.
+2. **`DESIGN.md` §3's 8-slot encoding bound is wrong.** Random play reaches 20 cards on one
+   side of one lane. The engine uses the theoretical maximum instead; Phase 3 must pick a
+   real bound from strong-agent play rather than inheriting either number.
+3. **The mutual-lane-win draw is reachable, not astronomical** — 0.4–0.5% of random games,
+   and the only source of draws at this level of play.
+
+### Three `[ASSUMED]` calls made while implementing
+
+Per `CLAUDE.md`'s "make a defensible call, document it, flag it". Each is flagged in the
+code and pinned by a named test; none is load-bearing enough to block on, and all three are
+cheap to flip if the owner disagrees.
+
+- **A face-down 9 can be frozen by a 6.** Nimble is a power, and §6 says powers are inert
+  face-down; the rulebook's "cannot freeze a 9, ever" reads as being about *timing* (a 9
+  already in the lane is still immune), not about face-up-ness.
+- **A 9 deals 2 damage to a face-down Jack.** The doubling keys on the target being
+  physically a Jack, as hit points do, rather than on the Jack's taunt being live.
+- **A 10 whose twinstrike hits two 8s takes 1 retaliate from each, and dies.** §6 says "any
+  card that attacks this 8 takes 1 damage" and the 10 attacked both, so the damage adds.
 
 ---
 

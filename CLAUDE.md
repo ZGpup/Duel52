@@ -55,12 +55,49 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 
 ## Commands
 
-Nothing is built yet. As the engine lands, record the real commands here:
+```bash
+# Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
+# so the everyday loop does not pay for compiling PyO3.
+cargo build --release                    # engine + the `duel52` CLI
+cargo test                               # 190 tests: rules, determinism, information hiding
 
+# Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
+./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
+./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
+./target/release/duel52 play --opponent human              # hotseat
+./target/release/duel52 powers                             # card-power reference
+./target/release/duel52 demo --seed 86                     # watch a random game, ply by ply
+
+# Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
+./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
+./target/release/duel52 config configs/split.toml          # validate a config file
+
+# Python. Needs a venv; `maturin develop` drops the extension into py/duel52/.
+python3 -m venv .venv && .venv/bin/pip install -q maturin pytest
+.venv/bin/maturin develop --release
+.venv/bin/python -m pytest py/tests -q
 ```
-# build engine        (TBD)
-# run tests           (TBD)
-# play a human game   (TBD)
-# self-play benchmark (TBD)
-# train               (TBD)
-```
+
+Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
+`split-raw-two.toml` (the control for the §10a house rule).
+
+## Where things are
+
+| Path | What |
+|---|---|
+| `engine/src/state.rs` | `GameState` and the queries the rules are written in terms of |
+| `engine/src/apply.rs` | Powers, combat, turn machinery. The rules live here. |
+| `engine/src/legal.rs` | Legal-action enumeration |
+| `engine/src/config.rs` | Every tunable; the three variant presets |
+| `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 4 probes |
+| `engine/tests/` | One named test per ruling, named for its rule section |
+| `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
+
+Two structural points that are easy to undo by accident:
+
+- **Sub-decisions are separate zero-cost decision nodes on a stack** (`DESIGN.md` §4). A 5
+  that flips a King that re-empowers the lane resolves correctly because of this. Collapsing
+  them into one big action would blow up the branching factor and break §8's adaptive
+  ordering.
+- **Cards are tracked by `CardId`, never by slot.** Slots compact on death and shift when a
+  Queen moves a card, so anything remembered across a resolution step holds ids.

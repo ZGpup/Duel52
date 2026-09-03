@@ -680,6 +680,7 @@ impl GameState {
         let (rank, _known_to) = self.pile_mut(player).draw()?;
         self.hands[player.idx()].push(rank);
         self.hands[player.idx()].sort_unstable();
+        self.draws_taken[player.idx()] += 1;
         Some(rank)
     }
 

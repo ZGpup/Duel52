@@ -233,6 +233,15 @@ pub struct GameState {
     /// Consecutive plies with no damage and no kill (`game_rules.md` §7).
     pub quiet_plies: u32,
 
+    /// Total cards each player has drawn, from the turn-start draw and from 2s alike.
+    ///
+    /// Not a rule — pure instrumentation, and it exists for one specific question.
+    /// `game_rules.md` §10a claims the rules-as-written 2 "turns a filtering effect into a
+    /// lever on the draw count" by shrinking a **shared** pile, and `PLAN.md` asks for that
+    /// claim to be "measurable rather than assumed". Counting draws per player is what
+    /// makes the mechanism visible rather than merely inferred from win rates.
+    pub draws_taken: [u32; 2],
+
     pub outcome: Outcome,
 
     /// Sub-decisions still owed by the action being resolved. Empty in [`Phase::Main`].
@@ -669,6 +678,7 @@ pub(crate) fn empty_state(config: GameConfig, seed: u64) -> GameState {
         actions_remaining: 0,
         base_unlocked: false,
         quiet_plies: 0,
+        draws_taken: [0, 0],
         outcome: Outcome::Ongoing,
         pending: Vec::new(),
         next_card_id: 0,

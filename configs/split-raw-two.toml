@@ -1,0 +1,36 @@
+# Split deck with the RULES-AS-WRITTEN 2 — the control for the house rule.
+#
+# Identical to configs/split.toml except `two_power = "discard"`. It exists for exactly one
+# reason, stated in game_rules.md §10a: "Whether the parity problem is real is an empirical
+# question, and `two_power: discard` exists precisely so Phase 1 can answer it."
+#
+# The claim under test: RAW's discard permanently removes a card from the pile, changing
+# its parity. Someone now gets an extra draw, and the player who fires the 2 chooses who —
+# a lever on the draw count rather than a strategic dimension anyone designed. Bottoming
+# makes the 2 pile-neutral and hand-neutral: pure selection.
+#
+# What Phase 1 measured (see FINDINGS.md): under `bottom` the pile empties on a fixed ply
+# in every game, because it never shrinks. Under `discard` that ply varies. So the
+# mechanism the house rule was adopted to remove is real and now measured, though whether
+# it matters strategically is a question for Phase 2+, where agents actually choose when to
+# fire a 2.
+#
+#   duel52 stats --config configs/split-raw-two.toml --games 20000
+
+variant = "split"
+two_power = "discard"
+
+lanes = 3
+lanes_to_win = 2
+max_slots_per_side = 21
+max_rank_index = 12
+copies_per_rank = 4
+hand_size = 5
+base_cards_per_player = 3
+removal_count = 5
+
+actions_per_turn = 3
+first_turn_actions = 2
+draws_per_turn = 1
+stalemate_quiet_plies = 20
+max_plies = 2000

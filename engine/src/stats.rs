@@ -49,6 +49,8 @@ pub struct GameSummary {
     pub hand_sizes_at_unlock: [usize; 2],
     /// Largest number of cards seen on one side of one lane.
     pub max_side_occupancy: usize,
+    /// Total cards each player drew over the whole game. See `GameState::draws_taken`.
+    pub draws_taken: [u32; 2],
 }
 
 /// Play one random-vs-random game.
@@ -68,6 +70,7 @@ pub fn play_random_game(config: GameConfig, seed: u64) -> GameSummary {
         ply_at_unlock: None,
         hand_sizes_at_unlock: [0, 0],
         max_side_occupancy: 0,
+        draws_taken: [0, 0],
     };
 
     let record = |state: &GameState, summary: &mut GameSummary| {
@@ -96,6 +99,7 @@ pub fn play_random_game(config: GameConfig, seed: u64) -> GameSummary {
 
     summary.outcome = state.outcome;
     summary.plies = state.ply + 1;
+    summary.draws_taken = state.draws_taken;
     summary
 }
 
@@ -123,6 +127,17 @@ pub struct RandomPlayStats {
     pub max_side_occupancy: usize,
     pub total_decisions: u64,
     pub elapsed_secs: f64,
+
+    /// Total draws taken by each player, summed over every game.
+    ///
+    /// The direct measurement of the `game_rules.md` §10a parity claim. Under the house
+    /// rule the 2 is pile-neutral, so both players draw the pile dry and the totals differ
+    /// only by the odd card left when a game ends mid-pile. Under `two_power = discard`
+    /// each firing shrinks the pile — and in the **base** variant that pile is shared, so
+    /// the shrinkage lands on whoever would have drawn last.
+    pub draws_taken: [u64; 2],
+    /// Games in which one player drew strictly more cards than the other.
+    pub games_with_unequal_draws: usize,
 }
 
 impl RandomPlayStats {
@@ -252,33 +267,47 @@ impl RandomPlayStats {
             "  max cards on one side of one lane: {} (encoding bound in use: {})\n",
             self.max_side_occupancy, self.config.max_slots_per_side
         ));
+        out.push_str(&format!(
+            "  draws taken: P0 {} · P1 {} (P0 advantage {:+.4}/game, unequal in {:.1}% of games)\n",
+            self.draws_taken[0],
+            self.draws_taken[1],
+            self.draw_advantage_p0(),
+            100.0 * self.games_with_unequal_draws as f64 / self.games.max(1) as f64,
+        ));
         out
+    }
+
+    /// Mean extra cards P0 drew per game, relative to P1.
+    ///
+    /// This is the `game_rules.md` §10a parity lever, measured. Zero means the 2 is
+    /// pile-neutral as the house rule intends; a positive number means the rule is handing
+    /// the first player extra draws.
+    pub fn draw_advantage_p0(&self) -> f64 {
+        (self.draws_taken[0] as f64 - self.draws_taken[1] as f64) / self.games.max(1) as f64
     }
 
     /// One row of a Markdown table, for pasting into `FINDINGS.md`.
     pub fn markdown_row(&self) -> String {
         format!(
-            "| {} | {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.4} ± {:.4} | {:.1}% | {} | {:.0} | {} |",
+            "| {} | {} | {} | {:.4} ± {:.4} | {:.1}% | {:.1}% | {:.0} | {:+.3} | {} |",
             self.config.variant,
             self.config.two_power,
             self.games,
-            100.0 * self.p0_wins as f64 / self.games.max(1) as f64,
-            100.0 * self.p1_wins as f64 / self.games.max(1) as f64,
-            100.0 * self.draw_rate(),
             self.p0_score(),
             self.p0_score_ci95(),
+            100.0 * self.draw_rate(),
             100.0 * self.stalemate_rate(),
-            Self::percentile(&self.lengths, 0.50),
             Self::mean(&self.lengths),
+            self.draw_advantage_p0(),
             self.max_side_occupancy,
         )
     }
 
     /// Header for [`RandomPlayStats::markdown_row`].
     pub fn markdown_header() -> String {
-        "| variant | 2's power | games | P0 win | P1 win | draw | P0 score (95% CI) | \
-         stalemate | median plies | mean plies | max lane occupancy |\n\
-         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "| variant | 2's power | games | P0 score (95% CI) | draw | stalemate | mean plies | \
+         P0 draw edge | max lane |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---:|"
             .to_string()
     }
 }
@@ -302,6 +331,8 @@ pub fn run_random_games(config: GameConfig, first_seed: u64, games: usize) -> Ra
         max_side_occupancy: 0,
         total_decisions: 0,
         elapsed_secs: 0.0,
+        draws_taken: [0, 0],
+        games_with_unequal_draws: 0,
     };
 
     for i in 0..games {
@@ -327,6 +358,11 @@ pub fn run_random_games(config: GameConfig, first_seed: u64, games: usize) -> Ra
         }
         stats.max_side_occupancy = stats.max_side_occupancy.max(summary.max_side_occupancy);
         stats.total_decisions += summary.decisions as u64;
+        stats.draws_taken[0] += summary.draws_taken[0] as u64;
+        stats.draws_taken[1] += summary.draws_taken[1] as u64;
+        if summary.draws_taken[0] != summary.draws_taken[1] {
+            stats.games_with_unequal_draws += 1;
+        }
     }
 
     stats.lengths.sort_unstable();
@@ -408,5 +444,94 @@ mod tests {
             }
         }
         assert!(seen > 0, "no game in the sample reached the unlock");
+    }
+
+    /// `game_rules.md` §10a, the reason the house rule exists: "With a shared 26-card pile
+    /// the players alternate draws 13/13; remove one card and someone now gets an extra
+    /// draw, and the player who fires the 2 chooses who."
+    ///
+    /// Measured directly rather than inferred from win rates. Because P0 draws first from
+    /// the shared pile, every card the RAW 2 removes shifts the pile's parity, and the
+    /// shrinkage lands on P1.
+    ///
+    /// The house baseline is **not** zero: P0 also draws first, so a game that ends before
+    /// the pile is exhausted leaves P0 with the odd draw. That residual (~0.05 cards/game)
+    /// is structural and has nothing to do with the 2. The RAW effect is an order of
+    /// magnitude larger, which is what makes it a lever rather than noise.
+    #[test]
+    fn rule_10a_the_raw_two_hands_the_first_player_extra_draws_in_the_base_game() {
+        let house = run_random_games(GameConfig::base(), 1, 4000);
+        let mut raw_config = GameConfig::base();
+        raw_config.two_power = crate::config::TwoPower::Discard;
+        let raw = run_random_games(raw_config, 1, 4000);
+
+        assert!(
+            house.draw_advantage_p0() < 0.15,
+            "the house 2 is pile-neutral, so P0's edge should stay near the structural \
+             residual; got {:+.4} cards/game",
+            house.draw_advantage_p0()
+        );
+        assert!(
+            raw.draw_advantage_p0() > 0.35,
+            "RAW should hand P0 a much larger draw advantage, got {:+.4} cards/game",
+            raw.draw_advantage_p0()
+        );
+        assert!(
+            raw.draw_advantage_p0() > 5.0 * house.draw_advantage_p0().max(0.01),
+            "the RAW effect should dwarf the structural residual: RAW {:+.4} vs house {:+.4}",
+            raw.draw_advantage_p0(),
+            house.draw_advantage_p0()
+        );
+    }
+
+    /// The control: the lever is absent from the split variants, because there you bottom
+    /// or discard into **your own** pile — there is no shared pile whose parity to flip
+    /// (`game_rules.md` §9a). This is what shows the effect above is really about pile
+    /// *sharing* rather than about the 2 as such.
+    #[test]
+    fn rule_9a_the_split_deck_has_no_shared_pile_parity_to_flip() {
+        for two_power in [
+            crate::config::TwoPower::Bottom,
+            crate::config::TwoPower::Discard,
+        ] {
+            let mut config = GameConfig::split_deck();
+            config.two_power = two_power;
+            let stats = run_random_games(config, 1, 4000);
+            assert!(
+                stats.draw_advantage_p0().abs() < 0.05,
+                "{two_power:?}: split decks give each player their own pile, so there \
+                 should be no systematic draw edge; got {:+.4}",
+                stats.draw_advantage_p0()
+            );
+        }
+    }
+
+    /// A second consequence of the house rule, and a genuine difference between the two
+    /// settings: bottoming **recycles**, so a player can take more draws than their pile
+    /// holds cards. `game_rules.md` §10a: "Cards are recycled, not destroyed. A bottomed
+    /// card *will* be drawn again if the pile outlasts it."
+    ///
+    /// Under RAW the pile only ever shrinks, so 13 draws is a hard ceiling in the split
+    /// variant and every game hits it exactly.
+    #[test]
+    fn rule_10a_bottoming_recycles_cards_so_draw_counts_exceed_the_pile_size() {
+        let pile = GameConfig::split_deck().expected_pile_size() as f64;
+
+        let mut raw_config = GameConfig::split_deck();
+        raw_config.two_power = crate::config::TwoPower::Discard;
+        let raw = run_random_games(raw_config, 1, 2000);
+        let raw_mean = raw.draws_taken[0] as f64 / raw.games as f64;
+        assert!(
+            raw_mean <= pile,
+            "RAW destroys cards, so draws cannot exceed the pile size; got {raw_mean:.2}"
+        );
+
+        let house = run_random_games(GameConfig::split_deck(), 1, 2000);
+        let house_mean = house.draws_taken[0] as f64 / house.games as f64;
+        assert!(
+            house_mean > pile,
+            "bottoming recycles, so draws should exceed the {pile} card pile; got \
+             {house_mean:.2}"
+        );
     }
 }

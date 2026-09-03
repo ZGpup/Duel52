@@ -10,7 +10,38 @@ analysis for this game. The agent is the instrument. The insight is the delivera
 
 ## Status
 
-Specification complete. No code yet.
+**Phase 1 complete.** The engine plays the full game to spec, with 190 tests named after the
+rule sections they check, PyO3 bindings, a text CLI, and baseline statistics over 1.2M
+random games. No agent yet — that is Phase 2.
+
+## Try it
+
+```bash
+cargo build --release
+./target/release/duel52 play --seed 1     # play the engine in your terminal
+./target/release/duel52 powers            # what every card does
+./target/release/duel52 stats --all       # the Phase 1 numbers
+```
+
+Every prompt names the rule it is applying, so if the engine does something that looks
+wrong you can point at exactly which ruling it thinks it is following. `--seed N` makes a
+game exactly reproducible, so a rules complaint travels as a seed and a move number.
+
+## What Phase 1 found
+
+Details and provenance in [FINDINGS.md](FINDINGS.md). Random play characterises the game
+*tree*, not strategy, so none of this speaks to how the game should be played:
+
+- Games are short and tightly clustered: **45 plies**, median and mean, in every variant.
+- **First-player advantage is real but small** — P0 scores 0.512, about +1.2 points.
+- **The stalemate rule never fired once in 1.2M games**, because the stall the rules
+  describe is strategic and random agents attack constantly. It remains untested.
+- **The house rule for the 2 fixes a real artifact.** Rules-as-written, the 2 discards a
+  card from a *shared* pile, which hands the first player half an extra draw per game and
+  +0.9 points of score. Bottoming instead makes it exactly zero. The artifact turns out to
+  be about pile *sharing*, so it does not exist in the split-deck variant at all.
+- The mutual-lane-win draw the rules call "astronomically rare" happens in **1 game in
+  220** at this level of play. `duel52 demo --seed 86` replays one.
 
 ## The game, briefly
 
@@ -27,7 +58,7 @@ Two properties make it interesting as an AI problem:
 
 ## Plan
 
-**Phase 1: Engine.** Rust core with exact rules, PyO3 bindings, one test per ruling, and a
+**Phase 1: Engine.** ✅ Rust core with exact rules, PyO3 bindings, one test per ruling, and a
 text CLI to play against. Ends with random vs random statistics.
 
 **Phase 2: Baselines.** Random, greedy, flat Monte Carlo, PIMC, and ISMCTS with random
@@ -53,6 +84,17 @@ Everything runs locally on an M series Mac and scales to rented CUDA through con
 | [PLAN.md](PLAN.md) | Phased roadmap with status. |
 | [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) | Unresolved rules and design questions. |
 | [FINDINGS.md](FINDINGS.md) | Results, and hypotheses recorded before any data. |
+| [CLAUDE.md](CLAUDE.md) | Commands, repo layout, and the facts that are easy to get wrong. |
+
+## Layout
+
+```
+engine/      the rules engine (zero dependencies) and the `duel52` CLI
+  tests/     one named test per ruling, named for its rule section
+bindings/    PyO3 wrapper, kept separate so the engine never depends on Python
+py/duel52/   the Python package
+configs/     variant configs: split (default), base, mirrored, split-raw-two
+```
 
 ## A note on rules
 
