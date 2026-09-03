@@ -842,6 +842,90 @@ fn encoding_spec<'py>(
     Ok(d)
 }
 
+// ================================================= Phase 3 step 3: the training corpus ==
+
+/// Read a `.d52sp` self-play shard and replay it into training tensors.
+///
+/// This is the *only* way the trainer gets observations, and it is deliberately a call into
+/// Rust rather than a decoder in Python: `CLAUDE.md` says there is exactly one encoder and
+/// it lives in `engine/src/encode.rs`. The shard stores trajectories — seeds and
+/// legal-action indices — so the tensors come out in whatever layout this build encodes,
+/// and a shard survives an encoder change.
+///
+/// Returns a dict of **flat little-endian buffers** to be wrapped with
+/// ``numpy.frombuffer``; see ``py/duel52/train/buffer.py``, which is the only intended
+/// caller. Observations are sparse (4.8% dense — `FINDINGS.md` F3.3), as CSR-style
+/// `offset`/`index`/`value` triples, because a dense generation is gigabytes and a sparse
+/// one is hundreds of megabytes.
+///
+/// `stride` keeps one decision in `stride` (default 1 — all of them).
+#[pyfunction]
+#[pyo3(signature = (path, threads=0, stride=1))]
+fn replay_shard<'py>(
+    py: Python<'py>,
+    path: &str,
+    threads: usize,
+    stride: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    use pyo3::types::PyBytes;
+
+    let shard = duel52_engine::selfplay::Shard::read(std::path::Path::new(path))
+        .map_err(PyRuntimeError::new_err)?;
+    let threads = if threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        threads
+    };
+    // Replaying is pure Rust over data it owns, so the GIL is not needed and holding it
+    // would serialise the trainer against anything else in the process. (`detach` is
+    // pyo3 0.29's name for what used to be `allow_threads`.)
+    let (set, recorded) = py.detach(|| {
+        let recorded = shard.sample_count();
+        (duel52_engine::selfplay::replay(&shard, threads, stride), recorded)
+    });
+
+    fn bytes_of<'py, T: Copy>(py: Python<'py>, v: &[T]) -> Bound<'py, PyBytes> {
+        // Every element is a plain `u32` or `f32`, so the buffer is exactly the
+        // little-endian array numpy will read back. Little-endian is assumed; every
+        // platform this project targets is.
+        let raw = unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
+        };
+        PyBytes::new(py, raw)
+    }
+
+    let d = PyDict::new(py);
+    d.set_item("samples", set.samples)?;
+    d.set_item("recorded_samples", recorded)?;
+    d.set_item("obs_dim", set.obs_dim)?;
+    d.set_item("action_dim", set.action_dim)?;
+    d.set_item("obs_offset", bytes_of(py, &set.obs_offset))?;
+    d.set_item("obs_index", bytes_of(py, &set.obs_index))?;
+    d.set_item("obs_value", bytes_of(py, &set.obs_value))?;
+    d.set_item("policy_offset", bytes_of(py, &set.policy_offset))?;
+    d.set_item("policy_index", bytes_of(py, &set.policy_index))?;
+    d.set_item("policy_prob", bytes_of(py, &set.policy_prob))?;
+    d.set_item("value", bytes_of(py, &set.value))?;
+    d.set_item("root_value", bytes_of(py, &set.root_value))?;
+
+    let header = PyDict::new(py);
+    for (k, v) in &shard.header {
+        header.set_item(k, v)?;
+    }
+    d.set_item("header", header)?;
+    d.set_item("games", shard.games.len())?;
+    d.set_item("config", shard.config.to_config_string())?;
+    d.set_item(
+        "obs_layout_hash",
+        format!("{:016x}", encode::obs_layout_hash(&shard.config)),
+    )?;
+    d.set_item(
+        "action_layout_hash",
+        format!("{:016x}", encode::action_layout_hash(&shard.config)),
+    )?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", "Rust engine for Duel 52. Imported via the `duel52` package.")?;
@@ -852,5 +936,6 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(power_reference, m)?)?;
     m.add_function(wrap_pyfunction!(ladder_agents, m)?)?;
     m.add_function(wrap_pyfunction!(encoding_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(replay_shard, m)?)?;
     Ok(())
 }

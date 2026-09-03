@@ -1,0 +1,129 @@
+# The first-pass training configuration — PLAN.md Phase 3 step 3.
+#
+# Sized for a 2-3 hour session on an 8-core M-series Mac, which is an *assessment* run: long
+# enough to see whether the loop learns at all, short enough to throw away. Every number
+# below was set against the measurements in FINDINGS.md F3.4, so if you change the machine,
+# re-measure rather than assuming.
+#
+#   python -m duel52.train check --config configs/train-fast.toml
+#   python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first
+#
+# To scale up for a real run: raise selfplay.games and selfplay.sims first (the data is the
+# bottleneck, not the fitting), then net.width and net.blocks, then run.hours.
+
+[game]
+variant = "split"
+
+# 21, not the default 16. FINDINGS.md F3.1: 16 survives self-play and does NOT survive an
+# evaluation ladder, because `random` never kills anything and lanes fill up against it —
+# and `random` is the anchor rung forever. 21 is the theoretical maximum, so the encoder
+# provably cannot assert mid-run. Costs obs_dim 3300 -> 4290 and action_dim 1325 -> 2195.
+#
+# This must match the checkpoint. It is what fixes obs_dim, so a mismatch is a refused
+# checkpoint rather than a silent misread.
+encoding_slots = 21
+
+# What an engine-declared stalemate is worth TO THE LEARNER, to both players.
+#
+# The engine default is 0.5 — the same as any draw — and FINDINGS.md F3.6 is the record of
+# what that does to a training run: mutual refusal to attack is a stable equilibrium when a
+# certain half point beats a risky fight, and the loop found it. Draw rate went 9% -> 55% ->
+# 88% over three generations while the agent's score against `random` fell 0.93 -> 0.53.
+#
+# 0.0 makes refusing to play no better than losing, so a player who is behind always prefers
+# a gamble to a stall. The stalemate is [ENGINE], not a rule (game_rules.md §7 says the
+# published game defines no draw), so this is correcting an artefact rather than editing the
+# game. A mutual lane win — a real §7 outcome — keeps its half point either way.
+#
+# Scoring and Elo are NOT affected: a draw is still half a point in `match` and `ladder`, so
+# every number in FINDINGS.md F1 and F2 still means what it meant.
+stalemate_value = 0.0
+
+[net]
+# Small on purpose. The input layer and the policy head both scale with the encoder's
+# dimensions, which are large, so a 128-wide trunk is already ~950k parameters. Inference
+# cost sets how many self-play games an hour buys, and at this stage games matter more than
+# capacity.
+width = 128
+blocks = 3
+value_hidden = 128
+
+[selfplay]
+# ~8 minutes per generation at 6.2 games/sec on 8 cores (FINDINGS.md F3.4), about 500k
+# decisions.
+games = 3000
+
+# PUCT simulations per decision. Cost is very close to linear in this, so it trades
+# directly against games: 64 sims and 3000 games, or 128 sims and 1500. For a first pass,
+# more games is the better half of that trade — the policy target only needs to be better
+# than the current policy, not good.
+sims = 64
+c_puct = 1.25
+
+# Root exploration noise. Self-play only; evaluation and gating play without it.
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+
+# Sample the first ~third of a game from the visit counts, then play the most-visited move,
+# so the value target is the result of a game both sides were trying to win.
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+# "auto" resolves to MPS here and CUDA on a rented box. This string is the whole handoff.
+device = "auto"
+batch_size = 512
+steps_per_generation = 1200
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# Keep one decision in two. Consecutive decisions inside a turn are nearly the same
+# position, so this halves memory for very little signal, and the replay buffer is the
+# largest thing in the process.
+sample_stride = 2
+
+# ~250k samples a generation, so three generations is ~750k samples and ~1.2 GB. Raise
+# buffer_generations on a machine with more RAM; a wider window is the cheapest stability
+# there is.
+buffer_generations = 3
+buffer_samples = 700000
+
+[gate]
+# Two tests, and a candidate must pass both. See FINDINGS.md F3.6 for why the obvious
+# single-test version failed: 199 draws in 200 games scores exactly 0.500, which cleared a
+# 0.5 threshold and promoted three consecutive generations of a collapsing agent.
+games = 200
+sims = 64
+
+# Test 1: the mirror match, scored on DECISIVE games only — W / (W + L), draws discarded.
+# With draws out of the denominator, AlphaGo Zero's 0.55 is meaningful again. Below
+# min_decisive resolved games the mirror abstains rather than reporting a number computed
+# from a handful of results.
+threshold = 0.55
+min_decisive = 20
+
+# Test 2: the reference veto. These opponents will not cooperate with a stall, so they are
+# the only measurement in the loop that a stalling agent cannot fake. Run on the CANDIDATE,
+# before the decision. A candidate that falls more than reference_tolerance below the
+# incumbent on any of them is refused, whatever the mirror match said.
+#
+# This is a veto, never a target — optimising to beat `random` is not the goal.
+reference = ["random", "greedy"]
+reference_games = 150
+reference_tolerance = 0.05
+
+# Stop rather than grind. A gate that refuses three in a row is working; a loop that hides
+# that behind healthy-looking loss curves for another two hours is not.
+max_consecutive_refusals = 3
+
+[run]
+# One generation measured at 8m01s (FINDINGS.md F3.5), so the hours budget is what binds and
+# this cap is only a backstop. The loop stops *before* a generation that would overrun,
+# rather than after, so 2.5 here means at most 2.5.
+generations = 20
+hours = 2.5
+seed = 1000000
+threads = 0                       # 0 = every core
+engine = "./target/release/duel52"

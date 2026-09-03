@@ -1,49 +1,64 @@
 //! The interactive prompt's action tree.
 //!
 //! [`GameState::legal_actions`](crate::GameState::legal_actions) returns a flat list, which
-//! is the right shape for an agent and the wrong shape for a person: in a live midgame it
-//! is sixty-odd lines, most of them the attacker × target cross-product of one lane. This
-//! module reshapes that same list into two levels — **pick a card, then pick what it does**
-//! — so what a human reads is one line per card they own.
+//! is the right shape for an agent and the wrong shape for a person: in a live midgame it is
+//! sixty-odd lines, most of them the attacker × target cross-product of one lane. This
+//! module reshapes that same list into a tree that asks one question at a time — *which
+//! verb, which lane, which card* — the order the game is actually played in.
 //!
-//! Nothing here decides legality. Every leaf of the tree is an [`Action`] taken verbatim
-//! from the list the engine handed over, and every action in that list appears at exactly
-//! one leaf, so the tree can neither invent a move nor hide one. `CLAUDE.md`: the engine is
-//! the sole authority on legality.
+//! # Every number means the same thing every time
+//!
+//! The tree is built so that what a player types is a property of the game, not of the list:
+//!
+//! - the five §4 verbs are always in the same order at the same numbers, whether or not they
+//!   are available this turn;
+//! - a lane's number is its lane number, always;
+//! - a card's number is **its position in the column the board draws**, via
+//!   [`display::column_slots`](crate::display::column_slots) — so "the second card in lane 2"
+//!   means the same thing on the board and at the prompt.
+//!
+//! Holding that line means listing things that cannot be picked right now. A row with
+//! nothing behind it keeps its place and shows `—` rather than closing the gap, because a
+//! menu that renumbers itself is a menu you have to read every time.
+//!
+//! Nothing here decides legality. Every leaf of the tree is an [`Action`] taken verbatim from
+//! the list the engine handed over, and every action in that list appears at exactly one
+//! leaf, so the tree can neither invent a move nor hide one. `CLAUDE.md`: the engine is the
+//! sole authority on legality.
 //!
 //! Information hiding is inherited rather than reimplemented: every rank this module prints
 //! comes from `display::card_token` or from the acting player's own hand, and the combat
 //! notes come from `display::combat_notes`, which reads face-up cards only.
 
 use crate::action::{Action, Side};
-use crate::display::{card_token, combat_notes, knows, lane_label, slot_label, Observer};
+use crate::display::{
+    card_token, column_slots, combat_notes, knows, lane_label, Observer,
+};
+use crate::player::Player;
 use crate::rank::Rank;
 use crate::state::{GameState, Pending, ResolveKind};
 
 /// One numbered line of a menu.
 pub struct Row {
-    /// The heading this row sits under. Consecutive rows sharing a heading are printed
-    /// under one copy of it; an empty heading prints a blank separator and no heading.
+    /// The heading this row sits under. Consecutive rows sharing a heading are printed under
+    /// one copy of it; an empty heading prints a blank separator and no heading.
     pub heading: String,
-    /// The row's own name — the card, the lane, the rank.
-    pub label: String,
-    /// What picking it means.
+    /// What the row is called — `PLAY`, `LANE 2`, `CARD`. The number is not part of this:
+    /// the renderer appends it, because it *is* the row's position.
+    pub name: String,
+    /// The card token and whatever is worth knowing before picking.
     pub note: String,
-    /// The row compressed onto one line of the menu *above* it, for when a card's only
-    /// move has to be stated on the line that takes it. Kept separate from `note` because
-    /// the two have different budgets: a second menu has a whole screen for one power's
-    /// text, while the card list has to fit a row per card inside the board's width.
-    pub summary: String,
 }
 
 /// What picking a row does.
 pub enum Pick {
-    /// Apply this action straight away. Either the row *is* a complete action (`pass`), or
-    /// it is the only thing its card can do — a second menu holding one option is a
-    /// keystroke that asks nothing.
+    /// Apply this action.
     Take(Action),
-    /// Open a second menu. Only ever one level deeper: a card, then what it does.
+    /// Ask the next question.
     Open(Box<Menu>),
+    /// Nothing behind this row right now. It keeps its number so that the rows around it
+    /// keep theirs.
+    Unavailable,
 }
 
 /// A menu: a question, and the numbered answers to it.
@@ -52,15 +67,14 @@ pub enum Pick {
 pub struct Menu {
     /// The question, printed above the rows.
     pub prompt: String,
-    /// One line of context under the question — a power's full text, a rule that is about
-    /// to bite. Empty when there is nothing to add.
+    /// One line of context under the question. Empty when there is nothing to add, which is
+    /// most of the time — the board says it better.
     pub hint: String,
     pub rows: Vec<Row>,
     pub picks: Vec<Pick>,
 }
 
 impl Menu {
-    /// How many numbered rows this menu offers.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -69,8 +83,8 @@ impl Menu {
         self.rows.is_empty()
     }
 
-    /// Walk `path` down from this menu. A path that has gone stale — which can only happen
-    /// if the state changed underneath it — resolves to the deepest menu that still exists
+    /// Walk `path` down from this menu. A path that has gone stale — which can only happen if
+    /// the state changed underneath it — resolves to the deepest menu that still exists
     /// rather than panicking.
     pub fn at(&self, path: &[usize]) -> &Menu {
         match path.split_first() {
@@ -82,22 +96,22 @@ impl Menu {
         }
     }
 
-    /// The menu as printed: the question, the hint, then the numbered rows under their
-    /// headings.
-    pub fn render(&self) -> String {
+    /// The menu as printed: the question, then the numbered rows under their headings.
+    ///
+    /// `nested` adds the row that goes back up a level. It lives here rather than at the
+    /// call site so that it lines up with everything above it.
+    pub fn render(&self, nested: bool) -> String {
         let mut out = format!("\n {}\n", self.prompt);
         if !self.hint.is_empty() {
             out.push_str(&format!("   {}\n", self.hint));
         }
-        // Align the notes into a column, but never let one long card token push the whole
-        // board's worth of notes off the right edge.
         let width = self
             .rows
             .iter()
-            .map(|r| r.label.chars().count())
+            .map(|r| r.name.chars().count())
             .max()
             .unwrap_or(0)
-            .min(30);
+            .max(if nested { 4 } else { 0 });
 
         let mut current: Option<&str> = None;
         for (i, row) in self.rows.iter().enumerate() {
@@ -108,15 +122,19 @@ impl Menu {
                 }
                 current = Some(row.heading.as_str());
             }
-            let n = i + 1;
+            let number = match self.picks[i] {
+                Pick::Unavailable => "—".to_string(),
+                _ => format!("#{}", i + 1),
+            };
+            let head = format!("   {:<width$} {number:>2}", row.name);
             if row.note.is_empty() {
-                out.push_str(&format!("   {n:>3}. {}\n", row.label));
+                out.push_str(&format!("{head}\n"));
             } else {
-                out.push_str(&format!(
-                    "   {n:>3}. {:<width$}   {}\n",
-                    row.label, row.note
-                ));
+                out.push_str(&format!("{head}   {}\n", row.note));
             }
+        }
+        if nested {
+            out.push_str(&format!("\n   {:<width$} {:>2}\n", "BACK", "#0"));
         }
         out
     }
@@ -152,42 +170,22 @@ impl Builder {
         self.heading = heading.into();
     }
 
-    fn push(&mut self, label: impl Into<String>, note: impl Into<String>, pick: Pick) {
-        let (label, note) = (label.into(), note.into());
-        let summary = if note.is_empty() {
-            label.clone()
-        } else {
-            format!("{label} — {note}")
-        };
+    fn push(&mut self, name: impl Into<String>, note: impl Into<String>, pick: Pick) {
         self.rows.push(Row {
             heading: self.heading.clone(),
-            label,
-            note,
-            summary,
+            name: name.into(),
+            note: note.into(),
         });
         self.picks.push(pick);
     }
 
-    fn take(&mut self, label: impl Into<String>, note: impl Into<String>, action: Action) {
-        self.push(label, note, Pick::Take(action));
-    }
-
-    /// A row whose compressed form is not just its label and note — because the note is
-    /// too long for the line above.
-    fn take_summarised(
-        &mut self,
-        label: impl Into<String>,
-        note: impl Into<String>,
-        summary: impl Into<String>,
-        action: Action,
-    ) {
-        self.push(label, note, Pick::Take(action));
-        let last = self.rows.last_mut().expect("just pushed");
-        last.summary = summary.into();
-    }
-
-    fn open(&mut self, label: impl Into<String>, note: impl Into<String>, sub: Menu) {
-        self.push(label, note, Pick::Open(Box::new(sub)));
+    /// A row that leads somewhere if `sub` is `Some`, and holds its number if not.
+    fn step(&mut self, name: impl Into<String>, note: impl Into<String>, sub: Option<Menu>) {
+        let pick = match sub {
+            Some(menu) => Pick::Open(Box::new(menu)),
+            None => Pick::Unavailable,
+        };
+        self.push(name, note, pick);
     }
 
     fn done(self) -> Menu {
@@ -202,8 +200,8 @@ impl Builder {
 
 /// Build the menu for whatever decision is on the table.
 ///
-/// `legal` must be the list the engine just returned for this state; it is the only source
-/// of actions.
+/// `legal` must be the list the engine just returned for this state; it is the only source of
+/// actions.
 pub fn build(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
     if legal.is_empty() {
         return Builder::new("No decision to make.").done();
@@ -214,9 +212,7 @@ pub fn build(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
         Some(Pending::ResolveOrder { kind, lane, remaining, .. }) => {
             build_resolve_order(state, legal, observer, *kind, *lane, remaining.len())
         }
-        Some(Pending::QueenSource { lane, .. }) => {
-            build_queen_source(state, legal, observer, *lane)
-        }
+        Some(Pending::QueenSource { lane, .. }) => build_queen_source(state, legal, observer, *lane),
         Some(Pending::GiveBack { .. }) => build_give_back(state, legal),
         Some(Pending::SplitTarget { lane, attackers, .. }) => {
             build_split_target(state, legal, observer, *lane, attackers.first().copied())
@@ -224,328 +220,400 @@ pub fn build(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
     }
 }
 
+// ========================================================================== helpers ==
+
+/// The lane an action happens in, for the actions that name one.
+fn lane_of(action: Action) -> Option<usize> {
+    match action {
+        Action::Play { lane, .. }
+        | Action::Flip { lane, .. }
+        | Action::Attack { lane, .. }
+        | Action::DeclarePair { lane, .. }
+        | Action::Peek { lane, .. }
+        | Action::ResolveNext { lane, .. }
+        | Action::MoveHere { lane, .. } => Some(lane as usize),
+        Action::Pass | Action::GiveBack { .. } | Action::SplitTarget { .. } => None,
+    }
+}
+
+fn in_lane(actions: &[Action], lane: usize) -> Vec<Action> {
+    actions
+        .iter()
+        .copied()
+        .filter(|a| lane_of(*a) == Some(lane))
+        .collect()
+}
+
+/// A menu over the lanes. Every lane keeps its number whether or not this step can reach it,
+/// so lane 2 is `#2` in every menu that asks for a lane.
+fn lane_menu(
+    state: &GameState,
+    prompt: impl Into<String>,
+    mut sub: impl FnMut(usize) -> Option<Menu>,
+) -> Menu {
+    let mut b = Builder::new(prompt);
+    for lane in 0..state.lane_count() {
+        let name = format!("LANE {}", lane_label(lane));
+        b.step(name, String::new(), sub(lane));
+    }
+    b.done()
+}
+
+/// A menu over one side of one lane.
+///
+/// Lists **every** card in the column, in the order the board draws it, so a card's number is
+/// where it sits on the board. `detail` returns what to say about a card and the action to
+/// take for it; returning `None` for the action leaves the row in place, showing `—`.
+fn card_menu(
+    state: &GameState,
+    observer: Observer,
+    prompt: impl Into<String>,
+    lane: usize,
+    owner: Player,
+    name: &str,
+    mut detail: impl FnMut(usize) -> (String, Option<Pick>),
+) -> Menu {
+    let mut b = Builder::new(prompt);
+    for slot in column_slots(state, lane, owner, observer) {
+        let token = card_token(&state.lanes[lane].side(owner)[slot], observer);
+        let (text, pick) = detail(slot);
+        let note = if text.is_empty() {
+            token
+        } else {
+            format!("{token}   {text}")
+        };
+        b.push(name, note, pick.unwrap_or(Pick::Unavailable));
+    }
+    b.done()
+}
+
+/// The power's name, for a card whose rank this observer is entitled to know.
+fn power_note(state: &GameState, lane: usize, owner: Player, slot: usize, observer: Observer) -> String {
+    match state.at(lane, owner, slot) {
+        Some(card) if knows(card, observer) => card.rank.power_name().to_string(),
+        // A base card is hidden from its owner too (`game_rules.md` §3).
+        _ => String::new(),
+    }
+}
+
 // ====================================================================== the main phase ==
 
-/// Pick a card, then pick what it does.
+/// The five §4 actions, always in this order at these numbers.
 ///
-/// The grouping is by *subject*: the card whose action it is. That is the one grouping under
-/// which every §4 action falls into exactly one place — a `Play` belongs to a card in hand,
-/// a `Flip` and an `Attack` to a card on the board — and it is also how a person thinks
-/// about a turn ("what does my 9 do?"), rather than how the action encoding is shaped.
+/// Fixing the numbers costs a row for each verb that has nothing behind it and buys the
+/// thing a player actually wants from a menu they will see a thousand times: `3` is attack,
+/// this turn and every turn, whether or not there is anything to attack.
 fn build_main(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
-    let me = state.acting_player();
-    let mut b = Builder::new(format!(
-        "Pick a card to act with — {} action(s) left this turn.",
-        state.actions_remaining
-    ))
-    .hint("A number picks a card; a card with one legal move takes it at once.");
+    let of = |f: fn(&Action) -> bool| -> Vec<Action> {
+        legal.iter().copied().filter(f).collect()
+    };
+    let plays = of(|a| matches!(a, Action::Play { .. }));
+    let flips = of(|a| matches!(a, Action::Flip { .. }));
+    let attacks = of(|a| matches!(a, Action::Attack { .. }));
+    let pairs = of(|a| matches!(a, Action::DeclarePair { .. }));
 
-    // --- IN HAND: one row per distinct rank, since identical ranks are interchangeable. --
-    let hand = state.hand(me);
+    let mut b = Builder::new(format!(
+        "Your move — {} action(s) left.",
+        state.actions_remaining
+    ));
+    b.step(
+        "PLAY",
+        String::new(),
+        (!plays.is_empty()).then(|| play_menu(state, &plays)),
+    );
+    b.step(
+        "FLIP",
+        String::new(),
+        (!flips.is_empty()).then(|| flip_menu(state, &flips, observer)),
+    );
+    b.step(
+        "ATTACK",
+        String::new(),
+        (!attacks.is_empty()).then(|| attack_menu(state, &attacks, observer)),
+    );
+    b.step(
+        "PAIR",
+        String::new(),
+        (!pairs.is_empty()).then(|| pair_menu(state, &pairs, observer)),
+    );
+    b.push("PASS", String::new(), Pick::Take(Action::Pass));
+    b.done()
+}
+
+/// PLAY: which card, then which lane. Identical ranks in hand collapse to one row — the
+/// engine treats them as interchangeable, so offering both would be two rows for one choice.
+fn play_menu(state: &GameState, plays: &[Action]) -> Menu {
+    let hand = state.hand(state.acting_player());
     let mut ranks: Vec<Rank> = Vec::new();
-    for action in legal {
+    for action in plays {
         if let Action::Play { rank, .. } = action {
             if !ranks.contains(rank) {
                 ranks.push(*rank);
             }
         }
     }
-    if !ranks.is_empty() {
-        b.heading(format!("IN HAND ({} card(s))", hand.len()));
-        for rank in ranks {
-            let lanes: Vec<u8> = legal
-                .iter()
-                .filter_map(|a| match a {
-                    Action::Play { rank: r, lane } if *r == rank => Some(*lane),
-                    _ => None,
-                })
-                .collect();
-            let copies = hand.iter().filter(|r| **r == rank).count();
-            let label = if copies > 1 {
-                format!("{rank} ×{copies}")
-            } else {
-                format!("{rank}")
-            };
-            let sub = lane_menu(state, rank, &lanes);
-            if let [only] = lanes[..] {
-                // A one-lane config: there is no lane to choose.
-                b.take(
-                    label,
-                    format!("play face-down into lane {}", lane_label(only)),
-                    Action::Play { rank, lane: only },
-                );
-            } else {
-                b.open(
-                    label,
-                    format!("play face-down — {}", rank.power_name()),
-                    sub,
-                );
-            }
-        }
-    }
 
-    // --- ON THE BOARD: one row per card of yours that can do something. ----------------
+    let mut b = Builder::new("PLAY — which card?");
+    b.heading("IN HAND");
+    for rank in ranks {
+        let copies = hand.iter().filter(|r| **r == rank).count();
+        let label = if copies > 1 {
+            format!("{rank} ×{copies}")
+        } else {
+            format!("{rank}")
+        };
+        let lanes: Vec<u8> = plays
+            .iter()
+            .filter_map(|a| match a {
+                Action::Play { rank: r, lane } if *r == rank => Some(*lane),
+                _ => None,
+            })
+            .collect();
+        b.step(
+            "CARD",
+            format!("{label:<6} {}", rank.power_name()),
+            Some(play_lane_menu(state, rank, &lanes)),
+        );
+    }
+    b.done()
+}
+
+fn play_lane_menu(state: &GameState, rank: Rank, lanes: &[u8]) -> Menu {
+    let mut b = Builder::new(format!("PLAY the {rank} face-down — which lane?"))
+        .hint(format!("{}: {}", rank.power_name(), rank.power_text()));
     for lane in 0..state.lane_count() {
-        let mut lane_started = false;
-        for slot in 0..state.lanes[lane].side(me).len() {
-            let mine: Vec<Action> = legal
-                .iter()
-                .copied()
-                .filter(|a| acts_from(*a, lane, slot))
-                .collect();
-            if mine.is_empty() {
-                continue;
-            }
-            if !lane_started {
-                b.heading(format!("LANE {} — your cards", lane_label(lane)));
-                lane_started = true;
-            }
-            let token = state
-                .at(lane, me, slot)
-                .map(|c| card_token(state, c, observer))
-                .unwrap_or_default();
-            let label = format!("#{} {}", slot_label(slot), token);
-
-            let sub = card_menu(state, observer, lane, slot, &label, &mine);
-            if let [only] = mine[..] {
-                // The one-move case is the common one: a face-down card can only be
-                // flipped. The row has to carry the whole consequence, because picking it
-                // does it — there is no second menu to reconsider in.
-                b.take(label.clone(), sub.rows[0].summary.clone(), only);
-            } else {
-                b.open(label.clone(), verb_summary(&mine), sub);
-            }
+        let name = format!("LANE {}", lane_label(lane));
+        match lanes.iter().find(|&&l| l as usize == lane) {
+            Some(&l) => b.push(name, String::new(), Pick::Take(Action::Play { rank, lane: l })),
+            None => b.push(name, String::new(), Pick::Unavailable),
         }
-    }
-
-    // --- Ending the turn is not a card, so it gets its own heading. --------------------
-    if legal.contains(&Action::Pass) {
-        b.heading("END THE TURN");
-        b.take(
-            "pass",
-            format!(
-                "forfeit the rest of this turn ({} action(s) unused)",
-                state.actions_remaining
-            ),
-            Action::Pass,
-        );
     }
     b.done()
 }
 
-/// Does `action` belong to the card at `lane`/`slot` on the acting player's side?
-///
-/// A `DeclarePair` belongs to *both* of its members, so it is offered from either card.
-/// Picking it from one or the other yields the same action, since the engine's slots are
-/// ordered.
-fn acts_from(action: Action, lane: usize, slot: usize) -> bool {
-    let (l, s) = (lane as u8, slot as u8);
-    match action {
-        Action::Flip { lane, slot } => (lane, slot) == (l, s),
-        Action::Attack { lane, attacker, .. } => (lane, attacker) == (l, s),
-        Action::DeclarePair { lane, slot_a, slot_b } => lane == l && (slot_a == s || slot_b == s),
-        _ => false,
-    }
-}
-
-/// The second menu for a card in hand: which lane.
-fn lane_menu(state: &GameState, rank: Rank, lanes: &[u8]) -> Menu {
+/// FLIP: which lane, then which card.
+fn flip_menu(state: &GameState, flips: &[Action], observer: Observer) -> Menu {
     let me = state.acting_player();
-    let mut b = Builder::new(format!("Play the {rank} face-down into which lane?")).hint(
-        format!("{}: {}", rank.power_name(), rank.power_text()),
-    );
-    for &lane in lanes {
-        let l = lane as usize;
-        b.take(
-            format!("lane {}", lane_label(lane)),
-            format!(
-                "you have {} card(s) there, opponent {}",
-                state.lanes[l].side(me).len(),
-                state.lanes[l].side(me.other()).len()
-            ),
-            Action::Play { rank, lane },
-        );
-    }
-    b.done()
-}
-
-/// The second menu for a card on the board: what it does.
-///
-/// Flip, attack and pair are listed together rather than behind a verb menu. They are never
-/// all available at once — flipping needs the card face-down, attacking and pairing need it
-/// face-up — so the flat list is short, and it lets the attack rows carry their target and
-/// their combat notes on one line.
-fn card_menu(
-    state: &GameState,
-    observer: Observer,
-    lane: usize,
-    slot: usize,
-    subject: &str,
-    actions: &[Action],
-) -> Menu {
-    let me = state.acting_player();
-    let them = me.other();
-    let mut b = Builder::new(format!(
-        "Your {subject} in lane {} — do what?",
-        lane_label(lane)
-    ));
-    if let Some(card) = state.at(lane, me, slot) {
-        if knows(card, observer) {
-            b = b.hint(format!(
-                "{} — {}: {}",
-                card.rank,
-                card.rank.power_name(),
-                card.rank.power_text()
-            ));
+    lane_menu(state, "FLIP — which lane?", |lane| {
+        let here = in_lane(flips, lane);
+        if here.is_empty() {
+            return None;
         }
-    }
-
-    for &action in actions {
-        match action {
-            Action::Flip { .. } => {
-                // Flipping is always a card's only legal move — attacking and pairing both
-                // need it face-up — so this row is what the card list shows, and the power
-                // has to be named there without pushing the row past the board's width.
-                // The full text is one `powers` away.
-                let (note, summary) = match state.at(lane, me, slot) {
-                    Some(c) if knows(c, observer) => (
-                        format!(
-                            "reveals {} — {}: {}",
-                            c.rank,
-                            c.rank.power_name(),
-                            c.rank.power_text()
-                        ),
-                        format!("flip face-up — reveals {} ({})", c.rank, c.rank.power_name()),
+        Some(card_menu(
+            state,
+            observer,
+            format!("FLIP in lane {} — which card?", lane_label(lane)),
+            lane,
+            me,
+            "CARD",
+            |slot| {
+                let action = here.iter().copied().find(
+                    |a| matches!(a, Action::Flip { slot: s, .. } if *s as usize == slot),
+                );
+                match action {
+                    Some(a) => (
+                        power_note(state, lane, me, slot, observer),
+                        Some(Pick::Take(a)),
                     ),
-                    // A base card is hidden from its owner too (`game_rules.md` §3), so
-                    // this is a genuine gamble and the menu says so.
-                    _ => (
-                        "a base card — you do not know what this is either".to_string(),
-                        "flip face-up — a base card, unknown even to you".to_string(),
-                    ),
-                };
-                b.take_summarised("flip it face-up", note, summary, action);
-            }
+                    None => (String::new(), None),
+                }
+            },
+        ))
+    })
+}
 
-            Action::Attack { target, .. } => {
-                let token = state
-                    .at(lane, them, target as usize)
-                    .map(|c| card_token(state, c, observer))
-                    .unwrap_or_else(|| "<gone>".to_string());
+/// ATTACK: which lane, then which of your cards, then which of theirs.
+fn attack_menu(state: &GameState, attacks: &[Action], observer: Observer) -> Menu {
+    let me = state.acting_player();
+    lane_menu(state, "ATTACK — which lane?", |lane| {
+        let here = in_lane(attacks, lane);
+        if here.is_empty() {
+            return None;
+        }
+        Some(card_menu(
+            state,
+            observer,
+            format!("ATTACK from lane {} — which card?", lane_label(lane)),
+            lane,
+            me,
+            "CARD",
+            |slot| {
+                let mine: Vec<Action> = here
+                    .iter()
+                    .copied()
+                    .filter(|a| matches!(a, Action::Attack { attacker, .. } if *attacker as usize == slot))
+                    .collect();
+                if mine.is_empty() {
+                    return (String::new(), None);
+                }
                 let mut notes = Vec::new();
                 if let Some(partner) = state.pair_partner(lane, me, slot) {
                     notes.push(format!(
-                        "PAIR with your #{}: one action, 2 damage",
-                        slot_label(partner)
+                        "pair with #{}",
+                        crate::display::card_number(state, lane, me, partner, observer)
                     ));
                 }
-                notes.extend(combat_notes(state, lane, slot, target as usize));
-                b.take(
-                    format!("attack opp #{} {token}", slot_label(target)),
+                notes.extend(combat_notes(state, lane, slot, usize::MAX));
+                (
                     notes.join("; "),
-                    action,
-                );
-            }
+                    Some(Pick::Open(Box::new(target_menu(
+                        state, observer, lane, slot, &mine,
+                    )))),
+                )
+            },
+        ))
+    })
+}
 
-            Action::DeclarePair { slot_a, slot_b, .. } => {
-                let other = if slot_a as usize == slot { slot_b } else { slot_a };
-                let token = state
-                    .at(lane, me, other as usize)
-                    .map(|c| card_token(state, c, observer))
-                    .unwrap_or_default();
-                b.take_summarised(
-                    format!("pair with your #{} {token}", slot_label(other)),
-                    "2 damage for one action; they can never attack separately again",
-                    format!(
-                        "pair with your #{} {token} — they can never attack separately again",
-                        slot_label(other)
-                    ),
-                    action,
-                );
+fn target_menu(
+    state: &GameState,
+    observer: Observer,
+    lane: usize,
+    attacker: usize,
+    actions: &[Action],
+) -> Menu {
+    let them = state.acting_player().other();
+    card_menu(
+        state,
+        observer,
+        format!("ATTACK in lane {} — which enemy card?", lane_label(lane)),
+        lane,
+        them,
+        "OPPONENT CARD",
+        |slot| {
+            let action = actions.iter().copied().find(
+                |a| matches!(a, Action::Attack { target, .. } if *target as usize == slot),
+            );
+            match action {
+                Some(a) => (
+                    combat_notes(state, lane, attacker, slot).join("; "),
+                    Some(Pick::Take(a)),
+                ),
+                None => (String::new(), None),
             }
+        },
+    )
+}
 
-            // `acts_from` admits nothing else.
-            _ => {}
+/// PAIR: which lane, then the two cards. §5 — both must be face-up, the same rank, in the
+/// same lane, and unpaired.
+fn pair_menu(state: &GameState, pairs: &[Action], observer: Observer) -> Menu {
+    let me = state.acting_player();
+    lane_menu(state, "PAIR — which lane?", |lane| {
+        let here = in_lane(pairs, lane);
+        if here.is_empty() {
+            return None;
         }
-    }
-    b.done()
+        Some(card_menu(
+            state,
+            observer,
+            format!("PAIR in lane {} — which card?", lane_label(lane)),
+            lane,
+            me,
+            "CARD",
+            |slot| {
+                let mine: Vec<Action> = here
+                    .iter()
+                    .copied()
+                    .filter(|a| {
+                        matches!(a, Action::DeclarePair { slot_a, slot_b, .. }
+                                 if *slot_a as usize == slot || *slot_b as usize == slot)
+                    })
+                    .collect();
+                if mine.is_empty() {
+                    return (String::new(), None);
+                }
+                (
+                    String::new(),
+                    Some(Pick::Open(Box::new(partner_menu(
+                        state, observer, lane, slot, &mine,
+                    )))),
+                )
+            },
+        ))
+    })
 }
 
-/// The one-line summary of a card that has several moves, for the first menu.
-fn verb_summary(actions: &[Action]) -> String {
-    let attacks = actions
-        .iter()
-        .filter(|a| matches!(a, Action::Attack { .. }))
-        .count();
-    let pairs = actions
-        .iter()
-        .filter(|a| matches!(a, Action::DeclarePair { .. }))
-        .count();
-    let mut parts = Vec::new();
-    if attacks > 0 {
-        parts.push(format!(
-            "{attacks} target{}",
-            if attacks == 1 { "" } else { "s" }
-        ));
-    }
-    if pairs > 0 {
-        parts.push(format!(
-            "{pairs} pairing{}",
-            if pairs == 1 { "" } else { "s" }
-        ));
-    }
-    parts.join(" · ")
+fn partner_menu(
+    state: &GameState,
+    observer: Observer,
+    lane: usize,
+    first: usize,
+    actions: &[Action],
+) -> Menu {
+    let me = state.acting_player();
+    card_menu(
+        state,
+        observer,
+        format!("PAIR in lane {} — with which card?", lane_label(lane)),
+        lane,
+        me,
+        "CARD",
+        |slot| {
+            if slot == first {
+                return (String::new(), None);
+            }
+            let action = actions.iter().copied().find(|a| {
+                matches!(a, Action::DeclarePair { slot_a, slot_b, .. }
+                         if *slot_a as usize == slot || *slot_b as usize == slot)
+            });
+            match action {
+                Some(a) => ("never attack separately again".to_string(), Some(Pick::Take(a))),
+                None => (String::new(), None),
+            }
+        },
+    )
 }
 
-// ===================================================================== sub-decisions ==
-//
-// A sub-decision *is* a choice of card, so there is no second level to build: these are one
-// grouped list each. They stay short — the widest is the 4's Foresight at one row per
-// face-down card on the board — which is why the flat list that was wrong for the main
-// phase is right here.
+// ======================================================================= sub-decisions ==
 
+/// The 4's Foresight reaches both sides of the board, so it asks for a lane, then a side,
+/// then a card — rather than one long list in which a card's number would stop matching its
+/// position in its own column.
 fn build_foresight(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
     let me = state.acting_player();
-    // Sort so the two sides are contiguous and can share a heading; the engine enumerates
-    // lane by lane, which interleaves them.
-    let mut peeks: Vec<(bool, u8, u8, Action)> = legal
-        .iter()
-        .filter_map(|a| match a {
-            Action::Peek { side, lane, slot } => {
-                Some((*side == Side::Theirs, *lane, *slot, *a))
-            }
-            _ => None,
-        })
-        .collect();
-    peeks.sort_unstable_by_key(|(theirs, lane, slot, _)| (*theirs, *lane, *slot));
-
-    let mut b = Builder::new("Foresight — which face-down card do you look at?").hint(
-        "Only you learn it, and you keep knowing it. Base cards count, yours included.",
-    );
-    let mut current: Option<bool> = None;
-    for (theirs, lane, slot, action) in peeks {
-        if current != Some(theirs) {
-            b.heading(if theirs {
-                "THE OPPONENT'S SIDE"
-            } else {
-                "YOUR SIDE"
-            });
-            current = Some(theirs);
+    lane_menu(state, "FORESIGHT — look in which lane?", |lane| {
+        let here = in_lane(legal, lane);
+        if here.is_empty() {
+            return None;
         }
-        let owner = if theirs { me.other() } else { me };
-        let token = state
-            .at(lane as usize, owner, slot as usize)
-            .map(|c| card_token(state, c, observer))
-            .unwrap_or_default();
-        b.take(
-            format!("lane {} #{} {token}", lane_label(lane), slot_label(slot)),
-            String::new(),
-            action,
-        );
-    }
-    b.done()
+        let mut b = Builder::new(format!(
+            "FORESIGHT in lane {} — whose side?",
+            lane_label(lane)
+        ))
+        .hint("Only you learn it, and you keep knowing it. Base cards included.");
+        for (name, side, owner) in [
+            ("OPPONENT", Side::Theirs, me.other()),
+            ("YOURS", Side::Mine, me),
+        ] {
+            let on_side: Vec<Action> = here
+                .iter()
+                .copied()
+                .filter(|a| matches!(a, Action::Peek { side: s, .. } if *s == side))
+                .collect();
+            let sub = (!on_side.is_empty()).then(|| {
+                card_menu(
+                    state,
+                    observer,
+                    format!("FORESIGHT — which card in lane {}?", lane_label(lane)),
+                    lane,
+                    owner,
+                    if owner == me { "CARD" } else { "OPPONENT CARD" },
+                    |slot| {
+                        let action = on_side.iter().copied().find(
+                            |a| matches!(a, Action::Peek { slot: s, .. } if *s as usize == slot),
+                        );
+                        (String::new(), action.map(Pick::Take))
+                    },
+                )
+            });
+            b.step(name, String::new(), sub);
+        }
+        Some(b.done())
+    })
 }
 
+/// A 5's flip list or a King's reactivation list — all in one lane, so this is one menu.
 fn build_resolve_order(
     state: &GameState,
     legal: &[Action],
@@ -555,31 +623,34 @@ fn build_resolve_order(
     remaining: usize,
 ) -> Menu {
     let me = state.acting_player();
-    let mut b = Builder::new(format!(
-        "{} in lane {} — which card resolves next? ({remaining} left)",
-        kind.label(),
-        lane_label(lane)
-    ))
-    .hint("Each power resolves fully before you choose the next one (§8).");
-    for &action in legal {
-        let Action::ResolveNext { lane, slot } = action else {
-            continue;
-        };
-        let card = state.at(lane as usize, me, slot as usize);
-        let token = card
-            .map(|c| card_token(state, c, observer))
-            .unwrap_or_default();
-        let note = match card {
-            Some(c) if knows(c, observer) => {
-                format!("{}: {}", c.rank.power_name(), c.rank.power_text())
+    let lane = lane as usize;
+    card_menu(
+        state,
+        observer,
+        format!(
+            "{} in lane {} — resolve which card next? ({remaining} left)",
+            kind.label(),
+            lane_label(lane)
+        ),
+        lane,
+        me,
+        "CARD",
+        |slot| {
+            let action = legal.iter().copied().find(
+                |a| matches!(a, Action::ResolveNext { slot: s, .. } if *s as usize == slot),
+            );
+            match action {
+                Some(a) => (
+                    power_note(state, lane, me, slot, observer),
+                    Some(Pick::Take(a)),
+                ),
+                None => (String::new(), None),
             }
-            _ => String::new(),
-        };
-        b.take(format!("#{} {token}", slot_label(slot)), note, action);
-    }
-    b.done()
+        },
+    )
 }
 
+/// The Queen pulls an allied card in from another lane, so this asks for that lane first.
 fn build_queen_source(
     state: &GameState,
     legal: &[Action],
@@ -587,38 +658,44 @@ fn build_queen_source(
     queen_lane: u8,
 ) -> Menu {
     let me = state.acting_player();
-    let mut b = Builder::new(format!(
-        "Queen — pull which allied card into lane {}?",
-        lane_label(queen_lane)
-    ))
-    .hint("It keeps its damage and its freeze, stops being a base card, and does not refire.");
-    let mut current: Option<u8> = None;
-    for &action in legal {
-        let Action::MoveHere { lane, slot } = action else {
-            continue;
-        };
-        if current != Some(lane) {
-            b.heading(format!("LANE {}", lane_label(lane)));
-            current = Some(lane);
-        }
-        let token = state
-            .at(lane as usize, me, slot as usize)
-            .map(|c| card_token(state, c, observer))
-            .unwrap_or_default();
-        b.take(format!("#{} {token}", slot_label(slot)), String::new(), action);
-    }
-    b.done()
+    lane_menu(
+        state,
+        format!(
+            "QUEEN — pull a card into lane {} from which lane?",
+            lane_label(queen_lane)
+        ),
+        |lane| {
+            let here = in_lane(legal, lane);
+            if here.is_empty() {
+                return None;
+            }
+            Some(card_menu(
+                state,
+                observer,
+                format!("QUEEN — move which card out of lane {}?", lane_label(lane)),
+                lane,
+                me,
+                "CARD",
+                |slot| {
+                    let action = here.iter().copied().find(
+                        |a| matches!(a, Action::MoveHere { slot: s, .. } if *s as usize == slot),
+                    );
+                    (String::new(), action.map(Pick::Take))
+                },
+            ))
+        },
+    )
 }
 
 fn build_give_back(state: &GameState, legal: &[Action]) -> Menu {
     let me = state.acting_player();
     let (prompt, hint) = match state.config.two_power {
         crate::config::TwoPower::Bottom => (
-            "View — which card goes on the bottom of your draw pile?",
+            "VIEW — which card goes to the bottom of your pile?",
             "Private to you. You may give back the card you just drew.",
         ),
         crate::config::TwoPower::Discard => (
-            "View — which card do you discard?",
+            "VIEW — which card do you discard?",
             "The discard pile is public, so the opponent will see this.",
         ),
     };
@@ -634,7 +711,11 @@ fn build_give_back(state: &GameState, legal: &[Action]) -> Menu {
         } else {
             format!("{rank}")
         };
-        b.take(label, rank.power_name(), action);
+        b.push(
+            "CARD",
+            format!("{label:<6} {}", rank.power_name()),
+            Pick::Take(action),
+        );
     }
     b.done()
 }
@@ -647,31 +728,34 @@ fn build_split_target(
     attacker: Option<crate::card::CardId>,
 ) -> Menu {
     let them = state.acting_player().other();
-    // The attacker is still on the board — no damage has landed yet — so its slot is what
-    // the combat notes need to know whether a 9 or an 8 changes this half of the split.
+    let lane = lane as usize;
+    // The attacker is still on the board — no damage has landed yet — so its slot is what the
+    // combat notes need in order to say whether a 9 or an 8 changes this half of the split.
     let attacker_slot = attacker
         .and_then(|id| state.locate(id))
         .map(|(_, _, slot)| slot)
         .unwrap_or(usize::MAX);
 
-    let mut b = Builder::new("Twinstrike — which card takes the second point of damage?")
-        .hint("No damage has landed yet; both halves land together.");
-    b.heading(format!("OPPONENT, LANE {}", lane_label(lane)));
-    for &action in legal {
-        let Action::SplitTarget { slot } = action else {
-            continue;
-        };
-        let token = state
-            .at(lane as usize, them, slot as usize)
-            .map(|c| card_token(state, c, observer))
-            .unwrap_or_default();
-        b.take(
-            format!("opp #{} {token}", slot_label(slot)),
-            combat_notes(state, lane as usize, attacker_slot, slot as usize).join("; "),
-            action,
-        );
-    }
-    b.done()
+    card_menu(
+        state,
+        observer,
+        "TWINSTRIKE — which card takes the second damage?",
+        lane,
+        them,
+        "OPPONENT CARD",
+        |slot| {
+            let action = legal.iter().copied().find(
+                |a| matches!(a, Action::SplitTarget { slot: s } if *s as usize == slot),
+            );
+            match action {
+                Some(a) => (
+                    combat_notes(state, lane, attacker_slot, slot).join("; "),
+                    Some(Pick::Take(a)),
+                ),
+                None => (String::new(), None),
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -679,7 +763,6 @@ mod tests {
     use super::*;
     use crate::agents::Agent;
     use crate::config::GameConfig;
-    use crate::player::Player;
     use crate::testkit::Position;
 
     /// Every leaf of the tree, in order.
@@ -689,15 +772,16 @@ mod tests {
             match pick {
                 Pick::Take(a) => out.push(*a),
                 Pick::Open(sub) => out.extend(leaves(sub)),
+                Pick::Unavailable => {}
             }
         }
         out
     }
 
-    /// The whole tree as printed, every level of it — what a player could see by walking
-    /// every branch. `Menu::render` only prints the level it is called on.
+    /// The whole tree as printed, every level of it. `Menu::render` prints only the level it
+    /// is called on.
     fn render_all(menu: &Menu) -> String {
-        let mut out = menu.render();
+        let mut out = menu.render(false);
         for pick in &menu.picks {
             if let Pick::Open(sub) = pick {
                 out.push_str(&render_all(sub));
@@ -706,11 +790,42 @@ mod tests {
         out
     }
 
+    /// A taunting Jack is the case that shows why an unavailable row still has to be drawn:
+    /// §6 makes the Jack the only card in its lane that can be attacked, so every *other*
+    /// enemy card is a `—` — and the Jack keeps the number it has on the board.
+    #[test]
+    fn rule_6_a_taunt_leaves_the_other_targets_numbered_but_unavailable() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.face_up(0, Player::P0, Rank::TEN);
+        p.base(0, Player::P1, Rank::ACE);
+        p.face_up(0, Player::P1, Rank::EIGHT);
+        p.face_up(0, Player::P1, Rank::JACK);
+        let state = p.build();
+
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on\n{}", menu.render(false));
+        };
+        let Pick::Open(mine) = &attack.picks[0] else {
+            panic!("lane 1 must be reachable\n{}", attack.render(false));
+        };
+        let Pick::Open(targets) = &mine.picks[0] else {
+            panic!("the 10 must be able to attack\n{}", mine.render(false));
+        };
+
+        let text = targets.render(false);
+        assert_eq!(targets.len(), 3, "every enemy card in the lane is listed\n{text}");
+        assert!(matches!(targets.picks[0], Pick::Unavailable), "base card\n{text}");
+        assert!(matches!(targets.picks[1], Pick::Unavailable), "the 8, taunted\n{text}");
+        assert!(matches!(targets.picks[2], Pick::Take(_)), "the Jack\n{text}");
+        assert!(targets.rows[2].note.starts_with("[J "), "{text}");
+    }
+
     /// The tree is a reshaping of the engine's list, not a filter on it. Every legal action
     /// must be reachable, or the menu has quietly made a move impossible.
     ///
-    /// `DeclarePair` is the one action that appears twice — once under each of its two
-    /// members — so the comparison is by set, not by count.
+    /// `DeclarePair` is the one action that appears twice — once from each of its two members
+    /// — so the comparison is by set, not by count.
     #[test]
     fn menu_offers_every_legal_action_and_nothing_else() {
         for seed in 0..40u64 {
@@ -728,7 +843,7 @@ mod tests {
                     assert!(
                         offered.contains(action),
                         "seed {seed}: menu does not offer {action}\n{}",
-                        menu.render()
+                        render_all(&menu)
                     );
                 }
                 for action in &offered {
@@ -743,42 +858,72 @@ mod tests {
         }
     }
 
-    /// The top level is one row per card, so it must be shorter than the flat list it
-    /// replaces in any position where the flat list was the problem.
+    /// The five verbs are always in the same order at the same numbers, whatever is legal.
     #[test]
-    fn top_level_is_one_row_per_card() {
+    fn the_five_verbs_keep_their_numbers() {
+        let names = ["PLAY", "FLIP", "ATTACK", "PAIR", "PASS"];
+
+        // A fresh deal: cards in hand, nothing face-up, so only PLAY and PASS can be taken.
+        let opening = GameState::new(GameConfig::split_deck(), 3);
+        let menu = build(&opening, &opening.legal_actions(), Some(Player::P0));
+        assert_eq!(menu.len(), 5);
+        for (row, name) in menu.rows.iter().zip(names) {
+            assert_eq!(row.name, name);
+        }
+        assert!(matches!(menu.picks[2], Pick::Unavailable), "nothing to attack");
+        assert!(matches!(menu.picks[3], Pick::Unavailable), "nothing to pair");
+        assert!(matches!(menu.picks[4], Pick::Take(Action::Pass)));
+
+        // A position where attacking is on and playing is not: the numbers do not move.
         let mut p = Position::new(GameConfig::split_deck());
-        // Two attackers against three targets: nine flat actions, five rows.
-        p.face_up(0, Player::P0, Rank::SEVEN);
         p.face_up(0, Player::P0, Rank::SEVEN);
         p.face_up(0, Player::P1, Rank::FOUR);
-        p.face_up(0, Player::P1, Rank::EIGHT);
-        p.face_up(0, Player::P1, Rank::SIX);
+        let midgame = p.build();
+        let menu = build(&midgame, &midgame.legal_actions(), Some(Player::P0));
+        assert_eq!(menu.len(), 5);
+        for (row, name) in menu.rows.iter().zip(names) {
+            assert_eq!(row.name, name);
+        }
+        assert!(matches!(menu.picks[0], Pick::Unavailable), "hand is empty");
+        assert!(matches!(menu.picks[2], Pick::Open(_)), "attacking is on");
+    }
+
+    /// A card's number is its position in the column the board draws, which is *not* its
+    /// slot: the observer's own base card is stored first and drawn last.
+    #[test]
+    fn a_cards_number_is_where_the_board_draws_it() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.base(0, Player::P0, Rank::QUEEN); // slot 0, drawn last
+        p.face_up(0, Player::P0, Rank::SEVEN); // slot 1, drawn first
+        p.face_up(0, Player::P1, Rank::FOUR);
         let state = p.build();
 
+        assert_eq!(
+            column_slots(&state, 0, Player::P0, Some(Player::P0)),
+            vec![1, 0],
+            "your own base card is drawn at the bottom of your column"
+        );
+        assert_eq!(
+            column_slots(&state, 0, Player::P1, Some(Player::P0)),
+            vec![0],
+            "the opponent's column starts at their base card"
+        );
+
+        // So the 7 — slot 1 — is the card a player asks for as #1.
         let legal = state.legal_actions();
         let menu = build(&state, &legal, Some(Player::P0));
-        assert!(
-            menu.len() < legal.len(),
-            "the tree must be shorter than the flat list\n{}",
-            menu.render()
-        );
-        // Two of P0's cards can act, plus `pass`.
-        assert_eq!(menu.len(), 3, "{}", menu.render());
-
-        // The second level is that one card's own moves: three targets and the pairing,
-        // each on one line with its combat notes.
-        let Pick::Open(sub) = &menu.picks[0] else {
-            panic!("a card with four moves must open a second menu\n{}", menu.render());
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on\n{}", menu.render(false));
         };
-        let text = sub.render();
-        println!("{text}");
-        assert_eq!(sub.len(), 4, "{text}");
-        assert!(text.contains("attack opp #1 [4]"), "{text}");
-        assert!(text.contains("attack opp #3 [6]"), "{text}");
-        assert!(text.contains("pair with your #2 [7]"), "{text}");
-        // The 8's retaliation is public and changes the trade, so it has to be on the line.
-        assert!(text.contains("8 retaliates for 1"), "{text}");
+        let Pick::Open(cards) = &attack.picks[0] else {
+            panic!("lane 1 must be reachable\n{}", attack.render(false));
+        };
+        assert!(cards.rows[0].note.starts_with("[7 "), "{}", cards.render(false));
+        assert!(matches!(cards.picks[0], Pick::Open(_)), "the 7 can attack");
+        assert!(
+            matches!(cards.picks[1], Pick::Unavailable),
+            "the base card cannot, but keeps its row"
+        );
     }
 
     /// The menu is built from the acting player's own point of view, and no level of it may
@@ -800,11 +945,8 @@ mod tests {
             "the base card must be offered, or the test proves nothing"
         );
         let text = render_all(&build(&state, &legal, Some(Player::P0)));
-        for token in ["(K)", "[K]", "(Q)", "[Q]"] {
-            assert!(
-                !text.contains(token),
-                "menu leaked a hidden {token}\n{text}"
-            );
+        for token in ["(K ", "[K ", "{Q ", "[Q "] {
+            assert!(!text.contains(token), "menu leaked a hidden {token}\n{text}");
         }
         // The actor's own hand is theirs to see, so the 3 must still be named.
         assert!(text.contains(" 3 "), "P0's own hand is missing\n{text}");

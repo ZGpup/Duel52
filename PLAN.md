@@ -2,11 +2,19 @@
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Current phase: 3, step 1 complete.** Phase 2 delivered five agents, determinization, a
-frozen Elo ladder and the first strategic measurements (`FINDINGS.md` F2). Phase 3 step 1
-delivered the encoders, the network and the inference path: a randomly-initialised checkpoint
-can be built in Python, loaded in Rust, and played through the existing harness, with a test
-proving the Rust and PyTorch forward passes compute the same function (`FINDINGS.md` F3).
+**Current phase: 3, steps 1–3 built; the first training run has not been done yet.** Phase 2
+delivered five agents, determinization, a frozen Elo ladder and the first strategic
+measurements (`FINDINGS.md` F2). Phase 3 step 1 delivered the encoders, the network and the
+inference path, with a test proving the Rust and PyTorch forward passes compute the same
+function. Step 2 added `netmcts` — PUCT over the policy prior with the value head in place of
+rollouts — and step 3 added the loop around it: `duel52 selfplay` writes trajectory shards,
+`python -m duel52.train` replays, fits, gates and promotes.
+
+**The next thing to do is run it.** The loop has been exercised for one generation only, to
+size it and prove it is connected — `FINDINGS.md` F3.5: from a random initialisation, one
+generation of 3000 self-play games takes 8m01s and lands at 0.93 against `random` and 0.56
+against `greedy`. No network has been trained past that. The first real pass is
+`configs/train-fast.toml`: ~18 generations in 2.5 hours on 8 cores.
 
 **Still open from Phase 1, and it is the owner's:** the exit criterion. Nobody has played
 the engine yet and confirmed the rules by hand. That is now a better-value hour than it was
@@ -153,22 +161,36 @@ search; step 3 is the training loop.
 - [x] `netpolicy:<checkpoint>` as a sixth `AgentSpec`, so a checkpoint plays through the
       existing `ladder` / `match` / `probe` / `play` harness. **The five Phase 2 rungs and
       their budgets are untouched.**
-- [ ] Net-guided ISMCTS (PUCT over the policy prior, value in place of rollouts) — step 2
-- [ ] AZ-style loop: ISMCTS self-play → replay buffer → train → gated evaluation — step 3.
-      The buffer stores **trajectories** (`config`, seed, action-index sequence), not encoded
-      tensors: the engine is deterministic, so an encoder version bump costs a CPU replay
-      rather than a discarded corpus. F2.7 and F3.1 both expect the slot bound to move.
-- [ ] Checkpointing, resumability, config-driven throughout
+- [x] Net-guided ISMCTS (PUCT over the policy prior, value in place of rollouts) — step 2.
+      `engine/src/agents/net_mcts.rs`, as the `netmcts:<checkpoint>@<sims>` rung. Availability
+      replaces parent visits in PUCT's numerator, and priors are stored as logits and
+      softmaxed over whatever subset a determinization makes legal.
+- [x] AZ-style loop: ISMCTS self-play → replay buffer → train → gated evaluation — step 3.
+      `duel52 selfplay` writes a `.d52sp` shard; `python -m duel52.train` replays it through
+      the Rust encoder, fits, gates and promotes. The buffer stores **trajectories**
+      (`config`, seed, and indices into `legal_actions()`), not encoded tensors: the engine
+      is deterministic, so an encoder version bump costs a CPU replay rather than a discarded
+      corpus. F2.7 and F3.1 both expect the slot bound to move.
+- [x] Checkpointing, resumability, config-driven throughout — a run is one TOML plus a seed;
+      `--resume` continues a run directory.
+- [ ] **Run it.** The first attempt ran three generations and collapsed into the engine's
+      stalemate draw (`FINDINGS.md` F3.6); the three fixes it produced are in. The next pass
+      is `configs/train-fast.toml` — ~2.5 hours, ~18 generations — followed by a ladder
+      against the frozen Phase 2 rungs. **Watch the self-play draw rate and the reference
+      line**; those are what caught it last time.
 - [ ] **Duel52-mini** in OpenSpiel; validate the loop against exact CFR before trusting it
       on the full game
 - [ ] Local best-response as the exploitability proxy
 - [ ] **Deliverable:** a trained agent that clearly beats the Phase 2 ladder, with an Elo
       table and an LBR number
 
-**Open before step 3 — the encoding bound.** `FINDINGS.md` F3.1: `encoding_slots = 16`
+**The encoding bound, settled for training.** `FINDINGS.md` F3.1: `encoding_slots = 16`
 survives self-play (max 10) but not a mixed pairing against `random` (13–17), and `random` is
-the ladder's permanent anchor. The default is still 16; step 2 or 3 has to settle whether to
-raise it to the theoretical 21. See the recommendation in F3.1.
+the ladder's permanent anchor. **The engine default stays 16** — F3.1's recommendation was
+flagged rather than applied, and that call is still the owner's — but `configs/train-fast.toml`
+sets `encoding_slots = 21` for the training run, because a run that dies partway through an
+evaluation ladder costs more than 30% on the tensors. Self-play at 16 sims has already been
+seen to reach 17 cards on one side of one lane, so this is not theoretical.
 
 ### What step 1 turned up that the plan did not anticipate
 
@@ -197,6 +219,44 @@ that constrain later work:
   (a JSON parser in a crate that has none).
 - **No new crates.** The `cli` / `nn` split waits for the CUDA handoff; `Evaluator` is the
   seam that makes it cheap.
+
+### What steps 2 and 3 turned up that the plan did not anticipate
+
+1. **The encoder's own shape is the inference budget, and sparsity buys it back.** The
+   observation is 4.8% dense and a position offers ~21 of 2195 encoded actions
+   (`FINDINGS.md` F3.3), so the input layer and the policy head — the two largest matrices —
+   are both almost entirely wasted work. Walking the non-zeros and evaluating only the legal
+   logits is **bit-identical**, not an approximation, and it is the difference between a
+   viable and an unviable local run. Neither optimisation would have been visible from the
+   design; both came out of measuring the tensors the encoder actually produces.
+2. **The batched `Evaluator` has not been needed yet.** `DESIGN.md` §9 locked a batch-shaped
+   interface so self-play could keep `G` games in flight per worker. Self-play instead
+   parallelises across *games* on threads, one position per evaluation, because after the
+   sparsity work the network is no longer the dominant cost per simulation — determinization
+   and legal-action enumeration are. The interface is still the right one and the
+   cross-game batching is still the right next step **when a GPU backend arrives**; it is
+   deferred, not abandoned.
+3. **AlphaGo Zero's 0.55 promotion gate does not work in a game with a stalemate draw.**
+   `FINDINGS.md` F3.4: an early network draws ~69% of its self-play games, so the score
+   between adjacent generations is compressed onto 0.5 and a 0.55 bar rejects nearly
+   everything — a run whose teacher never advances, while every other number on the readout
+   looks healthy. The gate ships at 0.5, which still rejects a candidate that is *measurably
+   worse*, and that is the failure mode that compounds.
+4. **The trajectory format is decoupled from the action layout too, not just the observation
+   layout.** The plan said the buffer stores an "action-index sequence". Storing the
+   *encoded* index would have tied every shard to one `action_dim`, which is exactly the
+   coupling the trajectory design exists to avoid — so a shard stores indices into
+   `legal_actions()`, which is a property of the engine rather than of the encoder, and the
+   replay maps them through whatever encoder is current.
+5. **The engine's stalemate draw is a stable equilibrium, and the first run found it in two
+   generations.** `FINDINGS.md` F3.6 — the draw rate went 9% → 55% → 88% while the agent's
+   score against `random` fell 0.93 → 0.53, and the gate promoted every generation because
+   two stalling agents draw against each other and 0.500 cleared a 0.5 bar. Fixed by
+   `config.stalemate_value` (a learning weight, not a rule; scoring is untouched), a gate
+   that reads decisive games only, and a reference panel that can veto. The transferable
+   part: **every [ENGINE] terminal condition is a potential equilibrium**, and the ones added
+   for the trainer's convenience are the most dangerous because nothing about the real game
+   constrains what they are worth.
 
 ---
 

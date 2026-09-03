@@ -200,7 +200,10 @@ impl Pending {
 /// order, and the identity of the removed-unseen cards. Anything shown to a player must go
 /// through [`crate::observation`] or [`crate::display`], which filter by what that observer
 /// is entitled to know.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `Eq` follows [`GameConfig`] in not being derived — it holds an `f32` learning weight, so
+/// `PartialEq` is the honest bound. Every comparison in the engine and the tests is a
+/// "are these the same position" equality, which `PartialEq` gives.
+#[derive(Clone, PartialEq, Debug)]
 pub struct GameState {
     pub config: GameConfig,
     /// The seed this game was dealt from. Recorded so any position can be reproduced.

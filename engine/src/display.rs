@@ -9,22 +9,35 @@
 //!   you, and the identity/position of a card you bottomed with a 2;
 //! - hidden from **everyone**: base cards, and the cards removed unseen at setup.
 //!
-//! One detail is easy to get wrong and is handled explicitly below: **`(?)` must be used
-//! for the owner's own base cards.** Base cards are hidden from their owner too (§3), which
-//! is exactly the fact a careless renderer misses.
+//! One detail is easy to get wrong and is handled explicitly below: **`{?  ²♥}` must be
+//! used for the owner's own base cards.** Base cards are hidden from their owner too (§3),
+//! which is exactly the fact a careless renderer misses.
 //!
 //! Hit points, by contrast, need no filtering at all: §5 makes every face-down card a blank
 //! 2-HP card whatever its rank, so a face-down card's hit points are common knowledge and
 //! printing them reveals nothing. (Were it otherwise — were a face-down Jack really 3 HP —
-//! then rendering "1/3 hp" would announce the Jack, and so would simply watching it survive
-//! two hits, since damage is public.)
+//! then rendering `³♥` would announce the Jack, and so would simply watching it survive two
+//! hits, since damage is public.)
 //!
-//! # Lanes and slots are numbered from 1 here, and only here
+//! # The board is a grid, and every cell is the same width
 //!
-//! The engine indexes lanes and slots from 0, and so do [`Action`], the Python action
-//! dicts, and every test. Humans count from 1, so this module — the display layer, which
-//! nothing else reads back — adds one on the way out via [`lane_label`] and [`slot_label`].
-//! Nothing parses these strings, so the two conventions cannot collide.
+//! Lanes run left to right as columns, the opponent at the top and the observer at the
+//! bottom, with each side's base card at its far end — the way the cards sit on a table.
+//! Every card is a six-column token ([`card_token`]) whatever its rank, damage or state, so
+//! a column never shifts sideways as the position changes.
+//!
+//! # Lanes and cards are numbered from 1 here, and only here
+//!
+//! The engine indexes lanes and slots from 0, and so do [`Action`], the Python action dicts,
+//! and every test. Humans count from 1, so this module — the display layer, which nothing
+//! else reads back — converts on the way out via [`lane_label`] and [`card_number`].
+//!
+//! [`card_number`] is more than an off-by-one: **slots are not display order**. Slots are
+//! the engine's storage order, base card first; the board draws the observer's own base card
+//! *last*, at the bottom of their column. So a card's number is its position in the column
+//! the observer is looking at, which is what makes "the second card in lane 2" mean the same
+//! thing on the board and at the prompt. [`column_slots`] is the single definition of that
+//! order, and both the renderer and the CLI's menus go through it.
 
 use crate::action::{Action, Side};
 use crate::card::Card;
@@ -44,10 +57,44 @@ pub fn lane_label(lane: impl Into<usize>) -> usize {
     lane.into() + 1
 }
 
-/// The slot number a human reads, given the engine's 0-based slot index.
-#[inline]
-pub fn slot_label(slot: impl Into<usize>) -> usize {
-    slot.into() + 1
+/// The slots of one side of one lane, in the order the board draws them, top to bottom.
+///
+/// The observer's own base card is drawn at the bottom of their column and the opponent's at
+/// the top of theirs, so both sides read outward from the front line. Everything else keeps
+/// slot order. Menus number cards by position in this list, so the number a player types
+/// always counts down the column they are looking at.
+pub fn column_slots(
+    state: &GameState,
+    lane: usize,
+    owner: Player,
+    observer: Observer,
+) -> Vec<usize> {
+    let side = state.lanes[lane].side(owner);
+    let (bases, played): (Vec<usize>, Vec<usize>) =
+        (0..side.len()).partition(|&slot| side[slot].is_base);
+    if owner == observer.unwrap_or(state.to_move) {
+        played.into_iter().chain(bases).collect()
+    } else {
+        bases.into_iter().chain(played).collect()
+    }
+}
+
+/// The number a human reads for a card, given the engine's slot index: its position in the
+/// column the board draws, counting from 1.
+pub fn card_number(
+    state: &GameState,
+    lane: usize,
+    owner: Player,
+    slot: usize,
+    observer: Observer,
+) -> usize {
+    column_slots(state, lane, owner, observer)
+        .iter()
+        .position(|&s| s == slot)
+        .map(|i| i + 1)
+        // A slot that is no longer on the board: only reachable from a description of an
+        // action whose target has already died, which the CLI renders as `<gone>` anyway.
+        .unwrap_or(slot + 1)
 }
 
 /// Does `observer` know this card's rank?
@@ -72,52 +119,89 @@ pub(crate) fn entitled_to_actors_hand(state: &GameState, observer: Observer) -> 
     }
 }
 
-/// One card as a short token, e.g. `[J]`, `(K)`, `(?)`.
+/// Hit points as a superscript. Nothing on the board ever exceeds 3 — a face-up Jack (§5).
+const HP_GLYPH: [&str; 4] = ["⁰", "¹", "²", "³"];
+
+/// The width of [`card_token`], in columns. Every token is exactly this wide.
+pub const TOKEN_WIDTH: usize = 6;
+
+/// One card as a **fixed-width six-column token**: `[3 ²♥]`, `(? ²♥)`, `{K ¹♥}`, `[10³♥]`.
 ///
-/// Brackets mean face-up (public); parentheses mean face-down. A face-down card shows its
-/// rank only when this observer is entitled to know it.
-pub(crate) fn card_token(state: &GameState, card: &Card, observer: Observer) -> String {
-    let visible = knows(card, observer);
-    let label = if visible { card.rank.label() } else { "?" };
-    let body = if card.face_up {
-        format!("[{label}]")
+/// The width never varies, so a lane column never shifts sideways as cards take damage or a
+/// 10 arrives. The rank field is two columns, left-aligned, which is exactly what lets the
+/// 10 eat the space that separates rank from hit points for every other rank.
+///
+/// The brackets carry the two facts a bare rank cannot:
+///
+/// - `{…}` a **base card**: untouchable until every draw pile is empty (§3), and hidden from
+///   its owner as well as from the opponent — which is why its rank is normally `?`.
+/// - `[…]` **face-up**: power live, can attack.
+/// - `(…)` **face-down**: a blank 2-HP card with no power (§4, §6). Shows a rank only to an
+///   observer entitled to know it.
+///
+/// The number is the hit points **remaining**, which is public for every card: §5 makes a
+/// face-down card a blank 2 HP whatever its rank, so this leaks nothing.
+pub fn card_token(card: &Card, observer: Observer) -> String {
+    let label = if knows(card, observer) {
+        card.rank.label()
     } else {
-        format!("({label})")
+        "?"
     };
-
-    let mut tags: Vec<String> = Vec::new();
-    if card.is_base {
-        tags.push("base".to_string());
-    } else if card.entered_as_base {
-        // Public: a card that entered as a base card and was moved by a Queen is no longer
-        // a base card, but its owner still may not look at it (§3).
-        tags.push("ex-base".to_string());
-    }
-    if card.damage > 0 {
-        // Safe to print for any card: damage is public (§5), and so is max HP, because a
-        // face-down card is always 2 HP regardless of rank. There is nothing to leak.
-        tags.push(format!("{}/{}hp", card.hp_remaining(), card.max_hp()));
-    }
-    if card.is_frozen(state.ply) {
-        tags.push("FROZEN".to_string());
-    }
-    if let Some(pid) = card.pair_id {
-        tags.push(format!("pair{}", pid.0));
-    }
-    if card.face_up && card.owner == state.to_move && card.attacks_used >= card.attack_allowance {
-        tags.push("spent".to_string());
-    } else if card.face_up && card.owner == state.to_move && card.attack_allowance > 1 {
-        tags.push(format!(
-            "{}atk left",
-            card.attack_allowance - card.attacks_used
-        ));
-    }
-
-    if tags.is_empty() {
-        body
+    let hp = HP_GLYPH[card.hp_remaining().min(3) as usize];
+    let (open, close) = if card.is_base {
+        ('{', '}')
+    } else if card.face_up {
+        ('[', ']')
     } else {
-        format!("{body}{}", tags.join(","))
+        ('(', ')')
+    };
+    format!("{open}{label:<2}{hp}♥{close}")
+}
+
+/// The two columns that follow a card's token: which pair it belongs to, then its condition.
+///
+/// Two columns of symbols rather than words, because these hang off every card on the board
+/// and the board has to stay a board. What they mean lives in the CLI's `help`.
+fn card_status(state: &GameState, lane: usize, owner: Player, slot: usize) -> String {
+    let Some(card) = state.at(lane, owner, slot) else {
+        return "  ".to_string();
+    };
+    let pair = pair_letter(state, lane, owner, slot).unwrap_or(' ');
+    let condition = if card.is_frozen(state.ply) {
+        // §8: frozen blocks attacking and being flipped, by anyone.
+        '*'
+    } else if card.face_up && card.owner == state.to_move {
+        // Only meaningful on your own turn, which is the only time attack budgets move.
+        if card.attacks_used >= card.attack_allowance {
+            '·'
+        } else if card.attack_allowance - card.attacks_used > 1 {
+            '+'
+        } else {
+            ' '
+        }
+    } else {
+        ' '
+    };
+    format!("{pair}{condition}")
+}
+
+/// Which declared pair a card belongs to, as a letter unique within its side of its lane.
+///
+/// `PairId`s are global and unbounded, so they are useless as a one-column marker. A pair is
+/// confined to one side of one lane (§5), so numbering them within that side is enough to
+/// tell two pairs apart wherever a player can actually see them side by side.
+fn pair_letter(state: &GameState, lane: usize, owner: Player, slot: usize) -> Option<char> {
+    let wanted = state.at(lane, owner, slot)?.pair_id?;
+    let mut seen: Vec<crate::card::PairId> = Vec::new();
+    for card in state.lanes[lane].side(owner) {
+        if let Some(id) = card.pair_id {
+            if !seen.contains(&id) {
+                seen.push(id);
+            }
+        }
     }
+    let index = seen.iter().position(|&id| id == wanted)?;
+    Some((b'a' + index as u8) as char)
 }
 
 /// A hand: contents if the observer owns it, otherwise just the count.
@@ -126,7 +210,7 @@ fn hand_text(state: &GameState, owner: Player, observer: Observer) -> String {
     let entitled = observer.is_none() || observer == Some(owner);
     if entitled {
         if hand.is_empty() {
-            "(empty)".to_string()
+            "—".to_string()
         } else {
             hand.iter()
                 .map(|r| r.label())
@@ -134,7 +218,8 @@ fn hand_text(state: &GameState, owner: Player, observer: Observer) -> String {
                 .join(" ")
         }
     } else {
-        format!("{} card(s)", hand.len())
+        // Hand *size* is public (§5); the contents are not.
+        format!("{}", hand.len())
     }
 }
 
@@ -142,19 +227,15 @@ fn hand_text(state: &GameState, owner: Player, observer: Observer) -> String {
 fn discard_text(state: &GameState, owner: Player) -> String {
     let d = &state.discards[owner.idx()];
     if d.is_empty() {
-        "-".to_string()
+        "—".to_string()
     } else {
         let mut sorted = d.clone();
         sorted.sort_unstable();
-        format!(
-            "{} ({})",
-            sorted.len(),
-            sorted
-                .iter()
-                .map(|r| r.label())
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
+        sorted
+            .iter()
+            .map(|r| r.label())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -191,67 +272,130 @@ fn bottom_knowledge_text(state: &GameState, observer: Observer) -> Option<String
     }
 }
 
+/// One lane column, including the space either side of the eight-column cell.
+const CELL: usize = TOKEN_WIDTH + 2 + 2;
+
 /// Render the whole position from `observer`'s point of view.
+///
+/// Lanes are columns, left to right; the opponent is at the top and the observer at the
+/// bottom; each side's base card sits at the far end of its column. The double rule across
+/// the middle is the front line — the only place cards can reach each other.
 pub fn render(state: &GameState, observer: Observer) -> String {
-    let mut out = String::new();
     let me = observer.unwrap_or(state.to_move);
     let them = me.other();
+    let lanes = state.lane_count();
 
-    let rule = "=".repeat(78);
-    let thin = "-".repeat(78);
+    // --- The grid ---------------------------------------------------------------------
+    // Every cell is exactly `CELL` columns, built by its caller, so a row is a plain join.
+    // That is what keeps the columns still: nothing here depends on a card's rank, damage
+    // or state.
+    let cells = |cells: Vec<String>| -> String { format!("  {}\n", cells.join("│")) };
+    let bar = |fill: &str, cross: &str| -> String {
+        let segment = fill.repeat(CELL);
+        format!(
+            "  {}\n",
+            vec![segment; lanes].join(cross)
+        )
+    };
+    // Two leading spaces put the token's left edge under the `l` of `lane N`.
+    let empty = " ".repeat(CELL);
 
-    out.push_str(&rule);
-    out.push('\n');
-    out.push_str(&format!(
-        " Duel 52 · {} · engine {}\n",
-        state.config.summary(),
-        crate::VERSION
-    ));
-    out.push_str(&format!(" {}\n", state.header()));
-    if observer.is_none() {
-        out.push_str(" *** REVEAL MODE: showing hidden information ***\n");
-    }
-    out.push_str(&thin);
-    out.push('\n');
-
-    // --- Resources -------------------------------------------------------------------
-    let pile_text = |p: Player| {
-        if state.shared_pile() {
-            format!("shared draw pile: {}", state.piles[0].len())
-        } else {
-            format!("draw pile: {}", state.pile(p).len())
+    // Base cards are drawn on their own row at the far end of each column; the rows in
+    // between hold only what has been played. This is the same partition [`column_slots`]
+    // is built on, so what the board draws and what the menus number cannot disagree.
+    let split = |lane: usize, owner: Player| -> (Vec<usize>, Vec<usize>) {
+        let side = state.lanes[lane].side(owner);
+        (0..side.len()).partition(|&slot| side[slot].is_base)
+    };
+    let cell = |lane: usize, owner: Player, slot: Option<usize>| -> String {
+        match slot {
+            Some(slot) => format!(
+                "  {}{}",
+                card_token(&state.lanes[lane].side(owner)[slot], observer),
+                card_status(state, lane, owner, slot)
+            ),
+            None => empty.clone(),
         }
     };
-    out.push_str(&format!(
-        " {label:<14} hand: {hand:<26} discard: {disc}\n",
-        label = format!("{them} (opponent)"),
-        hand = hand_text(state, them, observer),
-        disc = discard_text(state, them),
-    ));
-    out.push_str(&format!(
-        " {label:<14} hand: {hand:<26} discard: {disc}\n",
-        label = format!("{me} (you)"),
-        hand = hand_text(state, me, observer),
-        disc = discard_text(state, me),
-    ));
+    // `1` keeps an empty side from collapsing the grid, which would make the board jump
+    // about from turn to turn.
+    let played_rows = |owner: Player| -> usize {
+        (0..lanes)
+            .map(|lane| split(lane, owner).1.len())
+            .max()
+            .unwrap_or(0)
+            .max(1)
+    };
+    let base_row = |owner: Player| -> String {
+        cells(
+            (0..lanes)
+                .map(|lane| cell(lane, owner, split(lane, owner).0.first().copied()))
+                .collect(),
+        )
+    };
+    let played_row = |owner: Player, row: usize| -> String {
+        cells(
+            (0..lanes)
+                .map(|lane| cell(lane, owner, split(lane, owner).1.get(row).copied()))
+                .collect(),
+        )
+    };
+
+    let mut out = String::new();
+
+    // --- Above the board --------------------------------------------------------------
     if state.shared_pile() {
-        out.push_str(&format!(" {}\n", pile_text(me)));
+        out.push_str(&format!(" Deck: {}\n", state.piles[0].len()));
     } else {
         out.push_str(&format!(
-            " {} · opponent {}\n",
-            pile_text(me),
+            " Deck: you {} · opponent {}\n",
+            state.pile(me).len(),
             state.pile(them).len()
         ));
     }
+    out.push_str(&format!(" {}\n", "═".repeat(lanes * (CELL + 1))));
+    if observer.is_none() {
+        out.push_str(" *** REVEAL MODE: showing hidden information ***\n");
+    }
+    out.push_str(&format!(
+        " {them}   hand {}   discard {}\n\n",
+        hand_text(state, them, observer),
+        discard_text(state, them),
+    ));
+
+    // --- The board --------------------------------------------------------------------
+    out.push_str(&cells(
+        (0..lanes)
+            .map(|lane| format!("  lane {:<width$}", lane_label(lane), width = CELL - 7))
+            .collect(),
+    ));
+    out.push_str(&base_row(them));
+    out.push_str(&bar("─", "┼"));
+    for row in 0..played_rows(them) {
+        out.push_str(&played_row(them, row));
+    }
+    out.push_str(&bar("═", "╪"));
+    for row in 0..played_rows(me) {
+        out.push_str(&played_row(me, row));
+    }
+    out.push_str(&bar("─", "┼"));
+    out.push_str(&base_row(me));
+
+    // --- Below the board --------------------------------------------------------------
+    out.push_str(&format!(
+        "\n {me}   hand {}   discard {}\n",
+        hand_text(state, me, observer),
+        discard_text(state, me),
+    ));
     if let Some(bottom) = bottom_knowledge_text(state, observer) {
-        out.push_str(&format!(" you privately know: {bottom}\n"));
+        out.push_str(&format!(" you know: {bottom}\n"));
     }
     if state.removed_revealed {
         // §9b only: the removed multiset is public in the mirrored-removal variant.
         let mut ranks: Vec<Rank> = state.removed[0].clone();
         ranks.sort_unstable();
         out.push_str(&format!(
-            " removed from each deck (public, §9b): {}\n",
+            " removed from each deck (§9b): {}\n",
             ranks.iter().map(|r| r.label()).collect::<Vec<_>>().join(" ")
         ));
     } else if observer.is_none() {
@@ -262,116 +406,35 @@ pub fn render(state: &GameState, observer: Observer) -> String {
             ranks.iter().map(|r| r.label()).collect::<Vec<_>>().join(" ")
         ));
     }
-    out.push_str(&thin);
-    out.push('\n');
+    out.push_str(&format!(" {}\n", "═".repeat(lanes * (CELL + 1))));
 
-    // --- Lanes -----------------------------------------------------------------------
-    for lane in 0..state.lane_count() {
-        let won_note = {
-            let mut notes = Vec::new();
-            if state.base_unlocked {
-                if state.lanes[lane].side(them).is_empty() && state.hand(them).is_empty() {
-                    notes.push(format!("{me} has won this lane"));
-                }
-                if state.lanes[lane].side(me).is_empty() && state.hand(me).is_empty() {
-                    notes.push(format!("{them} has won this lane"));
-                }
-            }
-            if notes.is_empty() {
-                String::new()
-            } else {
-                format!("   <- {}", notes.join(" and "))
-            }
-        };
-        out.push_str(&format!(" LANE {}{won_note}\n", lane_label(lane)));
-
-        for (label, owner) in [("opp", them), ("you", me)] {
-            let side = state.lanes[lane].side(owner);
-            let cells: Vec<String> = side
-                .iter()
-                .enumerate()
-                .map(|(slot, card)| {
-                    format!(
-                        "#{} {}",
-                        slot_label(slot),
-                        card_token(state, card, observer)
-                    )
-                })
-                .collect();
-            let body = if cells.is_empty() {
-                "(empty)".to_string()
-            } else {
-                cells.join("   ")
-            };
-            out.push_str(&format!("   {label} {owner} | {body}\n"));
-        }
-    }
-    out.push_str(&thin);
-    out.push('\n');
-
-    // --- What is being asked ---------------------------------------------------------
     if state.outcome.is_over() {
         out.push_str(&format!(" GAME OVER: {}\n", state.outcome));
     } else {
-        out.push_str(&format!(" {}\n", state.prompt()));
-        if let Some(context) = pending_context(state) {
-            out.push_str(&format!(" {context}\n"));
-        }
+        // Base lock is the whole shape of the game — nothing can be won until it lifts
+        // (§3, §7) — so it stays on screen even though everything else here is a counter.
+        out.push_str(&format!(
+            " ply {} · base {} · quiet {}/{}{}\n",
+            state.ply,
+            if state.base_unlocked {
+                "UNLOCKED"
+            } else {
+                "locked"
+            },
+            state.quiet_plies,
+            state.config.stalemate_quiet_plies,
+            if state.base_unlocked {
+                format!(
+                    " · lanes won: you {} · opp {}",
+                    state.lanes_won_by(me),
+                    state.lanes_won_by(them)
+                )
+            } else {
+                String::new()
+            },
+        ));
     }
-    out.push_str(&rule);
-    out.push('\n');
     out
-}
-
-/// A sentence explaining *why* a sub-decision is being asked, so the owner can check the
-/// engine is doing what the rules say.
-fn pending_context(state: &GameState) -> Option<String> {
-    let text = match state.pending.last()? {
-        Pending::Foresight { .. } => {
-            "A 4 flipped: Foresight. Look at any one face-down card on the board — including \
-             base cards, yours or the opponent's. Only you learn it."
-                .to_string()
-        }
-        Pending::ResolveOrder { kind, lane, remaining, .. } => match kind {
-            crate::state::ResolveKind::FiveFlip => format!(
-                "A 5 flipped in lane {}: it flips ALL your face-down cards there \
-                 ({} left). Pick the order; each power fully resolves before the next.",
-                lane_label(*lane),
-                remaining.len()
-            ),
-            crate::state::ResolveKind::KingEmpower => format!(
-                "A King flipped in lane {}: your face-up cards there refire their \
-                 powers ({} left). Not Kings, not constant powers.",
-                lane_label(*lane),
-                remaining.len()
-            ),
-        },
-        Pending::QueenSource { lane, .. } => {
-            let lane = lane_label(*lane);
-            format!(
-                "A Queen flipped in lane {lane}: move one allied card from ANOTHER lane \
-                 into lane {lane}. It keeps its damage and does not refire its power."
-            )
-        }
-        Pending::GiveBack { .. } => match state.config.two_power {
-            crate::config::TwoPower::Bottom => {
-                "A 2 flipped: you drew a card, now put one from hand on the BOTTOM of your \
-                 pile. You may give back the card you just drew."
-                    .to_string()
-            }
-            crate::config::TwoPower::Discard => {
-                "A 2 flipped (rules-as-written): you drew a card, now DISCARD one from \
-                 hand."
-                    .to_string()
-            }
-        },
-        Pending::SplitTarget { .. } => {
-            "A 10 attacked: Twinstrike deals 1 damage each to TWO cards. Choose the second \
-             target. No damage has landed yet."
-                .to_string()
-        }
-    };
-    Some(text)
 }
 
 /// The face-up-only facts about an attack that a human wants in front of them before
@@ -455,9 +518,14 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
 
     let token = |lane: usize, owner: Player, slot: usize| -> String {
         match state.at(lane, owner, slot) {
-            Some(card) => card_token(state, card, observer),
+            Some(card) => card_token(card, observer),
             None => "<gone>".to_string(),
         }
+    };
+    // A card is named by where it sits in the column the observer is looking at, not by its
+    // storage slot — see the module docs on [`card_number`].
+    let num = |lane: u8, owner: Player, slot: u8| -> usize {
+        card_number(state, lane as usize, owner, slot as usize, observer)
     };
 
     // "your" and "opp" are relative to the actor, so they only read correctly when the
@@ -496,7 +564,7 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             let head = format!(
                 "FLIP  lane {} #{} {}",
                 lane_label(lane),
-                slot_label(slot),
+                num(lane, me, slot),
                 token(lane as usize, me, slot as usize)
             );
             match card {
@@ -519,7 +587,7 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             let lane_i = lane as usize;
             let paired = state
                 .pair_partner(lane_i, me, attacker as usize)
-                .map(|p| format!(" (PAIR with #{}, 2 dmg)", slot_label(p)))
+                .map(|p| format!(" (PAIR with #{}, 2 dmg)", num(lane, me, p as u8)))
                 .unwrap_or_default();
             let notes = combat_notes(state, lane_i, attacker as usize, target as usize);
             let note = if notes.is_empty() {
@@ -530,9 +598,9 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             format!(
                 "ATK   lane {}: {ours} #{} {}{paired} -> {theirs} #{} {}{note}",
                 lane_label(lane),
-                slot_label(attacker),
+                num(lane, me, attacker),
                 token(lane_i, me, attacker as usize),
-                slot_label(target),
+                num(lane, them, target),
                 token(lane_i, them, target as usize),
             )
         }
@@ -555,8 +623,8 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             format!(
                 "PAIR  lane {}: #{} + #{} (two {rank}s){caveat}",
                 lane_label(lane),
-                slot_label(slot_a),
-                slot_label(slot_b),
+                num(lane, me, slot_a),
+                num(lane, me, slot_b),
             )
         }
 
@@ -575,7 +643,7 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             format!(
                 "PEEK  {whose} lane {} #{} {}",
                 lane_label(lane),
-                slot_label(slot),
+                num(lane, owner, slot),
                 token(lane as usize, owner, slot as usize)
             )
         }
@@ -583,14 +651,14 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
         Action::ResolveNext { lane, slot } => format!(
             "NEXT  lane {} #{} {}",
             lane_label(lane),
-            slot_label(slot),
+            num(lane, me, slot),
             token(lane as usize, me, slot as usize)
         ),
 
         Action::MoveHere { lane, slot } => format!(
             "MOVE  lane {} #{} {} into the Queen's lane{}",
             lane_label(lane),
-            slot_label(slot),
+            num(lane, me, slot),
             token(lane as usize, me, slot as usize),
             if teaching {
                 " (keeps damage, keeps freeze, stops being a base card)"
@@ -620,7 +688,7 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             format!(
                 "2ND   twinstrike's second target: {theirs} lane {} #{} {}",
                 lane_label(lane),
-                slot_label(slot),
+                num(lane as u8, them, slot),
                 token(lane, them, slot as usize)
             )
         }
@@ -734,8 +802,8 @@ mod tests {
         let state = GameState::new(GameConfig::split_deck(), 5);
         for observer in [Some(Player::P0), Some(Player::P1)] {
             let text = render(&state, observer);
-            // Six base cards, all unknown, so six `(?)` tokens and nothing else on board.
-            let unknown = text.matches("(?)").count();
+            // Six base cards, all unknown, and nothing else is on the board yet.
+            let unknown = text.matches("{? ²♥}").count();
             assert_eq!(
                 unknown, 6,
                 "expected all six base cards to render as unknown\n{text}"
@@ -748,9 +816,66 @@ mod tests {
     fn rule_5_render_hides_the_opponent_hand_contents() {
         let state = GameState::new(GameConfig::split_deck(), 5);
         let text = render(&state, Some(Player::P0));
-        assert!(text.contains("5 card(s)"), "P1's hand size must be shown\n{text}");
+        assert!(
+            text.contains("P1   hand 5 "),
+            "P1's hand size must be shown, and only its size\n{text}"
+        );
         let own = hand_text(&state, Player::P0, Some(Player::P0));
         assert!(text.contains(&own), "P0 must see their own hand\n{text}");
+    }
+
+    /// Every card is the same width whatever its rank, damage or state, so a lane column
+    /// never shifts sideways. The 10 is the case that forces it: two digits of rank in a
+    /// field that has to hold `A` and `10` alike.
+    #[test]
+    fn every_card_token_is_the_same_width() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.face_up(0, Player::P0, Rank::TEN);
+        p.face_up(0, Player::P0, Rank::JACK);
+        p.face_down(0, Player::P0, Rank::ACE);
+        p.base(0, Player::P0, Rank::KING);
+        p.damage(0, Player::P0, 0, 1); // the 10, down to one hit point
+        let state = p.build();
+
+        for observer in [Some(Player::P0), Some(Player::P1), None] {
+            for card in state.lanes[0].side(Player::P0) {
+                let token = card_token(card, observer);
+                assert_eq!(
+                    token.chars().count(),
+                    TOKEN_WIDTH,
+                    "token {token:?} is not {TOKEN_WIDTH} columns"
+                );
+            }
+            // And the grid rows built from them all agree.
+            let widths: Vec<usize> = render(&state, observer)
+                .lines()
+                .filter(|l| l.contains('│'))
+                .map(|l| l.chars().count())
+                .collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "grid rows have differing widths: {widths:?}"
+            );
+        }
+    }
+
+    /// A damaged card shows the hit points it has left, and the Jack's third point appears
+    /// only once it is face-up (§5).
+    #[test]
+    fn rule_5_a_token_shows_the_hit_points_remaining() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.face_up(0, Player::P0, Rank::JACK);
+        p.face_down(0, Player::P0, Rank::JACK);
+        p.damage(0, Player::P0, 0, 1);
+        let state = p.build();
+        let side = state.lanes[0].side(Player::P0);
+
+        assert_eq!(card_token(&side[0], None), "[J ²♥]", "3 HP less 1 damage");
+        assert_eq!(
+            card_token(&side[1], None),
+            "(J ²♥)",
+            "a face-down Jack is a blank 2-HP card"
+        );
     }
 
     /// Reveal mode is the only way to see the removed-unseen pool.

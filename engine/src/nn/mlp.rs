@@ -57,6 +57,12 @@ pub struct MlpEvaluator {
     /// Index of each tensor in `weights.params`, resolved once so the hot loop does no
     /// string comparison.
     idx: Index,
+    /// `W_in` transposed to `[obs_dim × width]`, so the input layer can walk the
+    /// observation's non-zeros and add whole contiguous rows. See [`input_layer`].
+    ///
+    /// Costs `obs_dim × width` floats — 8.8 MB at the default architecture — which is why
+    /// [`crate::nn::evaluator_for`] caches evaluators rather than weights.
+    in_wt: Vec<f32>,
 }
 
 /// Resolved tensor positions. Built from [`Arch::params`], so it cannot drift from the
@@ -103,9 +109,29 @@ impl MlpEvaluator {
 
     /// Build over weights someone else already holds — how a cached checkpoint reaches an
     /// agent without a copy.
+    ///
+    /// Not cheap: it transposes the input matrix. Build one per checkpoint per process
+    /// ([`crate::nn::evaluator_for`]), not one per game.
     pub fn shared(weights: std::sync::Arc<Weights>) -> MlpEvaluator {
         let idx = Index::new(&weights.arch);
-        MlpEvaluator { weights, idx }
+        let arch = weights.arch;
+        let w_in = &weights.params[idx.in_w];
+        let mut in_wt = vec![0.0f32; arch.obs_dim * arch.width];
+        for i in 0..arch.width {
+            for j in 0..arch.obs_dim {
+                in_wt[j * arch.width + i] = w_in[i * arch.obs_dim + j];
+            }
+        }
+        MlpEvaluator {
+            weights,
+            idx,
+            in_wt,
+        }
+    }
+
+    /// Working buffers, so a search loop allocates once rather than once per evaluation.
+    pub fn scratch(&self) -> Scratch {
+        Scratch::new(&self.weights.arch)
     }
 
     pub fn arch(&self) -> Arch {
@@ -116,14 +142,14 @@ impl MlpEvaluator {
         &self.weights
     }
 
-    /// One row. `logits` is `action_dim` long; the value is returned.
-    fn forward_one(&self, x: &[f32], logits: &mut [f32], scratch: &mut Scratch) -> f32 {
+    /// Everything up to and including `ln_out`, leaving the trunk output in `scratch.h`.
+    fn trunk(&self, x: &[f32], scratch: &mut Scratch) {
         let arch = &self.weights.arch;
         let w = &self.weights.params;
         let i = &self.idx;
 
         // h = relu(ln_in(W_in·x + b_in))
-        matvec(&w[i.in_w], &w[i.in_b], x, arch.obs_dim, &mut scratch.h);
+        input_layer(&self.in_wt, &w[i.in_b], x, arch.width, &mut scratch.h);
         layer_norm(&mut scratch.h, &w[i.ln_in], &w[i.ln_in + 1]);
         relu(&mut scratch.h);
 
@@ -141,11 +167,15 @@ impl MlpEvaluator {
         }
 
         layer_norm(&mut scratch.h, &w[i.ln_out], &w[i.ln_out + 1]);
+    }
 
-        // Policy: raw logits, unmasked. Masking and softmax are the caller's job.
-        matvec(&w[i.policy_w], &w[i.policy_b], &scratch.h, arch.width, logits);
+    /// The value head, read off a trunk output already in `scratch.h`.
+    fn value_head(&self, scratch: &mut Scratch) -> f32 {
+        let arch = &self.weights.arch;
+        let w = &self.weights.params;
+        let i = &self.idx;
 
-        // Value: a two-layer head ending in tanh, so it is bounded to the zero-sum range.
+        // A two-layer head ending in tanh, so it is bounded to the zero-sum range.
         matvec(
             &w[i.value1_w],
             &w[i.value1_b],
@@ -161,6 +191,60 @@ impl MlpEvaluator {
             acc += wj * vj;
         }
         acc.tanh()
+    }
+
+    /// One row. `logits` is `action_dim` long; the value is returned.
+    fn forward_one(&self, x: &[f32], logits: &mut [f32], scratch: &mut Scratch) -> f32 {
+        let arch = &self.weights.arch;
+        let w = &self.weights.params;
+        let i = &self.idx;
+        self.trunk(x, scratch);
+        // Policy: raw logits, unmasked. Masking and softmax are the caller's job.
+        matvec(&w[i.policy_w], &w[i.policy_b], &scratch.h, arch.width, logits);
+        self.value_head(scratch)
+    }
+
+    /// One row, computing **only** the logits `mask` selects.
+    ///
+    /// The search path. `mask` is the legal-action mask, and a Duel 52 position offers
+    /// ~21 of 2195 encoded actions (`FINDINGS.md` F3.3), so skipping the rest removes
+    /// almost the whole policy head. Entries where `mask` is false are left untouched —
+    /// the caller never reads them, and writing a placeholder would cost the same
+    /// `action_dim` pass this exists to avoid.
+    ///
+    /// Every logit it *does* write is bit-identical to [`Self::forward_one`]'s: same
+    /// weights, same row, same ascending accumulation order.
+    pub fn eval_masked_with(
+        &self,
+        x: &[f32],
+        mask: &[bool],
+        logits: &mut [f32],
+        scratch: &mut Scratch,
+    ) -> f32 {
+        let arch = &self.weights.arch;
+        let w = &self.weights.params;
+        let i = &self.idx;
+        assert_eq!(x.len(), arch.obs_dim, "observation is the wrong length");
+        assert_eq!(mask.len(), arch.action_dim, "mask is the wrong length");
+        assert_eq!(logits.len(), arch.action_dim, "logit buffer is the wrong length");
+
+        self.trunk(x, scratch);
+
+        let pw = &w[i.policy_w];
+        let pb = &w[i.policy_b];
+        for (a, &allowed) in mask.iter().enumerate() {
+            if !allowed {
+                continue;
+            }
+            let row = &pw[a * arch.width..(a + 1) * arch.width];
+            let mut acc = pb[a];
+            for (&wj, &hj) in row.iter().zip(scratch.h.iter()) {
+                acc += wj * hj;
+            }
+            logits[a] = acc;
+        }
+
+        self.value_head(scratch)
     }
 }
 
@@ -193,7 +277,10 @@ impl Evaluator for MlpEvaluator {
 }
 
 /// Per-call working buffers, allocated once per `eval_batch` rather than per row.
-struct Scratch {
+///
+/// Public so a search loop can hold one across millions of evaluations; get one from
+/// [`MlpEvaluator::scratch`].
+pub struct Scratch {
     h: Vec<f32>,
     a: Vec<f32>,
     b: Vec<f32>,
@@ -207,6 +294,36 @@ impl Scratch {
             a: vec![0.0; arch.width],
             b: vec![0.0; arch.width],
             v: vec![0.0; arch.value_hidden],
+        }
+    }
+}
+
+/// `out = W_in·x + b`, walking only the non-zeros of `x`.
+///
+/// `wt` is `W_in` transposed to `[in_dim × out_dim]`, so one non-zero input contributes a
+/// contiguous `out_dim`-long row. That is the whole reason the transpose is kept: the
+/// observation is ~5% dense (205 of 4290 features, `FINDINGS.md` F3.3), and the input layer
+/// is otherwise the largest matrix in the network.
+///
+/// **Accumulation order is preserved.** For each output `i` the terms still arrive with `j`
+/// ascending, starting from the bias — the loop is transposed, not reordered — so this
+/// computes bit-identically to [`matvec`] over the untransposed matrix, with one
+/// footnote: a term whose input is exactly zero is skipped rather than added, and
+/// `acc + 0.0` differs from `acc` only when `acc` is `-0.0`, which then becomes `+0.0`.
+/// Nothing downstream can distinguish those two. `sparse_input_matches_the_dense_matvec`
+/// checks the equality on random weights.
+#[inline]
+fn input_layer(wt: &[f32], bias: &[f32], x: &[f32], out_dim: usize, out: &mut [f32]) {
+    debug_assert_eq!(wt.len(), x.len() * out_dim);
+    debug_assert_eq!(bias.len(), out_dim);
+    out.copy_from_slice(bias);
+    for (j, &xj) in x.iter().enumerate() {
+        if xj == 0.0 {
+            continue;
+        }
+        let row = &wt[j * out_dim..(j + 1) * out_dim];
+        for (o, &wij) in out.iter_mut().zip(row.iter()) {
+            *o += wij * xj;
         }
     }
 }
@@ -328,6 +445,74 @@ mod tests {
             (logits, value[0])
         };
         assert_eq!(run(one), run(two));
+    }
+
+    /// The transposed, zero-skipping input layer is an optimisation, not a different
+    /// function. A dense `matvec` over the untransposed matrix has to give the same bits —
+    /// on a sparse input, which is what it is for, and on a dense one, which is the case
+    /// where the two loops must agree term for term.
+    #[test]
+    fn sparse_input_matches_the_dense_matvec() {
+        let arch = Arch {
+            obs_dim: 37,
+            ..tiny()
+        };
+        let weights = Weights::random(9, arch);
+        let e = MlpEvaluator::shared(std::sync::Arc::new(weights.clone()));
+
+        let mut rng = crate::rng::Rng::new(11);
+        for sparsity in [0usize, 3, 30, 37] {
+            let mut x = vec![0.0f32; arch.obs_dim];
+            for _ in 0..sparsity {
+                x[rng.index(arch.obs_dim)] = (rng.below(9) as f32 - 4.0) / 4.0;
+            }
+            let mut dense = vec![0.0f32; arch.width];
+            matvec(
+                &weights.params[0],
+                &weights.params[1],
+                &x,
+                arch.obs_dim,
+                &mut dense,
+            );
+            let mut sparse = vec![0.0f32; arch.width];
+            input_layer(&e.in_wt, &weights.params[1], &x, arch.width, &mut sparse);
+            assert_eq!(dense, sparse, "sparsity {sparsity}");
+        }
+    }
+
+    /// The masked path exists to skip 99% of the policy head. It must not change the logits
+    /// it does compute, or search and training would be reading different functions.
+    #[test]
+    fn masked_evaluation_agrees_with_the_full_forward_pass() {
+        let arch = Arch {
+            obs_dim: 37,
+            action_dim: 23,
+            ..tiny()
+        };
+        let e = MlpEvaluator::new(Weights::random(5, arch));
+        let mut rng = crate::rng::Rng::new(2);
+        let mut x = vec![0.0f32; arch.obs_dim];
+        for _ in 0..12 {
+            x[rng.index(arch.obs_dim)] = 1.0;
+        }
+        let mask: Vec<bool> = (0..arch.action_dim).map(|i| i % 3 == 0).collect();
+
+        let mut full = vec![0.0f32; arch.action_dim];
+        let mut value = vec![0.0f32; 1];
+        e.eval_batch(&x, 1, &mut full, &mut value);
+
+        let mut masked = vec![f32::NAN; arch.action_dim];
+        let mut scratch = e.scratch();
+        let v = e.eval_masked_with(&x, &mask, &mut masked, &mut scratch);
+
+        assert_eq!(v, value[0]);
+        for (i, &allowed) in mask.iter().enumerate() {
+            if allowed {
+                assert_eq!(masked[i], full[i], "logit {i}");
+            } else {
+                assert!(masked[i].is_nan(), "logit {i} was written but not asked for");
+            }
+        }
     }
 
     #[test]

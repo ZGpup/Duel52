@@ -118,6 +118,67 @@ impl Rng {
             items.swap(i, j);
         }
     }
+
+    /// Uniform in the open-above interval `[0, 1)`, from the top 53 bits.
+    ///
+    /// Never returns exactly 1, and [`Rng::unit_open`] is the variant that also never
+    /// returns 0 — which matters wherever a logarithm is taken.
+    #[inline]
+    pub fn unit(&mut self) -> f64 {
+        // 53 bits is the whole mantissa, so every representable value in [0,1) with that
+        // spacing is reachable and none is doubled up.
+        (self.next_u64() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+    }
+
+    /// Uniform in `(0, 1)` — neither endpoint. For `ln(u)`.
+    #[inline]
+    pub fn unit_open(&mut self) -> f64 {
+        // `unit()` yields k / 2^53 for integer k in [0, 2^53); shifting to (k + 0.5) / 2^53
+        // keeps it uniform to the same precision and excludes both ends.
+        self.unit() + 0.5 / 9_007_199_254_740_992.0
+    }
+
+    /// A standard normal, by Box–Muller.
+    ///
+    /// The second variate of the pair is discarded rather than cached. Caching it would make
+    /// the number of `next_u64` calls depend on how many normals were drawn *earlier*, which
+    /// is exactly the kind of hidden state that makes a "reproducible" run stop reproducing
+    /// when an unrelated call site changes.
+    pub fn normal(&mut self) -> f64 {
+        let u1 = self.unit_open();
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// A Gamma(`shape`, 1) variate, by Marsaglia–Tsang (2000).
+    ///
+    /// Used to build the Dirichlet noise `agents/net_mcts.rs` mixes into root priors.
+    /// Normalising independent Gamma(α) draws is what makes that noise a *true* Dirichlet
+    /// over whichever subset of actions is legal in the current determinization — the
+    /// property a directly-sampled Dirichlet vector would lose the moment the legal set
+    /// changed. Panics on a non-positive shape.
+    pub fn gamma(&mut self, shape: f64) -> f64 {
+        assert!(shape > 0.0, "gamma shape must be positive, got {shape}");
+        if shape < 1.0 {
+            // Marsaglia–Tsang's boost: Gamma(a) = Gamma(a + 1) · U^(1/a).
+            let g = self.gamma(shape + 1.0);
+            return g * self.unit_open().powf(1.0 / shape);
+        }
+        let d = shape - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.normal();
+            let v = 1.0 + c * x;
+            if v <= 0.0 {
+                continue;
+            }
+            let v = v * v * v;
+            let u = self.unit_open();
+            if u.ln() < 0.5 * x * x + d - d * v + d * (v.ln()) {
+                return d * v;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +225,41 @@ mod tests {
             // a smoke check, not a statistical proof. Uniformity is guaranteed by
             // construction (Lemire rejection), not by this assertion.
             assert!(b > 9_200 && b < 10_800, "bucket count {b} looks skewed");
+        }
+    }
+
+    #[test]
+    fn unit_stays_inside_its_interval() {
+        let mut r = Rng::new(5);
+        let mut sum = 0.0;
+        for _ in 0..50_000 {
+            let u = r.unit();
+            assert!((0.0..1.0).contains(&u), "unit() returned {u}");
+            let o = r.unit_open();
+            assert!(o > 0.0 && o < 1.0, "unit_open() returned {o}");
+            sum += u;
+        }
+        let mean = sum / 50_000.0;
+        assert!((mean - 0.5).abs() < 0.01, "mean {mean} is not 0.5");
+    }
+
+    /// Marsaglia–Tsang has to be right on both sides of `shape = 1`, because the branch
+    /// below 1 is a different algorithm wrapping the one above it. Mean and variance of
+    /// Gamma(a, 1) are both `a`.
+    #[test]
+    fn gamma_has_the_right_mean_and_variance() {
+        for shape in [0.3f64, 1.0, 2.5] {
+            let mut r = Rng::derive(17, shape.to_bits());
+            let n = 200_000;
+            let xs: Vec<f64> = (0..n).map(|_| r.gamma(shape)).collect();
+            assert!(xs.iter().all(|x| *x > 0.0), "gamma returned a non-positive");
+            let mean = xs.iter().sum::<f64>() / n as f64;
+            let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+            // ~0.5% standard error at this sample size; 8% is loose enough never to flake
+            // and tight enough that a wrong branch (which is off by a factor, not a
+            // percent) fails.
+            assert!((mean - shape).abs() < 0.08 * shape, "shape {shape}: mean {mean}");
+            assert!((var - shape).abs() < 0.12 * shape, "shape {shape}: var {var}");
         }
     }
 

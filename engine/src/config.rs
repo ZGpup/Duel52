@@ -106,7 +106,12 @@ impl fmt::Display for TwoPower {
 ///
 /// Cloned into each `GameState`, so a state is self-describing and a saved game replays
 /// under the rules it was played under.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// `Eq` is deliberately not derived: [`GameConfig::stalemate_value`] is an `f32`, and an
+/// `Eq` over a float would be claiming a reflexivity the type does not have. `PartialEq` is
+/// what every comparison here actually wants — "were these two runs configured the same" —
+/// and nothing uses a config as a hash key.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GameConfig {
     pub variant: Variant,
     pub two_power: TwoPower,
@@ -184,6 +189,34 @@ pub struct GameConfig {
     /// `game_rules.md` §7. The published rules define no draw; this is a training
     /// necessity, not a claim about the paper game.
     pub stalemate_quiet_plies: u32,
+    /// **[ENGINE]** What an engine-declared stalemate is worth **to a learner**, to both
+    /// players, on the `0.0..=1.0` outcome scale. Default `0.5` — the same as any draw,
+    /// which is what every measurement before `FINDINGS.md` F3.6 was taken under.
+    ///
+    /// # Why this exists, and why it is not simply `0.5`
+    ///
+    /// The stalemate draw is **[ENGINE]**, not a rule: `game_rules.md` §7 records that the
+    /// published game defines no draw and that this one exists because the reachable stall
+    /// never ends on its own. Scoring it at 0.5 makes "neither player attacks" a *stable
+    /// equilibrium of the modified game* — a certain half point beats a risky fight, for
+    /// both players, forever. F3.6 is what that looks like when a learner finds it: the
+    /// draw rate went 9% → 55% → 88% over three generations while the agent's score against
+    /// `random` fell from 0.93 to 0.53.
+    ///
+    /// Setting this below 0.5 makes refusing to play strictly worse than playing, which is
+    /// the incentive the paper game gets for free by having no draw at all. `0.0` — the
+    /// training default in `configs/train-fast.toml` — makes it no better than a loss, so a
+    /// player who is behind always prefers a gamble to a stall.
+    ///
+    /// **This is a learning signal, not a scoring rule.** [`crate::Outcome::value_for`] is
+    /// untouched and still returns 0.5, so the Elo ladder, `MatchStats` and every number in
+    /// `FINDINGS.md` F1 and F2 mean exactly what they meant. Only
+    /// [`GameConfig::learning_value`] reads this, and only the search backup and the
+    /// training targets call that.
+    ///
+    /// The **mutual lane win** is deliberately not affected: it is a real outcome that
+    /// `game_rules.md` §7 spells out, and a symmetric result deserves a symmetric score.
+    pub stalemate_value: f32,
     /// **[ENGINE]** Hard safety cap on total plies. The game is provably finite (total
     /// power activations are bounded, so total healing is bounded, so total damage is
     /// bounded), and the quiet-ply rule already ends stalls, so this should never fire. It
@@ -220,6 +253,9 @@ impl GameConfig {
             first_turn_actions: 2,
             draws_per_turn: 1,
             stalemate_quiet_plies: 20,
+            // 0.5 keeps every pre-F3.6 measurement meaning what it meant. Training configs
+            // override it; see the field's docs.
+            stalemate_value: 0.5,
             max_plies: 2000,
         }
     }
@@ -367,6 +403,14 @@ impl GameConfig {
                 self.encoding_slots, self.max_slots_per_side
             ));
         }
+        if !(0.0..=0.5).contains(&self.stalemate_value) {
+            // Above 0.5 would make refusing to play *better* than a draw, which is the
+            // pathology in `FINDINGS.md` F3.6 with the sign flipped and worse.
+            return Err(format!(
+                "stalemate_value must be between 0.0 and 0.5, got {}",
+                self.stalemate_value
+            ));
+        }
         Ok(())
     }
 
@@ -433,6 +477,11 @@ impl GameConfig {
                 "first_turn_actions" => cfg.first_turn_actions = num(k, v)?,
                 "draws_per_turn" => cfg.draws_per_turn = num(k, v)?,
                 "stalemate_quiet_plies" => cfg.stalemate_quiet_plies = num(k, v)?,
+                "stalemate_value" => {
+                    cfg.stalemate_value = v
+                        .parse::<f32>()
+                        .map_err(|_| format!("{k}: `{v}` is not a number"))?
+                }
                 "max_plies" => cfg.max_plies = num(k, v)?,
                 other => return Err(format!("unknown config key `{other}`")),
             }
@@ -460,6 +509,7 @@ impl GameConfig {
              first_turn_actions = {}\n\
              draws_per_turn = {}\n\
              stalemate_quiet_plies = {}\n\
+             stalemate_value = {}\n\
              max_plies = {}\n",
             self.variant,
             self.two_power,
@@ -476,8 +526,36 @@ impl GameConfig {
             self.first_turn_actions,
             self.draws_per_turn,
             self.stalemate_quiet_plies,
+            self.stalemate_value,
             self.max_plies,
         )
+    }
+
+    /// What `outcome` is worth **to a learner**, for `player`, on the `0.0..=1.0` scale.
+    ///
+    /// This is [`Outcome::value_for`] with one substitution: an engine-declared stalemate
+    /// (and the ply-cap draw, which is a bug report) is worth [`Self::stalemate_value`] to
+    /// *both* players rather than half a point each. A mutual lane win stays at 0.5, because
+    /// it is a real outcome in `game_rules.md` §7 rather than an engine artefact.
+    ///
+    /// **Deliberately not zero-sum.** Both players can score 0 here, and that is the point:
+    /// a stalemate is both players declining to play, so both should prefer nearly anything
+    /// else. `net_mcts` banks a reward per player rather than one number and a sign, so a
+    /// non-zero-sum terminal backs up correctly — see the caveat in that module about the
+    /// value head, which can only report one side's estimate at a leaf.
+    ///
+    /// Called by exactly two places: the terminal backup in `agents/net_mcts.rs` and the
+    /// value targets in `selfplay.rs`. **Scoring never calls it** — `MatchStats`, the Elo
+    /// fit and every `FINDINGS.md` F1/F2 number go through [`Outcome::value_for`], so a
+    /// training run cannot move the benchmark it is measured against.
+    pub fn learning_value(&self, outcome: crate::outcome::Outcome, player: crate::Player) -> f32 {
+        use crate::outcome::{DrawReason, Outcome};
+        match outcome {
+            Outcome::Draw(DrawReason::Stalemate) | Outcome::Draw(DrawReason::PlyLimit) => {
+                self.stalemate_value
+            }
+            other => other.value_for(player),
+        }
     }
 
     /// One-line summary for log headers.

@@ -62,12 +62,14 @@ fn rule_3_a_queen_moved_base_card_is_still_unreadable_by_its_owner() {
     assert!(moved.entered_as_base, "the flag that gates the free look");
     assert_eq!(moved.known_to, 0, "so still nobody knows it");
 
-    // And it renders as unknown even to its owner.
+    // And it renders as unknown even to its owner. It is no longer a base card, so it is no
+    // longer drawn in braces — but its rank field stays `?`, which is the part that matters.
     let text = render(&s, Some(P0));
     assert!(
-        text.contains("(?)ex-base"),
+        text.contains("(? ²♥)"),
         "the owner must see it as unknown\n{text}"
     );
+    assert!(!text.contains("(K "), "and never as the King it is\n{text}");
 }
 
 /// §4: "You may look at your **own played face-down cards** at any time, for free."
@@ -82,8 +84,8 @@ fn rule_4_your_own_played_face_down_cards_are_private_to_you() {
     assert!(card.rank_known_to(P0));
     assert!(!card.rank_known_to(P1));
 
-    assert!(render(&s, Some(P0)).contains("(K)"), "P0 sees the rank");
-    assert!(!render(&s, Some(P1)).contains("(K)"), "P1 does not");
+    assert!(render(&s, Some(P0)).contains("(K ²♥)"), "P0 sees the rank");
+    assert!(!render(&s, Some(P1)).contains("(K "), "P1 does not");
 }
 
 // ================================================== Foresight is private ==
@@ -140,10 +142,10 @@ fn rule_5_a_peeked_card_renders_only_to_the_peeker() {
         },
     );
 
-    assert!(render(&s, Some(P0)).contains("(K)"), "the peeker sees it");
+    assert!(render(&s, Some(P0)).contains("(K ²♥)"), "the peeker sees it");
     let p1_view = render(&s, Some(P1));
     assert!(
-        p1_view.contains("(K)"),
+        p1_view.contains("(K ²♥)"),
         "P1 played it from hand, so P1 knew it all along"
     );
     // The point is that P0's knowledge is not published anywhere on P1's board.
@@ -174,7 +176,10 @@ fn rule_5_damage_and_hit_points_are_both_public_and_neither_reveals_a_rank() {
     let four_state = four_pos.build();
 
     let jack_text = render(&jack_state, Some(P0));
-    assert!(jack_text.contains("1/2hp"), "the damage is visible\n{jack_text}");
+    assert!(
+        jack_text.contains("(? ¹♥)"),
+        "the damage is visible: one hit point left of the two a face-down card has\n{jack_text}"
+    );
     assert_eq!(
         jack_text,
         render(&four_state, Some(P0)),
@@ -186,7 +191,10 @@ fn rule_5_damage_and_hit_points_are_both_public_and_neither_reveals_a_rank() {
     p.face_up(0, P1, Rank::JACK);
     p.damage(0, P1, 0, 1);
     let s = p.build();
-    assert!(render(&s, Some(P0)).contains("2/3hp"));
+    assert!(
+        render(&s, Some(P0)).contains("[J ²♥]"),
+        "two of three left, where a face-down Jack on the same damage shows one of two"
+    );
 }
 
 // ================================================ hands, discards, and piles ==
@@ -196,17 +204,23 @@ fn rule_5_damage_and_hit_points_are_both_public_and_neither_reveals_a_rank() {
 fn rule_5_hand_sizes_are_public_but_contents_are_not() {
     let s = GameState::new_default(4);
     let text = render(&s, Some(P0));
-    assert!(text.contains("5 card(s)"), "P1's size is shown\n{text}");
 
-    // Every rank P1 actually holds must be absent from the opponent-hand line.
+    // The opponent's line carries the size and nothing that could be a rank: the only digit
+    // on it is the count itself.
     let opponent_line = text
         .lines()
-        .find(|l| l.contains("P1 (opponent)"))
+        .find(|l| l.starts_with(" P1 "))
         .expect("the opponent line must exist");
-    assert!(
-        !opponent_line.contains(|c: char| c.is_ascii_digit() && c != '5')
-            || opponent_line.contains("5 card(s)"),
-        "the opponent's hand line must carry a count and nothing else: {opponent_line}"
+    let hand_field = opponent_line
+        .split("hand ")
+        .nth(1)
+        .and_then(|rest| rest.split("discard").next())
+        .expect("the opponent line must carry a hand field");
+    assert!(hand_field.starts_with('5'), "P1's size is shown\n{text}");
+    assert_eq!(
+        hand_field.matches(|c: char| c.is_ascii_digit()).count(),
+        1,
+        "the hand field must carry a count and nothing else: {hand_field:?}"
     );
 }
 
@@ -276,7 +290,7 @@ fn rule_10a_only_the_bottomer_knows_what_they_bottomed() {
 
     let p0_view = render(&s, Some(P0));
     assert!(
-        p0_view.contains("you privately know") && p0_view.contains("bottom-up: J"),
+        p0_view.contains("you know") && p0_view.contains("bottom-up: J"),
         "P0 knows both the identity and the position\n{p0_view}"
     );
     assert!(
@@ -399,7 +413,9 @@ fn rule_5_the_renderer_never_shows_a_rank_the_observer_may_not_know() {
                     .filter(|c| !c.rank_known_to(observer))
                     .count();
                 let text = render(&s, Some(observer));
-                let rendered_unknown = text.matches("(?)").count();
+                // `?` in the rank field is the only way a card can render unknown, whichever
+                // brackets it wears — `{…}` for a base card, `(…)` for anything else.
+                let rendered_unknown = text.matches("? ").count();
                 assert_eq!(
                     rendered_unknown, unknown_cards,
                     "{variant}: {observer} was shown a rank they may not know\n{text}"

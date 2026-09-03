@@ -20,15 +20,14 @@
 //! `phase3_observation_is_a_function_of_the_information_set` is what proves the projection is
 //! filtered correctly. The two tests together are the whole argument.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::action::Action;
 use crate::agents::Agent;
 use crate::config::GameConfig;
 use crate::encode::{action_dim, decode_action, encode_action, encode_observation, obs_dim};
-use crate::nn::{Evaluator, MlpEvaluator, Weights};
+use crate::nn::{Evaluator, MlpEvaluator};
 use crate::state::GameState;
 
 /// A checkpoint played greedily.
@@ -37,7 +36,7 @@ pub struct NetPolicyAgent {
     /// Resolved on the first decision, because [`crate::AgentSpec::build`] does not know the
     /// configuration the agent will be asked to play under and the layout hashes are
     /// config-derived.
-    evaluator: Option<MlpEvaluator>,
+    evaluator: Option<Arc<MlpEvaluator>>,
     obs: Vec<f32>,
     logits: Vec<f32>,
     values: Vec<f32>,
@@ -64,7 +63,7 @@ impl NetPolicyAgent {
         if self.evaluator.is_some() && self.obs.len() == obs_dim(config) {
             return;
         }
-        let weights = load_cached(&self.checkpoint, config).unwrap_or_else(|e| {
+        let evaluator = crate::nn::evaluator_for(&self.checkpoint, config).unwrap_or_else(|e| {
             // `Agent::choose` cannot fail, and a checkpoint that will not load is a setup
             // error rather than a game state the agent has to cope with — so this is a
             // panic with the whole diagnosis in it, not a silent fallback to random play.
@@ -74,7 +73,7 @@ impl NetPolicyAgent {
         self.logits = vec![0.0; action_dim(config)];
         self.values = vec![0.0; 1];
         self.mask = vec![false; action_dim(config)];
-        self.evaluator = Some(MlpEvaluator::shared(weights));
+        self.evaluator = Some(evaluator);
     }
 }
 
@@ -119,38 +118,6 @@ impl Agent for NetPolicyAgent {
     }
 }
 
-/// Process-wide checkpoint cache.
-///
-/// A ladder builds a fresh agent per game — `duel52 ladder --games 400` across five rungs is
-/// thousands of builds — and re-reading and re-parsing a 20 MB file each time would dominate
-/// the run. Weights are immutable once loaded, so sharing them changes nothing about
-/// reproducibility.
-///
-/// **The key includes the layout hashes, not just the path.** Keying on the path alone would
-/// let a checkpoint loaded under one configuration be served to an agent playing under a
-/// configuration whose layout it does not match: the second `Weights::load` would never run,
-/// so the check the format exists for would be skipped exactly when it mattered.
-type CacheKey = (PathBuf, u64, u64);
-type Cache = Mutex<HashMap<CacheKey, Arc<Weights>>>;
-
-fn cache() -> &'static Cache {
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn load_cached(path: &Path, config: &GameConfig) -> Result<Arc<Weights>, String> {
-    let key = (
-        path.to_path_buf(),
-        crate::encode::obs_layout_hash(config),
-        crate::encode::action_layout_hash(config),
-    );
-    if let Some(found) = cache().lock().expect("checkpoint cache").get(&key) {
-        return Ok(found.clone());
-    }
-    let weights = Arc::new(Weights::load(path, config)?);
-    cache()
-        .lock()
-        .expect("checkpoint cache")
-        .insert(key, weights.clone());
-    Ok(weights)
-}
+// The checkpoint cache this file used to own now lives in `crate::nn::evaluator_for`, so
+// that `netmcts` shares it. It caches the *evaluator* rather than the weights, because
+// building one transposes the input matrix (see `MlpEvaluator::shared`).

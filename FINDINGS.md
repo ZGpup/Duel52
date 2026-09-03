@@ -668,6 +668,179 @@ masked-softmax total-variation distance `< 1e-4`. Not a strategic finding — a 
 two implementations of `DESIGN.md` §5 are the same function, which is what makes "train in
 Python, evaluate in Rust" safe. `py/tests/test_parity.py`.
 
+**F3.3 — The observation is 4.8% dense and a position offers ~21 actions, and both numbers
+paid for themselves immediately.** Over 954 decision nodes sampled from 20 seeded
+random-vs-random games at `encoding_slots = 21`:
+
+| quantity | mean | min | max |
+|---|---:|---:|---:|
+| non-zero observation features (of 4290) | 205 | 77 | 294 |
+| legal actions (of 2195 encoded) | 20.7 | 1 | 78 |
+
+Config: `variant=split two_power=bottom encoding_slots=21`, seed 1, from
+`duel52 nn-dump --games 20 --max-rows 1024`. Self-play at 64 simulations gives the same
+density to within a feature (208 per sample over 10,612 decisions).
+
+Both are structural rather than incidental — the encoder is one-hot over rank, slot and
+phase, and Duel 52 gives a player three actions from a small hand — so both were turned into
+inference speed rather than merely noted:
+
+- **The input layer walks the non-zeros.** `W_in` is kept transposed in `MlpEvaluator`, so
+  each non-zero input adds one contiguous `width`-long row. Accumulation order per output is
+  unchanged, so it is **bit-identical**, not approximately equal: the 954-row `nn-dump` above
+  is byte-for-byte the same file before and after the change. It cut a 512-wide forward pass
+  from 3.9 ms to 2.5 ms.
+- **Search computes only the logits it will look at.** `MlpEvaluator::eval_masked_with`
+  evaluates the policy head for the ~21 legal actions instead of all 2195, which removes
+  almost the whole head from the search hot path.
+
+Also worth recording because it sets the storage design: 4.8% density means a generation of
+self-play stored as dense f32 observations is gigabytes and stored sparsely is hundreds of
+megabytes, which is why `replay_shard` hands the trainer CSR triples rather than a matrix.
+
+**F3.4 — Net-guided search throughput, and what a local training session actually buys.**
+Self-play, 8 cores (M-series, 16 GB), `encoding_slots = 21`, a 128-wide 3-block network
+(949,396 parameters), `variant=split`:
+
+| simulations per decision | games/sec (8 threads) | games in 15 min |
+|---:|---:|---:|
+| 16 | 30.8 | 27,700 |
+| 32 | 16.6 | 14,900 |
+| 64 | 8.3 | 7,500 |
+| 128 | 4.8 | 4,300 |
+
+`ismcts:64`, the rollout agent at the same budget, runs at 10.7 games/sec — so a network
+evaluation at this size costs about what a random playout costs, and the two agents are
+comparable per simulation rather than the network being an order of magnitude dearer. Cost
+is very close to **linear in simulations**, which means sims and games trade one for one and
+the choice is a modelling decision rather than a budget one.
+
+A self-play game at 64 simulations records **166 decisions** — far more than the ~65 "plies"
+a match reports, because a ply is a turn's worth of the three actions plus the free
+sub-decisions `DESIGN.md` §4 splits out, and every one of those is a policy target.
+
+Two things this makes concrete for `PLAN.md` step 3:
+
+1. **A 2–3 hour session is ~15 generations of 3000 games**, so ~45,000 self-play games and
+   ~7.5M decisions. That is an assessment run — enough to see whether the loop learns, not
+   enough to expect it to pass `ismcts:800`.
+2. **A randomly-initialised network draws 69% of its self-play games** (64 games, seed 1,
+   sims 64: P0 11%, P1 20%, draw 69%, all stalemates) and *loses to `random`*. Both are
+   expected from an untrained prior — the policy is arbitrary, so it passes constantly and
+   the stalemate rule at `game_rules.md` §7 fires — but they have a consequence for the
+   loop: **the gate cannot be AlphaGo Zero's 0.55.** With most of the score mass exactly at
+   0.5, a 0.55 bar rejects nearly every candidate and the run's teacher never advances while
+   every other number looks healthy. The gate ships at 0.5, which still rejects a candidate
+   that is measurably worse. Re-measure the draw rate once the run is real: if it stays near
+   69% for several generations, the loop is stuck rather than slow.
+
+**Both numbered claims above were then measured properly and one of them was wrong — see
+F3.5.** They are left standing because the mistake is instructive: a 64-game sample from a
+single random initialisation is not a measurement of the game.
+
+**F3.5 — The first generation already beats the hand-written heuristic, and the fitting is
+4% of the loop.** Generation 1 of `configs/train-fast.toml`, from a PyTorch-default random
+initialisation, 3000 self-play games at 64 simulations, 1200 optimisation steps of batch 512
+on MPS:
+
+| | |
+|---|---|
+| self-play outcome mix | P0 45% · P1 46% · **draw 9%** |
+| decisions recorded | 439,746 (147 per game) |
+| policy loss | 7.696 → 3.116 (uniform over 2195 actions is `ln 2195` = 7.694) |
+| value loss | 0.939 → 0.400 |
+| gate: candidate vs the random-init incumbent | **0.858 ± 0.033** (W145 L2 D53) |
+| vs `random`, 120 games | **0.929 ± 0.035** |
+| vs `greedy`, 120 games | **0.558 ± 0.052** |
+
+Config: `variant=split two_power=bottom encoding_slots=21`, run seed 1,000,000; gate and
+benchmark matches at seed 1. **One generation is not a trained agent and this is not a
+strength claim** — it is the claim that the loop is *connected*, which is what a first pass
+is for. A policy loss starting at exactly `ln(action_dim)` and falling is the tightest
+available evidence that each observation is paired with its own policy target rather than
+with someone else's; a scatter bug or an off-by-one in the replay would sit at 7.69 forever.
+
+**Where the 8m01s of one generation goes:** 6m57s self-play, 5s replay and encode, 20s
+training, ~40s of gate and benchmark matches. Gradients are 4% of the wall clock, so a
+larger budget goes into `selfplay.games` and `selfplay.sims` long before `net.width`.
+
+Two corrections to what the small sample above suggested:
+
+- **The draw rate at initialisation is a property of the initialisation, not of the game.**
+  64 games from one random-init checkpoint drew 69%, all stalemates. The shipped
+  configuration's generation 1, a different random init over 3000 games, drew **9%**. An
+  untrained policy is arbitrary, so whether it passes constantly is arbitrary too.
+- **The gate still ships at 0.5, but not for the reason F3.4 gave.** Generation 1 scored
+  0.858 and would have cleared any bar. The real concern is the *late* generations, where
+  gains shrink and the stalemate draw (`game_rules.md` §7) compresses the score onto 0.5 — a
+  fixed margin then rejects small-but-real improvements. 0.5 still rejects a candidate that
+  is measurably worse, which is the failure that compounds. Raise it once gate scores are
+  routinely well above 0.5.
+
+**F3.6 — The engine's stalemate draw is a stable equilibrium, and the first training run
+walked straight into it.** Three generations of `configs/train-fast.toml` as originally
+shipped (`stalemate_value = 0.5`, single-mirror gate at 0.5):
+
+| gen | self-play draws | value targets (buffer) | policy loss | value loss | mirror gate | vs `random` | vs `greedy` |
+|---:|---:|---|---:|---:|---|---:|---:|
+| 1 | 9% | 46 / 10 / 44 | 7.696 → 3.116 | 0.939 → 0.400 | 0.858 (W145 L2 D53) | **0.929** | **0.558** |
+| 2 | 55% | 29 / 44 / 27 | 2.955 → 2.826 | 0.547 → 0.269 | 0.502 (W1 L0 D199) | 0.600 | 0.496 |
+| 3 | 88% | 13 / 75 / 12 | 2.748 → 2.659 | 0.317 → 0.163 | 0.500 (W0 L0 D200) | 0.525 | 0.500 |
+
+Config: `variant=split two_power=bottom encoding_slots=21`, run seed 1,000,000, 3000
+self-play games per generation at 64 simulations. Every generation was **promoted**.
+
+**The mechanism.** `game_rules.md` §7 records that the published game defines no draw and
+that the stalemate rule is **[ENGINE]** — added because the reachable stall never ends on its
+own. Scoring it at half a point makes "neither player attacks" a stable equilibrium *of the
+modified game*: a certain 0.5 beats a risky fight, for both players, at every decision. Duel
+52 makes the trade especially attractive, because attacking costs material to retaliate
+(§5) and lane wins are endgame-only (§2), so there is nothing to lose by waiting. The learner
+found it in two generations.
+
+It then compounded three ways:
+
+1. **Stalled games are long**, so they are over-represented in the corpus relative to their
+   share of games. Generation 2 drew 55% of its *games* and contributed ~70% of its
+   *samples* — 147 decisions per game became 172.
+2. **A value head trained on 75% zeros learns to predict zero**, which is why the value loss
+   looks best exactly when the run is worst. `0.317 → 0.163` at generation 3 is the loss of
+   a head that has learned the game is a draw.
+3. **The gate could not see any of it.** Two stalling agents draw against each other, so the
+   mirror match scored 0.500, 0.502, 0.500 — indistinguishable from a dead-even fight, and
+   above the 0.5 threshold every time. Three promotions on no evidence at all, while the
+   only honest measurement in the readout (`vs random`) fell by 0.40.
+
+**Three fixes, and each one addresses a different link.**
+
+- **`config.stalemate_value`** (default 0.5, training `0.0`) — what a stalemate is worth *to
+  a learner*, to **both** players. At 0.0, refusing to play is no better than losing, so a
+  player who is behind always prefers a gamble. Read by exactly two places, the terminal
+  backup in `net_mcts` and the value targets in `selfplay`. **`Outcome::value_for` is
+  untouched**, so `match`, `ladder`, the Elo fit and every number in F1 and F2 still mean
+  what they meant. A *mutual lane win* keeps its half point — that one is a rule (§7), not
+  an artefact. `rule_7_a_stalemate_is_not_worth_half_a_point_to_a_learner`.
+- **The gate reads decisive games.** `W / (W + L)`, draws discarded, threshold back to 0.55.
+  Generation 3's match then reports "0 decisive of 200", which is *no evidence* rather than
+  a tie — a different thing, and the gate now treats it as one.
+- **A reference panel with a veto.** The candidate plays `random` and `greedy` — opponents
+  with no incentive to stall — *before* the promotion decision, and is refused if it falls
+  more than 0.05 below the best score any promoted checkpoint has managed. Measured against
+  a **high-water mark**, not the incumbent, so a slow give-back cannot ratchet the baseline
+  down one tolerance at a time. This is the check that catches generation 2 at the moment it
+  happens: mirror 0.502, `random` 0.929 → 0.600.
+
+Shard format version 2 exists because of this: version 1 recorded one byte for "draw" and
+could not distinguish an engine stalemate from a mutual lane win, so its corpus cannot be
+re-valued and is refused rather than read.
+
+**The generalisable lesson, and it is not about Duel 52.** Every *engine-defined* terminal
+condition is a potential equilibrium, and the ones added for the trainer's convenience are
+the most dangerous, because nothing about the real game constrains what they are worth. The
+draw here was added so games would terminate; scoring it like a real draw quietly changed
+which game was being solved. Anything else marked **[ENGINE]** in `game_rules.md` deserves
+the same question: *what does an agent get for exploiting this, and did we mean to offer it?*
+
 ### Learned card values — Phase 3/4
 From the value net and from ablation. F2.9 gives flip *priority* per rank, which is a
 different quantity and should not be quoted as a value table.

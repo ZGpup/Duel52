@@ -33,6 +33,8 @@ fn main() {
         "match" => cmd_match(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
         "nn-dump" => cmd_nn_dump(&args[1..]),
+        "selfplay" => cmd_selfplay(&args[1..]),
+        "shard" => cmd_shard(&args[1..]),
         "powers" => {
             print!("{}", power_reference());
             Ok(())
@@ -67,6 +69,8 @@ USAGE
   duel52 match   [options]        one head-to-head, with behavioural statistics
   duel52 probe   [options]        self-play instrumentation per agent (Phase 2 findings)
   duel52 nn-dump [options]        encode + forward-pass dump for the Python parity test
+  duel52 selfplay [options]       one generation of self-play, written as a .d52sp shard
+  duel52 shard   <file>           print a shard's header and replay it as an integrity check
   duel52 powers                   print the card-power reference
   duel52 config  <file>           validate a config file and print what it resolves to
   duel52 version
@@ -78,6 +82,8 @@ AGENTS
   pimc[:worldsxdepth]  alpha-beta per sampled world                (default 8x1)
   ismcts[:iters]    information-set MCTS, random rollouts          (default 800)
   netpolicy:<path>  a .d52nn checkpoint played by argmax, no search
+netmcts:<path>[@sims]  net-guided ISMCTS: PUCT over the policy prior,
+                  the value head in place of rollouts             (default 128)
 
 OPTIONS
   --variant <base|split|mirrored> which configuration (default: split — the project default)
@@ -85,6 +91,10 @@ OPTIONS
   --seed <n>                      game seed; the same seed always deals the same game
   --config <file>                 load a config file (overrides --variant/--two-power)
   --stalemate <plies>             quiet plies before a draw is declared (default 20)
+  --stalemate-value <0..0.5>      what an engine-declared stalemate is worth TO A LEARNER,
+                                  to both players (default 0.5 — the same as any draw).
+                                  Training sets 0.0; see FINDINGS.md F3.6. Scoring and Elo
+                                  are unaffected: a draw is still half a point there.
   --encoding-slots <n>            slots per side per lane the NN encoder reserves
                                   (default 16, FINDINGS.md F2.7). Must match the
                                   checkpoint: it is what fixes obs_dim.
@@ -113,6 +123,20 @@ OPTIONS
   --checkpoint <file>             the .d52nn checkpoint to run (required)
   --out <file>                    where to write the dump (required)
   --max-rows <n>                  rows to keep, sampled evenly across the run (default 512)
+
+  selfplay only:
+  --checkpoint <file>             the .d52nn checkpoint to play both sides (required)
+  --out <file>                    where to write the .d52sp shard (required)
+  --games <n>                     self-play games in this generation (default 1000)
+  --sims <n>                      PUCT simulations per decision (default 128)
+  --c-puct <f>                    PUCT exploration constant (default 1.25)
+  --dirichlet-alpha <f>           root noise concentration (default 0.3)
+  --dirichlet-weight <f>          root noise share of the prior (default 0.25)
+  --temperature <f>               visit-count exponent while sampling (default 1.0)
+  --temperature-decisions <n>     decisions sampled before switching to most-visited
+                                  (default 24)
+  --generation <n>                stamped into the shard header (default 0)
+  --quiet                         no per-batch progress lines
 
 EXAMPLES
   duel52 play --seed 1                     play the default variant as first player
@@ -219,6 +243,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut variant: Option<Variant> = None;
     let mut two_power: Option<TwoPower> = None;
     let mut stalemate: Option<u32> = None;
+    let mut stalemate_value: Option<f32> = None;
     let mut encoding_slots: Option<usize> = None;
 
     let mut i = 0;
@@ -239,6 +264,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--stalemate" => stalemate = Some(next_number(args, &mut i, "--stalemate")?),
+            "--stalemate-value" => {
+                stalemate_value = Some(next_number(args, &mut i, "--stalemate-value")?)
+            }
             "--encoding-slots" => {
                 encoding_slots = Some(next_number(args, &mut i, "--encoding-slots")?)
             }
@@ -306,6 +334,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     }
     if let Some(s) = stalemate {
         opts.config.stalemate_quiet_plies = s;
+    }
+    if let Some(v) = stalemate_value {
+        opts.config.stalemate_value = v;
     }
     if let Some(n) = encoding_slots {
         opts.config.encoding_slots = n;
@@ -872,10 +903,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         let mut complaint = String::new();
         let action = loop {
             let node = root.at(&path);
-            let mut menu_text = node.render();
-            if !path.is_empty() {
-                menu_text.push_str("     0. back\n");
-            }
+            let mut menu_text = node.render(!path.is_empty());
             if !complaint.is_empty() {
                 menu_text.push_str(&format!("\n !! {complaint}\n"));
                 complaint.clear();
@@ -927,6 +955,14 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             match number.checked_sub(1).and_then(|i| node.picks.get(i)) {
                 Some(menu::Pick::Take(action)) => break *action,
                 Some(menu::Pick::Open(_)) => path.push(number - 1),
+                // A row marked `—` keeps its number precisely so the others keep theirs, so
+                // this is a normal thing to type, not a mistake worth scolding.
+                Some(menu::Pick::Unavailable) => {
+                    complaint = format!(
+                        "nothing available under {} right now.",
+                        node.rows[number - 1].name
+                    )
+                }
                 None => complaint = format!("{number} is out of range (1..{})", node.len()),
             }
         };
@@ -966,13 +1002,19 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
 fn play_help() -> String {
     "\
-Choosing a move — two steps, never more:
-  1. pick the CARD you want to act with, from your hand or from your side of the board
-  2. pick what it does — which lane to play it into, or which card to attack
+Choosing a move — one question at a time:
+  PLAY   #1   which card from hand, then which lane
+  FLIP   #2   which lane, then which card
+  ATTACK #3   which lane, then which of your cards, then which of theirs
+  PAIR   #4   which lane, then the two cards
+  PASS   #5
 
-  A card whose only legal move is forced skips step 2 and takes it, so the first menu
-  spells out what that move is on the line you are picking. A flip is always such a
-  move, so its line names the power but not the whole power text — `powers` has that.
+  Those five numbers never move. A verb, lane or card that cannot be used right now keeps
+  its place in the list and shows `—` instead of a number, so `3` is attack every turn and
+  the second card in a lane is `#2` whether or not the first one can act.
+
+  A card's number counts DOWN its column on the board, so what you read off the board is
+  what you type. `powers` has the full text of every power.
 
   The screen is redrawn after every selection: what you are choosing between is always
   directly below the board it applies to, with the last few moves above it. Run with
@@ -980,7 +1022,7 @@ Choosing a move — two steps, never more:
 
 Commands at the prompt:
   <number>   pick that numbered line
-  0 / b      back to the card list (from the second menu)
+  0 / b      back one question
   help / ?   this message
   powers     the card-power reference
   rules      the handful of rules people get wrong
@@ -988,21 +1030,27 @@ Commands at the prompt:
   q          quit
 
 Reading the board:
-  Lanes are numbered 1-3 and slots from #1, the way you would count them. The engine's own
-  indices start at 0; nothing you type here uses them.
-  [K]        face-up card, rank K, visible to both players
-  (K)        face-down card whose rank YOU know (you played it, or a 4 showed it to you)
-  (?)        face-down card whose rank nobody has told you — including your own base cards
-  #2         the second card in that lane, counting from the left
-  base       still a base card: untouchable until every draw pile is empty
-  ex-base    entered play as a base card and was moved by a Queen; you still cannot see it
-  1/2hp      one hit point left of two. Every FACE-DOWN card is 2 HP whatever it really is,
-             so this tells you nothing about its rank — and a face-down Jack dies to two
-             hits like anything else. Flip it and its ceiling rises to 3.
-  FROZEN     cannot attack and cannot be flipped, by anyone, until its next turn ends
-  pair3      member of declared pair #3: attacks only together, and only a Queen or a
+  Lanes are columns, left to right. The opponent is at the top, you are at the bottom, and
+  each side's base card sits at the far end of its column. The double rule across the
+  middle is the front line: cards can only reach each other across it, in their own lane.
+
+  Every card is the same width, so a column never shifts as the position changes:
+
+  [3 ²♥]     FACE-UP 3, two hit points left. Power live, can attack.
+  (3 ²♥)     FACE-DOWN, and you know it is a 3 — you played it, or a 4 showed you. No
+             power, cannot attack, and a blank 2 HP whatever its rank, so a face-down Jack
+             dies to two hits like anything else. Flip it and its ceiling rises to 3.
+  (? ²♥)     face-down, and nobody has told you what it is
+  {? ²♥}     a BASE card: untouchable until every draw pile is empty, and hidden from you
+             as well as from your opponent — which is why a 4 can usefully peek at your own
+  [10³♥]     the 10 eats the space; the width does not change
+
+  Two columns follow each card when there is something to say:
+  a b c      member of that declared pair: attacks only together, and only a Queen or a
              death can break it
-  spent      already attacked this turn
+  *          FROZEN — cannot attack and cannot be flipped, by anyone, until its next turn
+  ·          already attacked this turn
+  +          has more than one attack left this turn (a freshly flipped Ace)
 "
     .to_string()
 }
@@ -1036,4 +1084,130 @@ Combat quick reference:
   * A King refires your other face-up powers in its lane — not Kings, not 8/9/10/J.
 "
     .to_string()
+}
+
+// ============================================================ Phase 3: the training loop ==
+
+/// One generation of self-play. The producer half of `PLAN.md` Phase 3 step 3; the consumer
+/// is `python -m duel52.train`, which calls this as a subprocess.
+fn cmd_selfplay(args: &[String]) -> Result<(), String> {
+    use duel52_engine::selfplay::{self, SelfPlayConfig};
+
+    let mut checkpoint: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut generation = 0u32;
+    let mut quiet = false;
+    let mut sp = SelfPlayConfig::default();
+
+    // Only the flags this command owns; everything else falls through to `parse_options`,
+    // so a typo is an error rather than a silent default.
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--checkpoint" => checkpoint = Some(next_value(args, &mut i, "--checkpoint")?),
+            "--out" => out_path = Some(next_value(args, &mut i, "--out")?),
+            "--generation" => generation = next_number(args, &mut i, "--generation")?,
+            "--sims" => sp.sims = next_number(args, &mut i, "--sims")?,
+            "--c-puct" => sp.c_puct = next_number(args, &mut i, "--c-puct")?,
+            "--dirichlet-alpha" => {
+                sp.noise.alpha = next_number(args, &mut i, "--dirichlet-alpha")?
+            }
+            "--dirichlet-weight" => {
+                sp.noise.weight = next_number(args, &mut i, "--dirichlet-weight")?
+            }
+            "--temperature" => sp.temperature = next_number(args, &mut i, "--temperature")?,
+            "--temperature-decisions" => {
+                sp.temperature_decisions = next_number(args, &mut i, "--temperature-decisions")?
+            }
+            "--quiet" => quiet = true,
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let opts = parse_options(&rest)?;
+    let checkpoint = checkpoint.ok_or("selfplay needs --checkpoint <path>")?;
+    let out_path = out_path.ok_or("selfplay needs --out <path>")?;
+    let games = opts.games_or(1000);
+    if sp.sims == 0 {
+        return Err("--sims must be at least 1".to_string());
+    }
+
+    let out = std::path::PathBuf::from(&out_path);
+    let report = selfplay::run(
+        opts.config,
+        &sp,
+        std::path::Path::new(&checkpoint),
+        opts.seed,
+        games,
+        opts.threads,
+        generation,
+        &out,
+        !quiet,
+    )?;
+    print!("{}", report.report(&out));
+    if report.max_slots_seen > opts.config.encoding_slots {
+        // Unreachable — the encoder asserts first — but if the assertion is ever relaxed
+        // this is the line that says the corpus is compromised rather than merely odd.
+        eprintln!(
+            "warning: a lane side held {} cards, above --encoding-slots {}",
+            report.max_slots_seen, opts.config.encoding_slots
+        );
+    }
+    Ok(())
+}
+
+/// Print a shard's header and replay it, which is the integrity check that matters: a
+/// trajectory is only worth keeping if the engine still produces the same legal-action lists
+/// it was recorded against.
+fn cmd_shard(args: &[String]) -> Result<(), String> {
+    use duel52_engine::selfplay;
+
+    let path = args.first().ok_or("shard needs a file path")?;
+    let threads = if let Some(pos) = args.iter().position(|a| a == "--threads") {
+        args.get(pos + 1)
+            .and_then(|v| v.parse().ok())
+            .ok_or("--threads needs a number")?
+    } else {
+        default_threads()
+    };
+
+    let shard = selfplay::Shard::read(std::path::Path::new(path))?;
+    println!("{path}");
+    for (k, v) in &shard.header {
+        println!("  {k:<22} {v}");
+    }
+    println!("  {:<22} {}", "games", shard.games.len());
+    println!("  {:<22} {}", "samples", shard.sample_count());
+    println!("  {:<22} {}", "config", shard.config.summary());
+
+    let started = std::time::Instant::now();
+    let set = duel52_engine::selfplay::replay(&shard, threads, 1);
+    let secs = started.elapsed().as_secs_f64();
+    if set.samples != shard.sample_count() {
+        return Err(format!(
+            "replay produced {} samples but the shard holds {} — the recorded trajectories \
+             do not match this engine build",
+            set.samples,
+            shard.sample_count()
+        ));
+    }
+    println!(
+        "\nreplayed cleanly in {secs:.1}s — {} samples, obs_dim {}, action_dim {}",
+        set.samples, set.obs_dim, set.action_dim
+    );
+    println!(
+        "  observation density {:.1}% ({:.0} of {} features per sample)",
+        100.0 * set.obs_index.len() as f64 / (set.samples * set.obs_dim).max(1) as f64,
+        set.obs_index.len() as f64 / set.samples.max(1) as f64,
+        set.obs_dim,
+    );
+    println!(
+        "  policy target support {:.1} actions per sample",
+        set.policy_index.len() as f64 / set.samples.max(1) as f64
+    );
+    let mean_value = set.value.iter().sum::<f32>() / set.samples.max(1) as f32;
+    let mean_root = set.root_value.iter().sum::<f32>() / set.samples.max(1) as f32;
+    println!("  mean value target {mean_value:+.4} · mean search root value {mean_root:+.4}");
+    Ok(())
 }

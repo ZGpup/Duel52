@@ -40,12 +40,13 @@
 //! | `apply` | Powers, combat, and the turn machinery (`impl GameState`) |
 //! | [`display`] | Rendering a board for a specific observer, without leaking |
 //! | [`encode`] | Observation and action tensors, and the layout hashes that pin them |
-//! | [`menu`] | Reshaping the legal-action list into the CLI's pick-a-card-then-act tree |
+//! | [`menu`] | Reshaping the legal-action list into the CLI's verb/lane/card question tree |
 //! | [`nn`] | The reference network: weights, checkpoint format, forward pass |
 //! | [`agents`] | The five-rung Phase 2 ladder, and the trait an agent implements |
 //! | [`elo`] | Fitting ratings to a round-robin result table |
 //! | [`ladder`] | Running the round-robin, in parallel |
 //! | [`probe`] | Strategic measurement — the Phase 2 deliverable |
+//! | [`selfplay`] | Self-play generation, and the `.d52sp` trajectory shard |
 //! | [`stats`] | Random-vs-random measurement — the Phase 1 deliverable |
 //! | [`testkit`] | Building positions by hand, for the rules tests and Phase 4 probes |
 //!
@@ -85,6 +86,7 @@ pub mod player;
 pub mod probe;
 pub mod rank;
 pub mod rng;
+pub mod selfplay;
 pub mod state;
 pub mod stats;
 pub mod testkit;
@@ -98,7 +100,8 @@ mod setup;
 
 pub use action::{Action, IllegalAction, Phase, Side};
 pub use agents::{
-    Agent, AgentSpec, FlatMcAgent, GreedyAgent, IsmctsAgent, PimcAgent, RandomAgent,
+    Agent, AgentSpec, FlatMcAgent, GreedyAgent, IsmctsAgent, NetMctsAgent, NetPolicyAgent,
+    PimcAgent, RandomAgent,
 };
 pub use card::{Card, CardId, PairId};
 pub use config::{GameConfig, TwoPower, Variant};

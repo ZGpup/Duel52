@@ -59,8 +59,8 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 268 tests: rules, determinism, information hiding,
-                                         # and the Phase 3 encoding path
+cargo test                               # 294 tests: rules, determinism, information hiding,
+                                         # the Phase 3 encoding path, and the training corpus
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
@@ -88,11 +88,33 @@ cargo test                               # 268 tests: rules, determinism, inform
 ./target/release/duel52 nn-dump --checkpoint checkpoints/init.d52nn \
     --games 20 --seed 1 --out /tmp/parity.bin                     # feeds test_parity.py
 
+# Phase 3 steps 2-3 — training. One TOML plus a seed describes a whole run; `check` validates
+# it in five seconds, which is worth doing before a two-hour session.
+.venv/bin/python -m duel52.train check --config configs/train-fast.toml
+.venv/bin/python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first
+.venv/bin/python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first \
+    --resume                                                      # continue after a stop
+
+# The pieces, runnable on their own when something looks wrong.
+./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \
+    --out /tmp/gen.d52sp --games 200 --sims 64 --encoding-slots 21
+./target/release/duel52 shard /tmp/gen.d52sp                      # header + replay check
+./target/release/duel52 match --a netmcts:runs/first/checkpoints/best.d52nn@64 \
+    --b ismcts:800 --games 200 --encoding-slots 21
+
 # Python. Needs a venv; `maturin develop` drops the extension into py/duel52/.
 python3 -m venv .venv && .venv/bin/pip install -q maturin pytest torch numpy
 .venv/bin/maturin develop --release
 .venv/bin/python -m pytest py/tests -q
 ```
+
+⚠️ **The stalemate draw is [ENGINE], and what it is worth is a training decision.** At the
+engine default of `stalemate_value = 0.5` a learner will discover that mutual refusal to
+attack is a safe half point and stop playing — `FINDINGS.md` F3.6 has the three generations
+where that happened. Training configs set `0.0`. This is a *learning* weight only:
+`Outcome::value_for`, `match`, `ladder` and every F1/F2 number are untouched by it. More
+generally, anything marked **[ENGINE]** in `game_rules.md` is a rule nobody agreed to, and
+deserves the question *what does an agent get for exploiting this?*
 
 ⚠️ `encoding_slots` defaults to **16** and the encoder **asserts** rather than truncating.
 A `netpolicy` checkpoint played against `random` can exceed it — see `FINDINGS.md` F3.1.
@@ -100,7 +122,9 @@ Add `--encoding-slots 21` to both the `init` and the `duel52` command if you hit
 must match, because `encoding_slots` is what fixes `obs_dim`.
 
 Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
-`split-raw-two.toml` (the control for the §10a house rule).
+`split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml` is a *training*
+config rather than a game config — it carries the loop's knobs and sets
+`encoding_slots = 21`, which every command in that run must agree on.
 
 ## Where things are
 
@@ -111,17 +135,19 @@ Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.t
 | `engine/src/legal.rs` | Legal-action enumeration |
 | `engine/src/config.rs` | Every tunable; the three variant presets |
 | `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 4 probes |
-| `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and slots are numbered from 1 |
-| `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's pick-a-card-then-act tree |
+| `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and cards are numbered from 1, and the only definition of the order a lane's cards are drawn in (`column_slots`) |
+| `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's verb → lane → card question tree, with every number fixed to the thing it picks |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
 | `engine/src/encode.rs` | Observation and action tensors, and the layout hashes that pin them |
 | `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass |
-| `engine/src/agents/` | The five ladder rungs plus `netpolicy`, and the evaluation in `eval.rs` |
+| `engine/src/agents/` | The five ladder rungs plus `netpolicy` and `netmcts`, and the evaluation in `eval.rs` |
+| `engine/src/selfplay.rs` | Self-play generation and the `.d52sp` trajectory shard |
 | `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit |
 | `engine/src/probe.rs` | Instrumented play — where the Phase 2 findings come from |
 | `engine/tests/` | One named test per ruling, named for its rule section |
 | `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
 | `py/duel52/nn/` | The PyTorch model and checkpoint I/O. **Never an encoder** — see below |
+| `py/duel52/train/` | The AZ loop: replay buffer, trainer, generation driver. Gradients only |
 
 Three structural points that are easy to undo by accident:
 

@@ -227,6 +227,55 @@ design above did not anticipate:
   at depth `d` costs `b^(d+1)`, and §3's note about lane width is the same problem seen from
   the other side. It carries an explicit node budget for that reason.
 
+**Phase 3 step 2 replaced the two halves of the loop, and nothing else** —
+`engine/src/agents/net_mcts.rs`, as the `netmcts:<checkpoint>@<sims>` rung. UCB1 over
+availability becomes PUCT over a network prior; a uniform-random playout becomes the value
+head. The determinization, the information-set tree and the availability counts are the
+Phase 2 code's, unchanged.
+
+Two adaptations that determinization forces, and that a transcription of AlphaZero would get
+wrong:
+
+- **The PUCT numerator is the edge's availability, not the parent's visit count.**
+  `Q + c·P·sqrt(availability(e))/(1 + visits(e))`. An action legal in only half the sampled
+  worlds has had half as many chances to be chosen, and charging it for the visits it was not
+  on the menu for is the same mistake UCB1 makes without an availability count. It reduces to
+  AlphaZero's rule exactly when every action is always legal.
+- **Priors are stored as logits and softmaxed over what is available**, because the legal set
+  changes between determinizations and a probability normalised at expansion time would be
+  normalised over the wrong support on most later visits.
+
+## 6a. The training loop
+
+`PLAN.md` Phase 3 step 3. One generation is: `duel52 selfplay` → a `.d52sp` shard →
+`python -m duel52.train` replays, fits, gates, promotes.
+
+**The corpus stores trajectories, not tensors.** A shard holds `(config, seed, and for each
+decision an index into legal_actions() plus the root visit distribution)`. Observations are
+recomputed by replaying the game through the engine, which costs a few hundred microseconds
+and means an encoder change costs a replay rather than a discarded corpus. The action indices
+are indices into the *legal-action list* rather than encoded action indices, for the same
+reason one level down: a legal-action list is a property of the engine, an encoded index is a
+property of the current action layout.
+
+**Replay hands Python sparse observations.** The observation is 4.8% dense (`FINDINGS.md`
+F3.3), so `duel52._engine.replay_shard` returns CSR-style `offset`/`index`/`value` triples
+and the trainer scatters a batch into a dense tensor on the way to the device. Dense storage
+of one generation is gigabytes; sparse is hundreds of megabytes.
+
+**An engine-declared stalemate is not worth half a point to a learner.** `config
+.stalemate_value` (default 0.5, training 0.0) is read by the terminal backup in `net_mcts`
+and the value targets in `selfplay`, and by nothing else — `Outcome::value_for` and therefore
+the whole Elo apparatus are untouched. `FINDINGS.md` F3.6 is why: at half a point, mutual
+refusal to attack is a stable equilibrium of the modified game, and the first training run
+found it in two generations. A *mutual lane win* keeps its half point; that one is a rule.
+
+**The gate is two tests, and reads decisive games.** `W / (W + L)` against the incumbent at
+0.55, plus a veto if the candidate falls more than a tolerance below the best score any
+promoted checkpoint has managed against a fixed reference panel. The single-mirror version
+promoted three consecutive generations of a collapsing agent, because two stalling agents
+draw against each other and 0.500 clears a 0.5 threshold — F3.6 again.
+
 ## 7. Validation strategy
 
 Exact exploitability is out of reach for the full game, so:

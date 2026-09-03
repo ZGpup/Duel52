@@ -32,6 +32,7 @@ pub mod eval;
 pub mod flat_mc;
 pub mod greedy;
 pub mod ismcts;
+pub mod net_mcts;
 pub mod net_policy;
 pub mod pimc;
 
@@ -42,6 +43,7 @@ use crate::state::GameState;
 pub use flat_mc::FlatMcAgent;
 pub use greedy::GreedyAgent;
 pub use ismcts::IsmctsAgent;
+pub use net_mcts::{NetMctsAgent, RootNoise, SearchResult};
 pub use net_policy::NetPolicyAgent;
 pub use pimc::PimcAgent;
 
@@ -159,6 +161,9 @@ pub enum AgentSpec {
     Ismcts { iterations: usize },
     /// Phase 3's policy-only rung: a checkpoint played by argmax, no search.
     NetPolicy { checkpoint: String },
+    /// Phase 3's real rung: net-guided ISMCTS. PUCT over the policy prior, the value head in
+    /// place of rollouts.
+    NetMcts { checkpoint: String, sims: usize },
 }
 
 impl AgentSpec {
@@ -240,9 +245,30 @@ impl AgentSpec {
                         .to_string(),
                 ),
             },
+            // `netmcts:<path>@<sims>`. Split from the *right*, because the path is taken
+            // verbatim and may itself contain an `@` — a name like `gen7@2.d52nn` is not
+            // the caller's mistake to pay for.
+            "netmcts" | "nmcts" => {
+                let budget = budget.filter(|b| !b.trim().is_empty()).ok_or_else(|| {
+                    "netmcts needs a checkpoint path, e.g. \
+                     `netmcts:checkpoints/gen7.d52nn@128`"
+                        .to_string()
+                })?;
+                let (checkpoint, sims) = match budget.rsplit_once('@') {
+                    Some((path, s)) => (path.to_string(), number("netmcts sims", s)?),
+                    None => (budget.to_string(), NetMctsAgent::DEFAULT_SIMS),
+                };
+                if checkpoint.trim().is_empty() {
+                    return Err("netmcts needs a checkpoint path before the `@`".to_string());
+                }
+                if sims == 0 {
+                    return Err("netmcts needs at least one simulation".to_string());
+                }
+                Ok(AgentSpec::NetMcts { checkpoint, sims })
+            }
             other => Err(format!(
-                "unknown agent `{other}` — expected random, greedy, flatmc, pimc, ismcts or \
-                 netpolicy"
+                "unknown agent `{other}` — expected random, greedy, flatmc, pimc, ismcts, \
+                 netpolicy or netmcts"
             )),
         }
     }
@@ -256,6 +282,7 @@ impl AgentSpec {
             AgentSpec::Pimc { worlds, depth } => format!("pimc:{worlds}x{depth}"),
             AgentSpec::Ismcts { iterations } => format!("ismcts:{iterations}"),
             AgentSpec::NetPolicy { checkpoint } => format!("netpolicy:{checkpoint}"),
+            AgentSpec::NetMcts { checkpoint, sims } => format!("netmcts:{checkpoint}@{sims}"),
         }
     }
 
@@ -283,6 +310,11 @@ impl AgentSpec {
             // checkpoint is read on the first decision, once per process — see
             // `net_policy::load_cached`.
             AgentSpec::NetPolicy { checkpoint } => Box::new(NetPolicyAgent::new(checkpoint)),
+            // No root noise: this is the evaluation build. Self-play adds it explicitly, in
+            // `selfplay.rs`, because a benchmark agent must play its best move.
+            AgentSpec::NetMcts { checkpoint, sims } => {
+                Box::new(NetMctsAgent::derived(checkpoint, seed, stream, *sims))
+            }
         }
     }
 }

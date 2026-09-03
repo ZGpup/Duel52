@@ -30,8 +30,52 @@
 mod mlp;
 mod weights;
 
-pub use mlp::MlpEvaluator;
+pub use mlp::{MlpEvaluator, Scratch};
 pub use weights::{Arch, Weights, CHECKPOINT_MAGIC, CHECKPOINT_VERSION};
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::config::GameConfig;
+
+/// Process-wide evaluator cache.
+///
+/// A ladder builds a fresh agent per game — `duel52 ladder --games 400` across six rungs is
+/// thousands of builds — and re-reading a 20 MB checkpoint each time would dominate the run.
+/// [`MlpEvaluator`] is immutable once built, so sharing it changes nothing about
+/// reproducibility, and it is the evaluator rather than the [`Weights`] that is cached
+/// because building one transposes the input matrix.
+///
+/// **The key includes the layout hashes, not just the path.** Keying on the path alone would
+/// let a checkpoint loaded under one configuration be served to an agent playing under a
+/// configuration whose layout it does not match: the second [`Weights::load`] would never
+/// run, so the check the format exists for would be skipped exactly when it mattered.
+type CacheKey = (PathBuf, u64, u64);
+type Cache = Mutex<HashMap<CacheKey, Arc<MlpEvaluator>>>;
+
+fn cache() -> &'static Cache {
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The evaluator for a checkpoint, loading it at most once per process per configuration.
+pub fn evaluator_for(path: &Path, config: &GameConfig) -> Result<Arc<MlpEvaluator>, String> {
+    let key = (
+        path.to_path_buf(),
+        crate::encode::obs_layout_hash(config),
+        crate::encode::action_layout_hash(config),
+    );
+    if let Some(found) = cache().lock().expect("checkpoint cache").get(&key) {
+        return Ok(found.clone());
+    }
+    let evaluator = Arc::new(MlpEvaluator::new(Weights::load(path, config)?));
+    cache()
+        .lock()
+        .expect("checkpoint cache")
+        .insert(key, evaluator.clone());
+    Ok(evaluator)
+}
 
 /// Something that can turn observations into raw policy logits and values.
 ///

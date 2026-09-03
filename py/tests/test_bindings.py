@@ -200,7 +200,11 @@ def test_observation_is_symmetric_between_the_players():
 def test_render_respects_the_observer():
     g = Game(seed=11)
     p0_view = g.render("p0")
-    assert "(?)" in p0_view, "base cards render as unknown"
+    # A face-down card renders its rank as `?` — including the observer's own base cards,
+    # which are hidden from their owner too (`game_rules.md` §3). The hit points beside it
+    # are not filtered and need not be: §5 makes every face-down card a blank 2-HP card, so
+    # printing them reveals nothing.
+    assert "?" in p0_view, "base cards render as unknown"
     assert "REVEAL" not in p0_view
     assert "REVEAL" in g.render(None), "no observer means debug mode"
 

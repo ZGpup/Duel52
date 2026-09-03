@@ -45,6 +45,10 @@ fn test_roster() -> Vec<AgentSpec> {
         AgentSpec::NetPolicy {
             checkpoint: test_checkpoint(),
         },
+        AgentSpec::NetMcts {
+            checkpoint: test_checkpoint(),
+            sims: 24,
+        },
     ]
 }
 
