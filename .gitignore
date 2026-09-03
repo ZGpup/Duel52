@@ -1,0 +1,28 @@
+# Rust
+/engine/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Training artifacts — never commit these, they belong in object storage
+/runs/
+/checkpoints/
+*.pt
+*.ckpt
+/data/
+/replay_buffers/
+
+# Logs and profiling
+*.log
+/wandb/
+/tensorboard/
+
+# macOS
+.DS_Store
