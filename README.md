@@ -77,23 +77,15 @@ much weaker. Both are agent names anywhere an agent is accepted, so the checkpoi
 straight into `match`, `ladder` and `probe`.
 
 ```bash
-# The hand-written rungs need no checkpoint, and no --encoding-slots.
-./target/release/duel52 play --seed 1                 # a random bot; --seed replays exactly
-./target/release/duel52 play --opponent ismcts:2000   # the strongest rung on the ladder
-./target/release/duel52 powers                        # what every card does
-./target/release/duel52 demo --seed 47                # watch a whole game, ply by ply
-
-# Measure instead of playing.
-./target/release/duel52 match --a netmcts:models/duel52-split-gen016.d52nn@64 \
-    --b ismcts:800 --games 200 --seed 1 --encoding-slots 21
-./target/release/duel52 stats  --all                  # the Phase 1 numbers
-./target/release/duel52 ladder --games 400            # the Phase 2 Elo table
-./target/release/duel52 probe  --games 400            # how each agent actually plays
+# These need no checkpoint, and no --encoding-slots.
+./target/release/duel52 powers             # what every card does
+./target/release/duel52 demo --seed 47     # watch a whole game, ply by ply
+./target/release/duel52 play --seed 1      # a random bot, if @4096 is too much
 ```
 
 [models/README.md](models/README.md) records how that checkpoint was produced, what it
-scores, and where it is weak. Training your own is a Python job — [CLAUDE.md](CLAUDE.md) has
-the full command set.
+scores, and where it is weak — including the command that reproduces the ladder above.
+Training your own is a Python job; [CLAUDE.md](CLAUDE.md) has the full command set.
 
 Every prompt names the rule it is applying, so if the engine does something that looks
 wrong you can point at exactly which ruling it thinks it is following. `--seed N` makes a
