@@ -19,11 +19,14 @@ measured where the first run's ceiling actually was, and it was not compute:
    condition — while genuinely improving throughout. The run was ended by a measurement with
    no power to make the call, not by a learner that had stopped learning. Raise `gate.games`
    to ~600, or drop `gate.threshold` to 0.52.
-2. **`selfplay.sims` 64 → 256.** Search returns are *constant* at ~+145 Elo per 4× out to 1024
-   simulations, with no knee anywhere in the measured range (F3.8). The policy target **is**
-   the visit distribution, so training at 64 caps the teacher roughly 300 Elo below what the
-   same weights produce given more thinking time. Trade `selfplay.games` down to ~1500 to pay
-   for it; better targets beat more of the same targets now that the policy is decent.
+2. **`selfplay.sims` 64 → 256.** Search returns run +141, +156, then +69 Elo across successive
+   4× steps out to 4096 simulations — flat, then halving, and every step still excludes even
+   (F3.8). The policy target **is** the visit distribution, so training at 64 caps the teacher
+   roughly **370 Elo** below what the same weights produce at 4096. 256 is the pick because
+   the early steps are where the return is largest per unit of compute; the knee above 1024
+   says buying all the way up is not worth it inside a training loop. Trade `selfplay.games`
+   down to ~1500 to pay for it; better targets beat more of the same targets now that the
+   policy is decent.
 3. **`net.blocks` 3 → 10 — not `net.width`.** Only **10.5%** of the 949k parameters are in the
    residual trunk. 58% is the input projection and 30% the policy head, both pinned by
    `obs_dim = 4290` and `action_dim = 2194`. Going 3→10 blocks costs +25% parameters and

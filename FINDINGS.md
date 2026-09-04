@@ -1068,32 +1068,50 @@ loss was still falling (2.02 → 1.94) and never plateaued.
 Reproduce: `duel52 ladder --games 200 --markdown --variant split --encoding-slots 21 --agents
 random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:models/duel52-split-gen016.d52nn@64`.
 
-### F3.8 — Search returns are constant to 1024 sims, and there is no fusion signature
+### F3.8 — Search pays to 4096 sims, flat then halving, and there is no fusion signature
 
 gen016 played against itself at different budgets, `--seed 1`, `--encoding-slots 21`:
 
-| step (each 4× compute) | score | Elo |
-|---|---:|---:|
-| `netpolicy` → `@64` | 0.8100 ± 0.054 | +252 |
-| `@64` → `@256` | 0.6925 ± 0.064 | **+141** |
-| `@256` → `@1024` | 0.7100 ± 0.088 | **+156** |
+| step (each 4× compute) | games | score | Elo | 95% CI |
+|---|---:|---:|---:|---|
+| `netpolicy` → `@64` | 200 | 0.8100 ± 0.054 | +252 | [+196, +321] |
+| `@64` → `@256` | 200 | 0.6925 ± 0.064 | **+141** | [+91, +197] |
+| `@256` → `@1024` | 200 | 0.7100 ± 0.088 | **+156** | [+87, +239] |
+| `@1024` → `@4096` | 300 | 0.5983 ± 0.055 | **+69** | [+30, +110] |
 
-+141 then +156, intervals overlapping heavily: **~+145 Elo per 4×, flat, no knee anywhere in
-the measured range.** Two consequences.
+**Every step excludes even, so search is still paying at 4096 — but the last step's return is
+about half the two before it.** The first evidence of a knee, and it should be read carefully:
+the point estimate halves, but [+87, +239] and [+30, +110] overlap, so the decline itself is
+*suggestive rather than established*. What is established is that 4× more search at 4096 is
+still worth a real +69 Elo.
+
+⚠️ Measured at 60 games first, which gave 0.5667 ± 0.1254 — an interval covering even, and
+useless. 300 games is the right size for this question; the power calculation says ~210. Two
+experiments on the same day were under-powered the same way (the other is F3.9's first pass at
+200 games). **Size the run before starting it, not after reading it.**
+
+Two consequences.
 
 **For training.** The policy target *is* the visit distribution, so a run at
-`selfplay.sims = 64` teaches the network to imitate a search ~300 Elo weaker than the same
-weights produce at 1024. The teacher was capped, and `train-fast.toml`'s reasoning — "the
+`selfplay.sims = 64` teaches the network to imitate a search **~370 Elo** weaker than the same
+weights produce at 4096. The teacher was capped, and `train-fast.toml`'s reasoning — "the
 policy target only needs to be better than the current policy, not good" — is right from a
-random init and stops being right once the policy is decent.
+random init and stops being right once the policy is decent. The knee also says where the
+useful ceiling is: the 64 → 256 step is the cheapest large gain and the one the next run
+should buy.
 
 **For the method, and this is the more important half.** F2.3 ran this exact test on PIMC:
 8× more sampled worlds bought **nothing measurable**, the signature of strategy fusion. The
-same test on `netmcts` buys +145 Elo per 4×, twice over. Fusion saturates under more sampling;
-this does not. Per-simulation determinization (`net_mcts.rs`, `state.determinize` *inside* the
-simulation loop) is genuinely avoiding the trap that killed PIMC. **The failure mode that
-would justify abandoning AZ-over-ISMCTS is measurably not occurring.** See `PLAN.md` Phase 4's
-tripwire for what would.
+same test on `netmcts` buys +141, +156 and +69 Elo across three successive 4× steps — all
+three excluding even. Fusion saturates under more sampling; this decays but does not saturate.
+Per-simulation determinization (`net_mcts.rs`, `state.determinize` *inside* the simulation
+loop) is genuinely avoiding the trap that killed PIMC. **The failure mode that would justify
+abandoning AZ-over-ISMCTS is measurably not occurring**, though the 1024 → 4096 step is the
+first place to look for it if the knee deepens. See `PLAN.md` Phase 4's tripwire.
+
+**For playing it.** `@4096` is the strongest setting measured and is worth a real +69 Elo over
+`@1024`, at well under a second a move — which is why the README offers it as the default
+human opponent.
 
 **Capacity is also misallocated.** Of gen016's 949,267 parameters, the input projection is
 549,248 (57.9%) and the policy head 283,026 (29.8%) — both pinned by `obs_dim = 4290` and
