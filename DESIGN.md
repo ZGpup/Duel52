@@ -123,7 +123,7 @@ choosing. They are not, and `engine/src/action.rs`'s module header already said 
 That is not only a strength question. In an AlphaZero loop the policy target is the visit
 distribution over engine actions; two distinct actions sharing a logit force an invented
 rule for folding their visits and another for which one to actually play. Both are
-arbitrary, and both distort the policy Phase 4 is supposed to read. The head is exact and
+arbitrary, and both distort the policy the insight phase is supposed to read. The head is exact and
 slot-keyed instead, and `phase3_action_encoding_round_trips` asserts injectivity over the
 legal set.
 
@@ -327,7 +327,7 @@ duel52/
     duel52/        the Python package
     duel52/nn/     the PyTorch model, and checkpoint read/write
     train/         AZ self-play loop, R-NaD (later)
-    analyze/       Phase 4 insight extraction
+    analyze/       Phase 5 insight extraction
   configs/         variant + training configs (base / split / mirrored)
   openspiel/       Duel52-mini game registration
 ```

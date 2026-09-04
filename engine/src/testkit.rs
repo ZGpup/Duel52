@@ -6,8 +6,8 @@
 //!   named test". Most rulings are about a specific interaction — a 9-pair against a Jack,
 //!   a 5 meeting a frozen card — and reaching those by dealing and playing would be
 //!   hopeless. So tests place the cards directly.
-//! - **Phase 4.** `PLAN.md` lists "probe the value net on hand-constructed positions" as a
-//!   deliverable, which needs exactly this.
+//! - **Phase 5, insight extraction.** `PLAN.md` lists "probe the value net on
+//!   hand-constructed positions" as a deliverable, which needs exactly this.
 //!
 //! This module can build positions that could never arise in a real game. That is the
 //! point, but it also means it bypasses every rule about *how* cards get where they are.

@@ -106,7 +106,7 @@ impl GameState {
     ///
     /// A position from [`crate::testkit`] is not a dealt game — it holds whatever cards the
     /// test asked for, and the deck arithmetic need not balance. `DESIGN.md` §7 and
-    /// `PLAN.md` Phase 4 both want search agents runnable on exactly those, so the sampler
+    /// `PLAN.md` Phase 5 both want search agents runnable on exactly those, so the sampler
     /// stays usable there: any hidden position the deck cannot account for is filled with a
     /// uniformly random rank instead. The strict balance check applies only to real deals,
     /// where a mismatch would mean the engine had lost or duplicated a card.

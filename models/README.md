@@ -23,8 +23,10 @@ config, a shakedown run rather than a compute-serious one.
 It beats the top of the hand-written ladder by a wide margin, while searching twelve times
 less. That says it is far ahead of anything else available to play against; it says nothing
 about how close to optimal it is, because there is no stronger reference to measure it
-against. Establishing that is Phase 4's problem, and the CFR cross-check on a scaled down
-variant is the honest way to start.
+against — and the one external check there is says it is not close: **the project owner beats
+it.** Closing that gap is Phase 4's problem (a scaled-up run), and measuring how far it really
+is from optimal is Phase 6's (local best-response, and the CFR cross-check on a scaled down
+variant).
 
 ### How it was made
 
@@ -139,7 +141,7 @@ F2.5), with the caveat that no agent on that ladder could hoard on purpose. This
 
 That is the first support hypothesis H2 has, and it is **not yet a finding** — it is one
 pairing at one seed, and a between-agent difference cannot be told apart from a within-agent
-one here. `FINDINGS.md`'s Phase 4 list already names the experiment that would settle it.
+one here. `PLAN.md`'s Phase 5 list already names the experiment that would settle it.
 
 ### Known limits
 
@@ -148,5 +150,5 @@ one here. `FINDINGS.md`'s Phase 4 list already names the experiment that would s
 - **`stalemate_value = 0.0`** during training. It never mattered: since the §4
   mandatory-action ruling the engine cannot reach an engine-declared stalemate, so the term
   weighted nothing. See `FINDINGS.md` F3.6 for what it was guarding against.
-- **Nothing here is a Phase 4 finding.** This checkpoint is an instrument that works, not a
+- **Nothing here is a Phase 5 finding.** This checkpoint is an instrument that works, not a
   measurement of how Duel 52 should be played.

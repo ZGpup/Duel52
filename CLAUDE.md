@@ -41,7 +41,10 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 - **Config-driven, no hardcoded constants.** Variant selection, deck composition, removal
   count, draw rules, and stalemate threshold all live in config.
 - **Device-agnostic.** Code must run on MPS locally and CUDA on a rented box with no edits
-  beyond a config value. That is the handoff path.
+  beyond a config value. That is the handoff path — but note what it hands off: 87% of the
+  training loop is Rust self-play on CPU cores and 4% is gradient work, and the gradient step
+  is only 1.4× faster on a GPU than on eight CPU cores (`FINDINGS.md` F3.11). `run.threads`
+  matters more than `train.device`.
 
 ## Working agreements
 
@@ -150,7 +153,7 @@ config rather than a game config — it carries the loop's knobs and sets
 | `engine/src/apply.rs` | Powers, combat, turn machinery. The rules live here. |
 | `engine/src/legal.rs` | Legal-action enumeration |
 | `engine/src/config.rs` | Every tunable; the three variant presets |
-| `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 4 probes |
+| `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 5 probes |
 | `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and cards are numbered from 1, and the only definition of the order a lane's cards are drawn in (`column_slots`) |
 | `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's question tree — verb, then card, then lane only when the card is in more than one — with every verb and lane number fixed to the thing it picks |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |

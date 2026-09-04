@@ -2,49 +2,27 @@
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Current phase: 3 done and shipped; Phase 4 has started by accident.** Phase 2 delivered five
-agents, determinization, a frozen Elo ladder and the first strategic measurements
-(`FINDINGS.md` F2). Phase 3 delivered the encoders, the network, the inference path,
-`netmcts`, and the AlphaZero loop around them. `configs/train-fast.toml` has now been run:
-57,000 self-play games, 19 generations, 1.94 hours. The result is
-`models/duel52-split-gen016.d52nn`, tracked in git, **+495 Elo clear of `ismcts:800`** on the
-first ladder fitted since the §4 ruling (F3.7).
+**Current phase: 4 — scale the AlphaZero loop on rented compute.** Phases 0–3 are closed.
+Phase 2 delivered five agents, determinization, a frozen Elo ladder and the first strategic
+measurements (`FINDINGS.md` F2). Phase 3 delivered the encoders, the network, the inference
+path, `netmcts`, and the AZ loop around them; `configs/train-fast.toml` ran for 1.94 hours and
+produced `models/duel52-split-gen016.d52nn`, **+495 Elo clear of `ismcts:800`** (F3.7). The
+owner has played the engine and found no rules errors, which closes the last Phase 1 item.
 
-**The next thing to do is run it again, bigger — with three things changed first.** F3.8
-measured where the first run's ceiling actually was, and it was not compute:
+**The one number that sets Phase 4's agenda: the owner still beats gen016.** It is +1476 Elo
+on a ladder whose anchor is `random`, and the owner wins more often than not against it at
+`@4096`. Ladder Elo is *internal* — it measures the distance
+to five hand-written agents, and nothing in it says how far that is from good play. The human
+result is the only external yardstick this project has, and it says the agent is not there yet.
+**Phase 4's exit criterion is therefore a human one**, not a self-referential one: a net that
+wins a recorded series against the owner.
 
-1. **The gate, first, because it is free.** 200 games at a 0.55 threshold gives the promotion
-   test a standard error of 0.035. A generation genuinely improving at a true 0.54 passes only
-   **39%** of the time, and there is a **23%** chance of three consecutive refusals — the stop
-   condition — while genuinely improving throughout. The run was ended by a measurement with
-   no power to make the call, not by a learner that had stopped learning. Raise `gate.games`
-   to ~600, or drop `gate.threshold` to 0.52.
-2. **`selfplay.sims` 64 → 256.** Search returns run +141, +156, then +69 Elo across successive
-   4× steps out to 4096 simulations — flat, then halving, and every step still excludes even
-   (F3.8). The policy target **is** the visit distribution, so training at 64 caps the teacher
-   roughly **370 Elo** below what the same weights produce at 4096. 256 is the pick because
-   the early steps are where the return is largest per unit of compute; the knee above 1024
-   says buying all the way up is not worth it inside a training loop. Trade `selfplay.games`
-   down to ~1500 to pay for it; better targets beat more of the same targets now that the
-   policy is decent.
-3. **`net.blocks` 3 → 10 — not `net.width`.** Only **10.5%** of the 949k parameters are in the
-   residual trunk. 58% is the input projection and 30% the policy head, both pinned by
-   `obs_dim = 4290` and `action_dim = 2194`. Going 3→10 blocks costs +25% parameters and
-   triples the reasoning depth; going 128→256 wide costs +120% for less of it. The comment in
-   `train-fast.toml` says to raise width first, and the parameter accounting says otherwise.
-
-Minor, same run: there is no LR schedule — `train.lr` is a constant 2e-3 through AdamW for the
-whole run — and `temperature_decisions = 24` samples only the first 18% of a ~130-decision
-game, which is thin exploration for a long game.
-
-**Then, and only then, rent the GPU.** Nothing measured so far argues for changing the
-*method*; see Phase 4's tripwire for what would.
-
-**Still open from Phase 1, and it is the owner's:** the exit criterion. Nobody has played the
-engine and confirmed the rules by hand. That hour is worth more than it was —
-`duel52 play --encoding-slots 21 --opponent netmcts:models/duel52-split-gen016.d52nn@2048`
-is an opponent that genuinely resists at ~137 ms a move, so a rules error is likelier to
-surface as something that looks *wrong* rather than as noise.
+Phase 4 is a scale-up, not a redesign. Nothing measured so far argues for changing the method
+— `netmcts` shows no strategy-fusion signature (F3.8), search still pays at 4096 simulations,
+and the policy loss was still falling when the first run stopped. What ended that run was a
+promotion gate with no statistical power (F3.7), a teacher capped at 64 simulations, and a
+trunk holding 10.5% of the network's parameters. All three are config, and §4.2 fixes them.
+See §4.8 for the two measurements that *would* justify changing method.
 
 ---
 
@@ -57,9 +35,9 @@ surface as something that looks *wrong* rather than as noise.
 
 ---
 
-## Phase 1 — Engine + rules validation `[~]`
+## Phase 1 — Engine + rules validation `[x]`
 
-The only phase that needs meaningful owner input.
+The only phase that needed meaningful owner input, and it is closed.
 
 - [x] Rust crate: state, legal-action enumeration, action application, terminal detection
 - [x] All three configurations behind one config flag: base / split-deck / mirrored-removal
@@ -79,7 +57,10 @@ The only phase that needs meaningful owner input.
 - [x] **Deliverable:** random-vs-random statistics — game length distribution, first-player
       win rate, how often games reach the stalemate cutoff, across all three variants —
       logged as `FINDINGS.md` F1, 1.2M games
-- [ ] **Exit criterion:** the owner plays a few games against the CLI and finds no rules errors
+- [x] **Exit criterion:** the owner plays the CLI and finds no rules errors — **confirmed
+      2026-09-04**, including games against `netmcts:gen016`, which is a much better rules
+      test than a random opponent because a wrong ruling shows up as an opponent doing
+      something that looks *wrong* rather than as noise. No rules errors reported.
 
 **Play it with:** `cargo build --release && ./target/release/duel52 play --seed 1`
 
@@ -171,19 +152,17 @@ which is a cleaner premise for the belief modeling in Phase 3.
 
 ---
 
-## Phase 3 — Neural self-play `[~]`
+## Phase 3 — Neural self-play `[x]`
 
-**Steps 1–3 are done and a run has been through them** — encoders, network and inference path;
-`netmcts`; the self-play/replay/gate/promote loop. `configs/train-fast.toml` produced
-`models/duel52-split-gen016.d52nn` (F3.7). Still open: the CFR cross-check on a scaled down
-variant, which is the only item from the original Phase 3 plan not delivered, and a run at a
-budget where the gate can actually resolve a generation — see the three changes at the top of
-this file.
+All three steps delivered, and the loop has produced a trained agent. Two items that were
+originally filed here — the exact-CFR cross-check on a scaled-down game, and local
+best-response as an exploitability proxy — are *verification* work rather than *training*
+work, and they now live in Phase 6, where the tripwire that needs them lives too.
 
 - [x] Observation + action encoders (`DESIGN.md` §4–5) — `engine/src/encode.rs`, 3300 floats
-      and a 1324-logit head, both config-derived. Exposed to Python through
-      `Game.encode_observation` / `legal_mask` / `encode_action` / `decode_action`, with
-      `duel52.encoding_spec()` as the single source of shapes and layout hashes.
+      and a 1324-logit head at the default bound, both config-derived. Exposed to Python
+      through `Game.encode_observation` / `legal_mask` / `encode_action` / `decode_action`,
+      with `duel52.encoding_spec()` as the single source of shapes and layout hashes.
 - [x] Residual MLP with policy + value heads — `engine/src/nn/` (the Rust forward pass and
       the `.d52nn` format) and `py/duel52/nn/` (the PyTorch definition). `test_parity.py`
       asserts the two compute the same function.
@@ -202,33 +181,29 @@ this file.
       corpus. F2.7 and F3.1 both expect the slot bound to move.
 - [x] Checkpointing, resumability, config-driven throughout — a run is one TOML plus a seed;
       `--resume` continues a run directory.
-- [ ] **Run it.** Two attempts, both collapsed into the engine's stalemate draw
+- [x] **Run it.** Three attempts. The first two collapsed into the engine's stalemate draw
       (`FINDINGS.md` F3.6 and its postscript) — the second even at `stalemate_value = 0.0`,
       which removed the incentive but not the ability. The cause was a rule that was never a
       rule: the engine let a player pass. Fixed 2026-09-03 (`game_rules.md` §4, actions are
-      mandatory); greedy self-play stalemates went to zero, F2.4b. `Pass` was then removed
-      from the action space outright, taking the policy head from 1325 to 1324 logits, so
-      **every checkpoint and shard written before 2026-09-03 is refused and `runs/` cannot
-      be resumed** — start from a fresh `python -m duel52.nn init`.
-      **The third run is the first one where a draw is not an available strategy** —
-      `configs/train-fast.toml`,
-      ~2.5 hours, ~18 generations, then a ladder against the frozen Phase 2 rungs. Every
-      Phase 2 and Phase 3 number below predates the ruling and is measured on a different
-      game; the ladder needs re-running before anything is compared across it. Still watch
-      the self-play draw rate and the reference line.
-- [ ] **Duel52-mini** in OpenSpiel; validate the loop against exact CFR before trusting it
-      on the full game
-- [ ] Local best-response as the exploitability proxy
-- [ ] **Deliverable:** a trained agent that clearly beats the Phase 2 ladder, with an Elo
-      table and an LBR number
+      mandatory); greedy self-play stalemates went to zero (F2.4b), and `Pass` was then
+      removed from the action space outright, taking the policy head from 1325 to 1324
+      logits — so **every checkpoint and shard written before 2026-09-03 is refused and
+      `runs/` from before that date cannot be resumed.** The third run, the first in which a
+      draw is not an available strategy, is F3.7: 57,000 games, 19 generations, 1.94 h,
+      13 promotions, `models/duel52-split-gen016.d52nn` published with full provenance in
+      `models/README.md`. Zero draws in every generation's self-play.
+- [x] **Deliverable:** a trained agent that clearly beats the Phase 2 ladder, with an Elo
+      table — F3.7, **+495 Elo** clear of `ismcts:800` on one twelfth its simulation budget,
+      and `netpolicy` alone (argmax, no search) beats `greedy` 0.94. The LBR half of the
+      original deliverable moves to Phase 6.
 
 **The encoding bound, settled for training.** `FINDINGS.md` F3.1: `encoding_slots = 16`
 survives self-play (max 10) but not a mixed pairing against `random` (13–17), and `random` is
 the ladder's permanent anchor. **The engine default stays 16** — F3.1's recommendation was
-flagged rather than applied, and that call is still the owner's — but `configs/train-fast.toml`
-sets `encoding_slots = 21` for the training run, because a run that dies partway through an
-evaluation ladder costs more than 30% on the tensors. Self-play at 16 sims has already been
-seen to reach 17 cards on one side of one lane, so this is not theoretical.
+flagged rather than applied, and that call is still the owner's — but every training and
+evaluation command in the Phase 3/4 line sets `encoding_slots = 21`, because a run that dies
+partway through an evaluation ladder costs more than 30% on the tensors. Self-play at 64 sims
+has been seen to reach 17 cards on one side of one lane, so this is not theoretical.
 
 ### What step 1 turned up that the plan did not anticipate
 
@@ -242,7 +217,7 @@ seen to reach 17 cards on one side of one lane, so this is not theoretical.
    `to_move == P0`, duplicating `to_move` and telling an observer nothing about its own seat.
    Found because the encoder needed the feature. Now `observer_is_first_player`.
 
-### Decisions step 1 locked, so step 2 does not have to relitigate them
+### Decisions step 1 locked, so later work does not have to relitigate them
 
 `PHASE3_STEP1.md` carried the reasoning and was folded in here when the step landed. The five
 that constrain later work:
@@ -250,14 +225,15 @@ that constrain later work:
 - **Search and inference in Rust, training in Python.** `DESIGN.md` §9 has the argument.
 - **`Evaluator` is batch-shaped**, because self-play will batch across concurrent games — `G`
   games in flight per worker, one simulation each per round, evaluated together. No virtual
-  loss, no search distortion, every game reproducible from its own seed.
-- **The action head is exact and slot-keyed**, 1324 logits, every one of them a decision a
-  player actually makes. `DESIGN.md` §4.
+  loss, no search distortion, every game reproducible from its own seed. Still unused; it is
+  the seam a GPU inference backend would attach to (§4.1, Phase 6).
+- **The action head is exact and slot-keyed**, every logit a decision a player actually
+  makes. `DESIGN.md` §4.
 - **The checkpoint is a documented ~100-line binary format**, zero-dependency on both sides,
   carrying layout hashes. Not ONNX (a C++ dependency for a five-layer MLP), not safetensors
   (a JSON parser in a crate that has none).
-- **No new crates.** The `cli` / `nn` split waits for the CUDA handoff; `Evaluator` is the
-  seam that makes it cheap.
+- **No new crates.** The `cli` / `nn` split waits for a GPU backend; `Evaluator` is the seam
+  that makes it cheap.
 
 ### What steps 2 and 3 turned up that the plan did not anticipate
 
@@ -268,19 +244,17 @@ that constrain later work:
    logits is **bit-identical**, not an approximation, and it is the difference between a
    viable and an unviable local run. Neither optimisation would have been visible from the
    design; both came out of measuring the tensors the encoder actually produces.
-2. **The batched `Evaluator` has not been needed yet.** `DESIGN.md` §9 locked a batch-shaped
-   interface so self-play could keep `G` games in flight per worker. Self-play instead
-   parallelises across *games* on threads, one position per evaluation, because after the
-   sparsity work the network is no longer the dominant cost per simulation — determinization
-   and legal-action enumeration are. The interface is still the right one and the
-   cross-game batching is still the right next step **when a GPU backend arrives**; it is
-   deferred, not abandoned.
+2. **The batched `Evaluator` has not been needed yet.** Self-play parallelises across *games*
+   on threads, one position per evaluation. F3.11 has since put a number on what that costs:
+   even after the sparsity work the forward pass is roughly **80% of per-simulation cost**,
+   so cross-game batching is the lever a GPU would pull. It is deferred, not abandoned — see
+   §4.1 for why it is not worth pulling yet.
 3. **AlphaGo Zero's 0.55 promotion gate does not work in a game with a stalemate draw.**
    `FINDINGS.md` F3.4: an early network draws ~69% of its self-play games, so the score
    between adjacent generations is compressed onto 0.5 and a 0.55 bar rejects nearly
-   everything — a run whose teacher never advances, while every other number on the readout
-   looks healthy. The gate ships at 0.5, which still rejects a candidate that is *measurably
-   worse*, and that is the failure mode that compounds.
+   everything. Fixed by scoring the mirror match on decisive games only — and then broke
+   again from the other side, because at 200 games that score has no power (F3.7). §4.2's
+   first item is the third version of this gate.
 4. **The trajectory format is decoupled from the action layout too, not just the observation
    layout.** The plan said the buffer stores an "action-index sequence". Storing the
    *encoded* index would have tied every shard to one `action_dim`, which is exactly the
@@ -290,26 +264,455 @@ that constrain later work:
 5. **The engine's stalemate draw is a stable equilibrium, and the first run found it in two
    generations.** `FINDINGS.md` F3.6 — the draw rate went 9% → 55% → 88% while the agent's
    score against `random` fell 0.93 → 0.53, and the gate promoted every generation because
-   two stalling agents draw against each other and 0.500 cleared a 0.5 bar. Fixed by
-   `config.stalemate_value` (a learning weight, not a rule; scoring is untouched), a gate
-   that reads decisive games only, and a reference panel that can veto. The transferable
+   two stalling agents draw against each other and 0.500 cleared a 0.5 bar. The transferable
    part: **every [ENGINE] terminal condition is a potential equilibrium**, and the ones added
    for the trainer's convenience are the most dangerous because nothing about the real game
    constrains what they are worth.
 
 ---
 
-## Phase 4 — Extract the insight `[~]`
+## Phase 4 — Scale up `[ ]`
+
+**Goal: the strongest agent this architecture can produce, and an honest account of where it
+tops out.** No new method, no new learner. One long run on rented hardware, with the three
+things F3.8 identified as the first run's actual ceiling fixed first.
+
+**Exit criteria**, in the order they should be checked:
+
+1. The new net beats `netmcts:gen016@256` head-to-head by **≥ 0.70** over 400 games at equal
+   simulations (≈ +150 Elo). Below that, the run did not buy anything and §4.8 applies.
+2. It wins the owner's recorded 20-game series (§4.0). This is the criterion that matters.
+3. The search-scaling sweep (F3.8) is repeated on the new net, because whether it still
+   absorbs more search is the input to every decision after Phase 4.
+4. `FINDINGS.md` gets the ladder, the sweep, the `probe` table and the human series, all with
+   config and seed range.
+
+Sections 4.1–4.7 are written for someone who has not rented a machine before. §4.1 is the
+one that saves money; read it before booking anything.
+
+### 4.0 First, spend an evening making the human benchmark a number `[ ]`
+
+Right now "I can still beat it" is the most important fact about the project and it is not
+written down anywhere. Twenty games, ten in each seat, fixed seeds so the *same deals* can be
+replayed against the Phase 4 net later — which makes the rematch paired, and paired is worth
+about a doubling of sample size here:
+
+```bash
+for s in 101 102 103 104 105 106 107 108 109 110; do
+  ./target/release/duel52 play --encoding-slots 21 --as p0 --seed $s --no-clear \
+      --opponent netmcts:models/duel52-split-gen016.d52nn@4096
+done
+# then the same ten seeds again with --as p1
+```
+
+Record W/L/D per seed in `FINDINGS.md` as F4.1. Twenty games has a standard error of 0.11, so
+it resolves "the human wins 3 games in 4" and does not resolve "the human wins 11 in 20" —
+that is the honest resolution of an evening, and it is enough for an exit criterion. `@4096`
+is the strongest measured setting (F3.8) and costs well under a second a move.
+
+⚠️ This is the *only* external measurement in the project. Everything else is scored against
+agents this project wrote, on a ladder anchored at `random`, which is why a +1476 Elo rating
+and a losing record against one human are not in contradiction.
+
+### 4.1 What to rent — and it is cores, not a GPU `[ ]`
+
+**The headline: as the code stands, a GPU changes ~1.5% of the loop's wall clock.** Two
+measurements, both reproducible:
+
+Where a generation's time goes (F3.5, 8-core M-series, 3000 games at 64 sims):
+
+| stage | time | share | runs on |
+|---|---:|---:|---|
+| self-play | 6m57s | **87%** | **CPU cores**, Rust, `duel52 selfplay` |
+| gate + reference matches | ~40s | 8% | **CPU cores**, Rust, `duel52 match` |
+| replay + encode | 5s | 1% | CPU, Rust encoder via PyO3 |
+| gradient steps | 20s | 4% | GPU (or CPU) |
+
+And the gradient step does not need a GPU anyway — F3.11, one optimisation step at the real
+shapes (`obs_dim` 4290, `action_dim` 2194, batch 512):
+
+| trunk | 8 CPU cores | MPS GPU | 2800 steps on CPU |
+|---|---:|---:|---:|
+| 128 wide × 3 blocks | 8.3 ms | 5.9 ms | 23 s |
+| 128 wide × 10 blocks | 13.8 ms | 9.1 ms | 39 s |
+
+A laptop GPU is 1.4× faster than eight laptop CPU cores on a 1.2M-parameter MLP, which is what
+you would expect: the model is far too small to fill a GPU. A rented A100 would be a few times
+faster again and would still be shaving a minute off an hour-long generation.
+
+**So the machine to want is a many-core CPU box.** Self-play parallelises across *games* on
+threads (`--threads`) and results are identical whatever it is set to, so throughput scales
+essentially linearly with cores until memory bandwidth bites. 95% of the loop is that.
+
+**The shopping list, in preference order:**
+
+1. **32–64 physical cores, ≥64 GB RAM, ≥50 GB working disk.** Any GPU, or none. A CPU-only
+   instance is a completely legitimate buy here (AWS `c7i`/`c7a`, Hetzner dedicated, a
+   Vast.ai CPU listing) and is usually the cheapest per core.
+2. If the GPU is the thing that is actually available — which is likely, given the framing —
+   **pick the listing by its vCPU count, not its GPU model.** On RunPod/Vast/Lambda, vCPU
+   count scales with GPU count, so "1× A100, 30 vCPU" is really "a 15-core box with a GPU
+   attached", and "8× H100, 192 vCPU" is a 96-core box. The second is a good buy *for its
+   cores*; at 8× the price of the first it is a bad buy for its GPUs.
+3. **What to ask your brother**, before booking anything:
+   - `nproc` and `lscpu | head -20` — total threads, and **cores per socket** × sockets.
+     `nproc` counts hyperthreads; MCTS is compute-bound, so 64 threads on 32 physical cores
+     is worth roughly 1.2×, not 2×. §4.5 Stage 1 measures the real number.
+   - `free -g` — RAM. The replay buffer is the biggest thing in the Python process; §4.3
+     sizes it.
+   - `df -h .` — **disk on the working directory**, not the root volume. Container images
+     (RunPod, Docker) often ship 20 GB and bill the persistent volume separately. A big run
+     writes ~10 GB of shards.
+   - Is it a **VM or a container**? In a container, `nproc` may report the *host's* cores
+     while cgroups allow far fewer, and Rayon will happily spawn 192 threads on a 16-core
+     allowance and thrash. Always set `run.threads` explicitly to the number you measured.
+   - Is it **spot / preemptible / interruptible**? If yes it can be killed with two minutes'
+     notice, and §4.6's resume discipline stops being optional.
+   - **How many hours, and who is watching the bill.** An idle GPU box bills exactly like a
+     busy one. The single most common way to waste money here is forgetting to destroy the
+     instance after the run finishes.
+
+**Rough rates as of mid-2026 — verify current listings before booking.** A 4090-class box with
+32–64 vCPU runs ~$0.35–0.90/hr on Vast.ai or RunPod community; a single A100 with ~30 vCPU
+runs ~$1.10–1.60/hr on Lambda or RunPod secure; an 8×A100/H100 box runs $10–30/hr. A 24-hour
+run in the first bracket is **$10–20**, which is worth stating plainly because it is easy to
+assume this needs a budget it does not.
+
+**When a GPU would start to matter**, and therefore what is *not* worth doing yet: the network
+is ~80% of per-simulation cost (F3.11), so a GPU inference backend behind the batch-shaped
+`Evaluator` (`DESIGN.md` §9) would in principle be the biggest single speedup available. It
+needs a new crate (`candle` or `tch`), cross-game batching in `selfplay.rs`, and a new parity
+test — days of work, and it buys nothing until the trunk is large enough that a CPU forward
+pass dominates a determinization. Filed in Phase 6. Rent cores now.
+
+### 4.2 What to change before the run, and why `[ ]`
+
+Six changes. The first two are the ones F3.7 and F3.8 actually diagnosed; the rest follow from
+the run being longer. Each is `configs/train-big.toml` unless marked **[code]**.
+
+**1. Make the promotion gate able to make a call — and correct what this file said before.**
+An earlier version of this plan said to *either* raise `gate.games` to 600 *or* drop
+`gate.threshold` to 0.52. The "either" is wrong, and the direction matters:
+
+| gate | true 0.50 (no gain) passes | true 0.54 (real gain) passes | 3 refusals in a row at 0.54 |
+|---|---:|---:|---:|
+| 200 games, 0.55 — the first run | 7.9% | **38.9%** | **22.9%** |
+| 600 games, 0.55 | 0.7% | **31%** | 33% |
+| 600 games, 0.52 | 16% | **84%** | 0.4% |
+
+More games cannot make a generation pass a bar it is genuinely below — it makes a true-0.54
+candidate pass *less* often against a 0.55 threshold, because the estimate concentrates on
+0.54. **The threshold is the bug; the sample size is what makes a lower threshold safe.** And
+the two errors are wildly asymmetric: promoting a candidate that is really 0.50 costs
+approximately nothing (the new weights are as good as the old ones), while refusing a
+candidate that is really 0.54 three times in a row ends the run — which is exactly what
+happened. So: `gate.games = 600`, `gate.threshold = 0.52`, `max_consecutive_refusals = 5`.
+(The table reads `games` as `decisive games`, which is now the same thing: every generation of
+the third run drew 0% of its self-play, so the draw compression F3.4 worried about is gone.
+`min_decisive = 60` keeps the abstain rule at the same 10% of `games` it had at 200.)
+
+A refusal is also not a wasted generation — self-play continues from the incumbent, so the
+buffer grows and the next candidate is trained on more data. Stopping is only correct when
+learning has genuinely plateaued, which is a claim the *reference* column makes, not the
+mirror match.
+
+**[code, optional, ~15 lines]** Better still, make the bar a confidence statement instead of a
+magic number: promote when the decisive score's lower 80% bound clears 0.5, i.e.
+`threshold = 0.5 + 0.84 × 0.5/√decisive`. That is 0.517 at 600 decisive games and 0.529 at
+200, so it stays honest if someone changes `gate.games` later without redoing this table.
+
+**2. Replace the saturated reference panel — this is the most valuable single change.** By
+generation 19 the panel read `random=1.000 greedy=1.000` (see `runs/third.log`): it could
+detect a catastrophe and nothing else. **gen016 is now available as a fixed external
+opponent**, and a score against a frozen strong agent, tracked per generation, is precisely
+the instrument §4.8's tripwire 2 needs:
+
+```toml
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen016.d52nn@64"]
+reference_games = 300
+```
+
+Keep `random` and `greedy` — they are cheap and their saturation is itself information. The
+gen016 column is the run's headline chart: rising monotonically means the loop is working;
+flat-or-falling while the mirror gate keeps passing is the exploitability signature. When the
+new net saturates *that* too (score ≥ 0.95 for several generations), freeze the current best
+as a second reference and add it. Note the panel is a **veto, never a target**.
+
+**3. `selfplay.sims` 64 → 256.** The policy target *is* the visit distribution, so training at
+64 teaches the network to imitate a search ~370 Elo weaker than the same weights produce at
+4096 (F3.8). The teacher was capped. 256 is the pick rather than 1024 because the 64 → 256
+step is the cheapest large gain (+141 Elo) and the return per 4× halves above 1024. Cost is
+close to linear: 4× the sims is 4× the self-play time.
+
+**4. `net.blocks` 3 → 6, `net.width` unchanged at 128 — and depth is not free.** Only 10.5% of
+gen016's 949k parameters are in the residual trunk; 58% is the input projection and 30% the
+policy head, both pinned by `obs_dim` and `action_dim` (F3.8). Parameter accounting says
+depth is much the better buy than width, and it is — but F3.8 counted parameters, and the
+sparse-input trick means parameters are not what inference costs. Measured (F3.11, 128 games,
+64 sims, 8 threads, seed 1):
+
+| trunk | params | decisions/sec | self-play throughput |
+|---|---:|---:|---:|
+| 128 × 3 — gen016 | 949k | 1078 | 1.00× |
+| **128 × 6** | 1,049k | 721 | **0.67×** |
+| 128 × 10 | 1,182k | 471 | 0.44× |
+| 256 × 3 | 2,093k | 324 | 0.30× |
+
+So 3 → 10 blocks costs +25% parameters and **2.3× the wall clock of every self-play game**;
+128 → 256 wide costs 3.3×. Depth is still the better buy per unit of throughput, and the
+config comment recommending width first is still wrong, but "+25% parameters" reads as free
+and is not. **6 blocks at 32 cores, 10 blocks only at ≥96 cores** — the trade is against
+games, and more games is what a longer run is for. If §4.5 Stage 1 shows the box is bigger
+than expected, spend it on depth before width.
+
+**5. [code, ~20 lines] A learning-rate schedule.** `train.lr` is a constant 2e-3 through
+AdamW for the whole run, which is fine for 19 generations and not for 50. Add a piecewise
+decay keyed to **generation index**, not to an optimiser step counter — `--resume` rebuilds
+the `Trainer` from the checkpoint and the step count does not survive it:
+
+```
+generations 0–40%   lr × 1.00
+generations 40–75%  lr × 0.25
+generations 75%+    lr × 0.0625
+```
+
+**[code, minor]** While in `trainer.py`: `--resume` currently reloads weights only, so the
+AdamW first and second moments are lost on every restart. On a preemptible box that is a few
+hundred steps of re-warm per interruption. Persisting them next to `best.d52nn` is cheap.
+
+**6. Widen the replay window, and scale the fitting to the data.** §4.3 gives the arithmetic.
+`temperature_decisions` stays at **24** for the main run: this plan previously called 24 of
+~136 decisions "thin", and it is worth noting that AlphaZero samples ~19% of a game for the
+same reason (clean value targets), so 18% is not obviously wrong. If Stage 1 leaves spare
+compute, that is the cheapest ablation on the list — one short run at 40 against one at 24.
+
+⚠️ **This changes six things at once, which means a failure will not say which one caused
+it.** That is a deliberate trade — the run is a scale-up, not an ablation — and the mitigation
+is the per-generation gen016 column from change 2, which says *during* the run whether it is
+working. If it is not, §4.5 Stage 4 runs the grid.
+
+### 4.3 Sizing the run — the arithmetic `[ ]`
+
+From F3.4 and F3.11, one formula covers it:
+
+```
+self-play games/hour  ≈  28,000 × (cores / 8) × (64 / sims) × trunk_factor
+```
+
+with `trunk_factor` from §4.2's table (1.00 at 128×3, 0.67 at 128×6, 0.44 at 128×10). The
+28,000 is measured, and F3.7's actual run — 57,000 games in 1.94 h at 8 cores, 64 sims,
+128×3 — comes out at 29,400, so the formula is calibrated on a real run rather than on a
+micro-benchmark. Worked examples:
+
+| box | sims | trunk | games/hour | 24 h |
+|---|---:|---|---:|---:|
+| 8 cores (this Mac) | 64 | 128×3 | 28,000 | — |
+| 8 cores (this Mac) | 256 | 128×6 | 4,700 | 113k |
+| 16 cores | 256 | 128×6 | 9,400 | 225k |
+| 32 cores | 256 | 128×6 | 18,800 | 450k |
+| **64 cores** | **256** | **128×6** | **37,500** | **900k** |
+| 64 cores | 256 | 128×10 | 24,600 | 590k |
+
+A 24-hour run at 64 cores is **~720,000 self-play games after evaluation overhead** — 13× the
+first run's games, each with 4× the search per decision, so roughly **50× the teacher
+compute**. That is a real scale-up rather than a longer version of the same thing.
+
+**Generation size, and why it is not "as big as possible".** A generation is one step of
+policy improvement, and the run needs a lot of steps, not a few enormous ones. Target
+**40–50 generations** and divide:
+
+At 64 cores, 15,000 games per generation → 24 min of self-play, plus ~5 min of everything
+else = **~29 min a generation**, so 24 hours is ~48 generations. Per generation:
+
+- **Samples:** `games × 136 decisions ÷ sample_stride` = 15,000 × 136 ÷ 2 = **1.02M**
+- **RAM:** ~1.6 KB a sample, so `buffer_generations = 6` is 6.1M samples ≈ **10 GB**. Fits
+  in 64 GB with room; raise `sample_stride` to 3 if RAM is tight, it costs little signal.
+- **`buffer_samples`:** the cap must be raised from 700,000 or it silently truncates the
+  window to two-thirds of one generation. Set it to `buffer_generations × samples/gen`
+  = **6,500,000**.
+- **`steps_per_generation`:** keep the first run's ratio of sample-presentations to new
+  samples (1200 × 512 ÷ 220k ≈ 2.8), which at 1.02M new samples and `batch_size = 1024`
+  is **2,800 steps** — about a minute of CPU, extrapolating F3.11's per-step figures to the
+  doubled batch. Fitting stays under 3% of the loop, so err high rather than low and let the
+  gate catch overfitting.
+- **Disk:** ~270 MB of shard a generation, so ~13 GB for the run. Shards are regenerable in
+  principle but not cheaply; keep them until the findings are written.
+- **`run.seed`:** the loop advances the seed by `selfplay.games` each generation, so this run
+  spans `seed .. seed + 720,000`. Use **2,000,000** — the first run occupies 1,000,000–1,057,000
+  and a collision would silently re-deal games the net has already trained on.
+
+So `configs/train-big.toml`, for a 64-core box:
+
+```toml
+[game]     variant = "split", encoding_slots = 21, stalemate_value = 0.0
+[net]      width = 128, blocks = 6, value_hidden = 128
+[selfplay] games = 15000, sims = 256, temperature_decisions = 24   # rest unchanged
+[train]    batch_size = 1024, steps_per_generation = 2800, sample_stride = 2,
+           buffer_generations = 6, buffer_samples = 6500000, lr = 2.0e-3 + schedule
+[gate]     games = 600, threshold = 0.52, sims = 256, min_decisive = 60,
+           reference = ["random", "greedy", "netmcts:models/duel52-split-gen016.d52nn@64"],
+           reference_games = 300, reference_tolerance = 0.05, max_consecutive_refusals = 5
+[run]      generations = 60, hours = 24, seed = 2000000, threads = <measured>, engine = "..."
+```
+
+`generations = 60` is a backstop; `hours` is what binds, and the loop stops *before* a
+generation that would overrun. Note `gate.sims = 256` matches `selfplay.sims`: the gate should
+measure the weights at the budget they are being trained for, not at 64.
+
+For a smaller box, scale `games` by the formula and keep `generations` in the 40–50 band —
+fewer, larger generations is the wrong direction.
+
+### 4.4 Code tasks before renting `[ ]`
+
+Everything here is small, and all of it should be done and committed **on the Mac**, because
+debugging on a metered box is the expensive way to do it.
+
+- [ ] `configs/train-big.toml` per §4.3, with the reasoning in comments as `train-fast.toml`
+      does. `python -m duel52.train check --config configs/train-big.toml` must pass.
+- [ ] LR schedule in `py/duel52/train/trainer.py`, keyed to generation index (§4.2 change 5).
+- [ ] Persist AdamW moment state across `--resume` (§4.2 change 5, minor).
+- [ ] Add the gate's decisive count and its 95% interval to the per-generation readout and to
+      `log.jsonl`, so "did the gate have power" is answerable from the log without recomputing
+      it. This is the single thing that would have made F3.7 obvious while the run was live.
+- [ ] Confirm a `netmcts:<path>@<sims>` string works as a `gate.reference` entry end-to-end
+      (one generation of a 100-game local run is enough).
+- [ ] **Optional, only if there is more than one machine:** let a generation consume several
+      shards, so `duel52 selfplay` can run on N boxes with disjoint seed ranges and the
+      trainer concatenate them. This is the natural way to use a second box and is a
+      genuinely small change to `loop.py` — the shard reader already validates layout hashes.
+
+### 4.5 The staged plan `[ ]`
+
+**Stage 0 — rehearse locally, 30–40 minutes, free.** On the Mac, run `train-big.toml` with
+`games = 200`, `generations = 2`, `hours = 0.5` into `runs/rehearsal`. What this proves is not
+strength; it is that the config parses, the LR schedule fires, the gen016 reference opponent
+loads, the buffer sizes do not blow up RAM, and `--resume` works after a deliberate Ctrl-C.
+Every one of those failing on a paid box costs money.
+
+**Stage 1 — one paid hour, measuring, before committing to 24.** In order:
+
+```bash
+# 1. Toolchain + build. The README has the rustup line.
+cargo build --release && cargo test          # 301 tests. This is the handoff proof:
+                                             # the box computes the same game or it does not.
+python3 -m venv .venv && .venv/bin/pip install -q maturin pytest torch numpy
+.venv/bin/maturin develop --release
+.venv/bin/python -m pytest py/tests -q       # includes test_parity.py: this box's PyTorch
+                                             # and this box's Rust agree on the forward pass
+
+# 2. Determinism against the Mac. Same seed, same config, same numbers — the engine is
+#    integer-only, so any difference is a real bug and not floating point.
+./target/release/duel52 stats --games 20000 --seed 1 --markdown
+
+# 3. How many cores does this box REALLY have? Run each and read games/sec.
+for t in 1 8 16 32 64; do
+  ./target/release/duel52 selfplay --checkpoint models/duel52-split-gen016.d52nn \
+      --out /tmp/t$t.d52sp --games $((t*8)) --sims 64 --encoding-slots 21 \
+      --threads $t --stalemate-value 0.0 --quiet
+done
+```
+
+Throughput should climb roughly linearly and then flatten; **the flattening point is the real
+core count**, and it is what `run.threads` should be set to. This measures gen016's 128×3
+trunk, which is deliberate — it is the same shape F3.11 and F3.4 measured, so the number is
+directly comparable and `trunk_factor` converts it to whatever trunk the run uses. Put the
+whole curve in `FINDINGS.md`; it is what makes §4.3's formula portable to the next box. Then
+re-derive `selfplay.games` from the measured number, and only then start the long run.
+
+**Stage 2 — the run.** In `tmux` (§4.6), 24 hours, checking the gen016 reference column once
+or twice rather than watching it.
+
+**Stage 3 — measure, on the box, while it is still rented.** All of §4.7. These are CPU jobs
+and the rented cores make them minutes instead of hours; a ladder at 400 games is ~26 min on
+8 cores.
+
+**Stage 4 — only if Stage 2 disappointed.** A grid instead of a run: four 6-hour runs at
+`blocks` 6 vs 10 × `sims` 128 vs 256, each pinned to a quarter of the cores with
+`run.threads` and `taskset`. Four data points beat one when the single point is confusing.
+
+**Then destroy the instance.** `rsync` first (§4.6).
+
+### 4.6 Operating a rented box `[ ]`
+
+- **`tmux` or the run dies with your SSH connection.** `tmux new -s duel52`, start the run,
+  `Ctrl-b d` to detach, `tmux attach -t duel52` to come back. This is the mistake everyone
+  makes once.
+- **Everything the run needs to survive is `--run-dir`.** After any interruption:
+  `python -m duel52.train run --config configs/train-big.toml --run-dir runs/big --resume`.
+  It refills the replay window from the shards on disk and does not re-promote from scratch.
+- **Sync the small things off the box every few hours**, because a spot instance can vanish:
+  `rsync -avz box:duel52/runs/big/checkpoints/ runs/big/checkpoints/` plus `log.jsonl`. The
+  checkpoints are 4.7 MB each and the log is kilobytes; the shards are 13 GB and can stay.
+- **Watch three numbers only:** the gen016 reference score (must rise), the self-play draw
+  rate (must stay ~0%; anything else means an equilibrium is forming — F3.6), and the gate's
+  decisive score with its interval.
+- **`nohup` is not a substitute for `tmux`** if you want to read the progress output.
+- **Destroy the instance when the run is done**, and check the provider's dashboard rather
+  than trusting that stopping the container stopped the billing. Persistent volumes usually
+  bill separately from compute.
+
+### 4.7 What Phase 4 must measure `[ ]`
+
+- [ ] **The frozen ladder**, with gen016 as a sixth rung so the two trained nets are on one
+      scale. 400 games, `--markdown`, straight into `FINDINGS.md`.
+- [ ] **Head-to-head vs gen016** at equal sims, 400 games — exit criterion 1.
+- [ ] **The search-scaling sweep repeated** (F3.8's shape: `netpolicy` → @64 → @256 → @1024 →
+      @4096, ≥300 games a step). Whether the new net absorbs *more* search than gen016 did is
+      the single most informative number the run produces, and it feeds §4.8 directly.
+- [ ] **`probe` against the same roster** as `FINDINGS.md`'s strong-play table, so hand@unlock,
+      lane concentration and the flip-timing curve can be compared generation to generation.
+      If the behavioural statistics moved, the strategy moved, and Phase 5's findings need
+      re-checking against the new net.
+- [ ] **The owner's 20-game rematch on the same 20 seeds** as §4.0 — exit criterion 2.
+- [ ] **Cost and wall clock**, recorded with the config. Someone repeating this needs to know
+      what an hour of what hardware bought.
+
+### 4.8 The tripwire — when to stop scaling and change method
+
+A Phase 4 judgement, not a training one, and the answer today is *not yet*. AZ over
+determinized ISMCTS has a real ceiling in an imperfect-information game: no equilibrium
+guarantee, and no way to learn to conceal or signal deliberately. The project already knows
+fusion is punishing — F2.2 is PIMC collapsing under exactly that.
+
+But `netmcts` shows **no fusion signature**. The same test that exposed PIMC — more sampling,
+does it buy anything — gives PIMC nothing at 8× worlds and gives `netmcts` +141, +156 and +69
+Elo across three successive 4× steps (F3.8). Per-simulation determinization is doing its job.
+
+Switch to R-NaD (Phase 7) when **either** of these appears, and not before:
+
+1. **Search still scales but the network stops absorbing it**, across a run whose gate
+   actually has power. That is a representation limit, not a compute one. §4.7's repeated
+   sweep is the measurement.
+2. **Self-play looks healthy while the score against a fixed external opponent flattens or
+   falls.** That is the exploitability signature, and no amount of compute fixes it. §4.2's
+   change 2 builds this detector into the loop, per generation, which the first run did not
+   have — its external opponents were saturated by generation 7.
+
+Neither is present as of gen016. The P0 self-play drift (51.4% → 56.7% over the first run)
+looked like signature 2 and turned out not to be: it does not survive without exploration
+noise, and `greedy` shows the same tilt (F3.9).
+
+A third condition, weaker and more likely: **the run succeeds and the owner still wins.** That
+is not a reason to change learner — it is a reason to look hard at what the human does that
+the agent does not, which is Phase 5's job and the most interesting outcome on this page.
+
+---
+
+## Phase 5 — Extract the insight `[~]`
 
 **This is the actual point of the project.** It is a separate job from training and should
 not be treated as a victory lap.
 
-Phase 4 started earlier than planned, and by accident. Running `probe` against gen016 to
+It started earlier than planned, and by accident. Running `probe` against gen016 to
 characterise it produced three of the results on the original list, because **the trained
 agent is the first player in this project capable of the behaviour the hypotheses are about.**
 Every Phase 2 rung was measured and found flat on H2 and H3; that was never evidence about the
 game, it was evidence about the agents. The lesson generalises to everything below: a null
 from an agent that *cannot do the thing* is not a null.
+
+⚠️ **Everything banked here is measured on gen016 and inherits it.** If Phase 4's net moves
+the behavioural statistics in `probe` (§4.7), each of these needs re-checking on the new net
+before it is written up as a claim about *the game* rather than about one agent.
 
 ### Banked
 
@@ -360,33 +763,37 @@ Until one of these lands, H2's status in `FINDINGS.md` is **supported, not confi
 - [ ] **Re-run every Phase 2 hypothesis against the trained agent, not just H2 and H3.** The
       whole F2 hypothesis table was scored by agents that could not deliberately do most of
       the things being hypothesised about.
+- [ ] **Where does the human beat the agent?** New, and it is the best question on this list
+      as long as §4.0's answer is "the human wins". The owner's twenty logged games are
+      twenty games in which a +1476-Elo agent lost to a human, which is a far richer signal
+      than another self-play table. Replay them, find the plies where the value
+      head was confident and wrong, and characterise them.
 - [ ] **Deliverable:** written findings + an interactive page
-
-### The tripwire — when to stop scaling and change method
-
-Recorded here because it is a Phase 4 judgement, not a training one, and because the answer
-today is *not yet*. AZ over determinized ISMCTS has a real ceiling in an imperfect-information
-game: no equilibrium guarantee, and no way to learn to conceal or signal deliberately. The
-project already knows fusion is punishing — F2.2 is PIMC collapsing under exactly that.
-
-But `netmcts` shows **no fusion signature**. The same test that exposed PIMC — more sampling,
-does it buy anything — gives PIMC nothing at 8× worlds and gives `netmcts` +145 Elo per 4×,
-twice over (F3.8). Per-simulation determinization is doing its job.
-
-Switch to R-NaD (see Stretch) when **either** of these appears, and not before:
-
-1. Search still scales but the network stops absorbing it across a run whose gate actually has
-   power — that is a representation limit, not a compute one.
-2. Self-play looks healthy while scores against a *fixed external* opponent flatten or fall.
-   That is the exploitability signature, and it is the one no amount of compute fixes.
-
-Neither is present as of gen016. The P0 self-play drift (51.4% → 56.7% over the run) looked
-like signature 2 and turned out not to be: it does not survive without exploration noise, and
-`greedy` shows the same tilt (F3.9).
 
 ---
 
-## Stretch — R-NaD on real compute `[ ]`
+## Phase 6 — Verification `[ ]`
+
+Moved out of Phase 3, where these were filed as training tasks. They are not: they are how the
+project finds out whether the trained policy is *good* rather than merely *better than the
+things it was trained against*. Phase 4's tripwire needs at least the second of them.
+
+- [ ] **Duel52-mini** — a scaled-down variant, in OpenSpiel, small enough for exact CFR.
+      Validate the loop against the exact equilibrium before trusting any claim that the full
+      game's policy is near-optimal.
+- [ ] **Local best-response** as the exploitability proxy on the full game. This is the
+      instrument for tripwire 2, and the honest version of "how strong is it, really".
+- [ ] **GPU inference behind the batch-shaped `Evaluator`** (§4.1). Only worth building once
+      the trunk is large enough that a CPU forward pass dominates a determinization — F3.11
+      is the measurement that decides it. Needs `candle` or `tch`, cross-game batching in
+      `selfplay.rs`, and its own parity test against `engine/src/nn/mlp.rs`.
+- [ ] **Multi-machine self-play** (§4.4, optional) if more than one box is ever available.
+
+---
+
+## Phase 7 — R-NaD on real compute `[ ]`
+
+Only on a tripwire, per §4.8.
 
 - [ ] Swap the learner; engine and encoders unchanged
 - [ ] Validate on Duel52-mini against exact equilibrium first
@@ -394,8 +801,8 @@ like signature 2 and turned out not to be: it does not survive without explorati
 - [ ] Compare the approximate-Nash policy against the AZ policy — where do they disagree,
       and is AZ exploitable in those spots?
 
-Estimate: a game this size should not need a cluster. One strong GPU, or a single
-multi-GPU day, is likely sufficient.
+Estimate: a game this size should not need a cluster. One strong many-core box, or a single
+multi-GPU day once inference is batched, is likely sufficient.
 
 ---
 
@@ -403,6 +810,10 @@ multi-GPU day, is likely sufficient.
 
 - Owner has limited time and is delegating implementation. Default to making a defensible
   call, marking it `[ASSUMED]`, and flagging it — rather than blocking.
-- Everything must run locally on an M-series Mac and scale to rented CUDA via config alone.
+- Everything must run locally on an M-series Mac and scale to rented hardware via config
+  alone. `train.device = "auto"` and `run.threads` are the whole handoff.
+- **Elo on this project's ladder is an internal coordinate.** The anchor is `random` and every
+  rung was written here. A number from it is a distance, not an absolute; the human series
+  (§4.0) is the only external measurement, and it should stay in every strength claim.
 - Insight beats strength. A slightly weaker agent whose play we can *explain* is worth more
   here than a stronger one we cannot.

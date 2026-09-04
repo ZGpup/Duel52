@@ -121,19 +121,30 @@ self-play for the first strategic measurements.
 
 **Phase 3: Neural self-play.** ✅ AlphaZero style loop using information set MCTS: encoders,
 network and inference path, then net-guided search, then self-play, replay, fitting and a
-promotion gate around them. The first trained checkpoint is in [models/](models/). One item
-from the original plan is still outstanding — the cross-check against exact CFR on a scaled
-down variant, which would say how far from equilibrium a merely strong agent is.
+promotion gate around them. The first trained checkpoint is in [models/](models/) — two hours
+on a laptop, and +495 Elo clear of the hand-written ladder.
 
-**Phase 4: Extract the insight.** 🚧 Learned card values, opening frequencies, flip timing,
+**Phase 4: Scale up.** 🚧 One long run on rented hardware, with the three things that actually
+capped the first run fixed first: a promotion gate with no statistical power, a teacher capped
+at 64 simulations, and a residual trunk holding 10.5% of the network's parameters. The exit
+criterion is not an Elo number — the ladder is anchored at `random` and every rung was written
+here. It is that the agent beats the project owner, who currently beats it.
+
+**Phase 5: Extract the insight.** Learned card values, opening frequencies, flip timing,
 lane commitment, and first player advantage with error bars. Hand size and flip timing are
 already in — instrumenting the trained agent answered them early, because it is the first
 player here *capable* of the behaviour the hypotheses are about.
 
-**Stretch:** R-NaD on real compute for an approximate Nash policy rather than a merely
-strong one.
+**Phase 6: Verification.** How strong is it *really* — local best-response as an
+exploitability proxy, and a cross-check against exact CFR on a scaled down variant small
+enough to solve.
 
-Everything runs locally on an M series Mac and scales to rented CUDA through config alone.
+**Phase 7:** R-NaD for an approximate Nash policy rather than a merely strong one, if and only
+if Phase 4 trips one of the two tripwires in [PLAN.md](PLAN.md) §4.8.
+
+Everything runs locally on an M series Mac and scales to rented hardware through config alone.
+Note which hardware: 87% of the training loop is Rust self-play on CPU cores and 4% is
+gradient work, so the thing to rent is cores. A GPU changes about 1.5% of it.
 
 ## Docs
 

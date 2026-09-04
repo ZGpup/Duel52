@@ -15,7 +15,7 @@
 //!   encoding bound. Phase 1 can replace the guess with a measurement.
 //! - **Hand size when the last pile empties.** `FINDINGS.md` hypothesises that hand size at
 //!   pile-empty is a defensive resource — "every card in hand is a turn the opponent cannot
-//!   close a lane". This records the raw quantity now so Phase 4 has a random-play baseline
+//!   close a lane". This records the raw quantity now so Phase 5 has a random-play baseline
 //!   to compare learned play against.
 
 use std::time::Instant;

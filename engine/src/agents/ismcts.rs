@@ -119,7 +119,7 @@ impl IsmctsAgent {
     /// Run the search and return the root's visit counts, aligned with `legal`.
     ///
     /// Exposed because visit counts *are* the policy: Phase 3 trains on them
-    /// (`DESIGN.md` §6), and Phase 4's policy characterisation reads them directly. `choose`
+    /// (`DESIGN.md` §6), and Phase 5's policy characterisation reads them directly. `choose`
     /// is a thin argmax over this.
     pub fn root_visits(&mut self, state: &GameState, legal: &[Action]) -> Vec<u32> {
         let me = state.acting_player();

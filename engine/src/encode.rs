@@ -41,7 +41,7 @@
 //! *which two* you pair changes the pair's damage and attack budget. In an AlphaZero loop
 //! the policy target is a visit distribution over engine actions, so two engine actions
 //! sharing a logit would force an invented rule for folding their visits and another for
-//! which one to play — both arbitrary, both distorting the policy Phase 4 reads. This
+//! which one to play — both arbitrary, both distorting the policy the insight phase reads. This
 //! encoding is exact and slot-keyed instead. See [`action_blocks`] for the table.
 
 use crate::action::{Action, Phase, Side};

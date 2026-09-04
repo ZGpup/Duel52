@@ -48,7 +48,7 @@
 //! | [`probe`] | Strategic measurement — the Phase 2 deliverable |
 //! | [`selfplay`] | Self-play generation, and the `.d52sp` trajectory shard |
 //! | [`stats`] | Random-vs-random measurement — the Phase 1 deliverable |
-//! | [`testkit`] | Building positions by hand, for the rules tests and Phase 4 probes |
+//! | [`testkit`] | Building positions by hand, for the rules tests and Phase 5 probes |
 //!
 //! ## Playing a game
 //!

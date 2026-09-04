@@ -4,7 +4,7 @@
 //!
 //! Every constant below was written by reading `game_rules.md`, not measured. They exist so
 //! `PLAN.md` Phase 2 has a "greedy heuristic agent (hand-written evaluation)" and a leaf
-//! evaluator for PIMC — nothing here is a claim about the game. **Phase 4's whole job is to
+//! evaluator for PIMC — nothing here is a claim about the game. **Phase 5's whole job is to
 //! replace this table with learned values**, and the interesting result will be wherever the
 //! two disagree. Do not quote a weight from this file in `FINDINGS.md`.
 //!
