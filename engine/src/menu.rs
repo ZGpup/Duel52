@@ -49,10 +49,20 @@
 //! checked against the board *before* Enter, rather than regretted after it.
 //!
 //! The focus is derived from the actions under a row rather than stored beside it, so a menu
-//! cannot point at a card it does not offer, and a row that leads to another question stands
-//! for the union of everything beneath it — walking down the tree only ever narrows what is
-//! lit. It leaks nothing: it names cards by [`CardId`](crate::card::CardId) and the renderer
-//! can only colour tokens it was already drawing.
+//! cannot point at a card it does not offer. A row lights only the part of the move it
+//! actually settles ([`Reach`]): the card you would act **with**, never the list of things
+//! you might aim it **at**, because that list is the next question and reddening all of it
+//! says nothing about the choice in front of you. So `ATTACK` lights your attackers,
+//! choosing one keeps just that one lit, and the enemy card reddens on the page that asks
+//! which enemy card — walking down the tree only ever narrows what is lit.
+//!
+//! Lanes are not lit alongside cards. A `PLAY` lights the lane it would go into, because
+//! there the lane *is* the move and no card is on the board yet; everywhere else the card is
+//! the answer, and reddening its column heading as well only widens what the eye has to
+//! check.
+//!
+//! It leaks nothing: it names cards by [`CardId`](crate::card::CardId) and the renderer can
+//! only colour tokens it was already drawing.
 //!
 //! Nothing here decides legality. Every leaf of the tree is an [`Action`] taken verbatim from
 //! the list the engine handed over, and every action in that list appears at exactly one
@@ -130,18 +140,20 @@ impl Menu {
         }
     }
 
-    /// Everything on the board that typing `number` would act on or with.
+    /// Everything on the board that typing `number` settles.
     ///
     /// `number` is what the player types, so `0` is `BACK` and names nothing. A row that
-    /// leads to another question contributes the union of everything under it: hovering
-    /// `FLIP` lights up every card you could flip, and choosing one narrows it down.
+    /// leads to another question lights only the part it decides — the cards you could act
+    /// *with*, never the list of things you might aim at, which is the next question's job
+    /// (see [`Reach`]). So `ATTACK` lights your attackers, choosing one keeps just that one
+    /// lit, and the enemy card reddens on the page that asks which enemy card.
     ///
     /// Derived from the actions themselves rather than stored alongside the rows, so a menu
     /// cannot point at a card it does not actually offer.
     pub fn focus(&self, state: &GameState, number: usize) -> Focus {
         let mut focus = Focus::none();
         if let Some(pick) = number.checked_sub(1).and_then(|i| self.picks.get(i)) {
-            collect_focus(state, pick, &mut focus);
+            collect_focus(state, pick, Reach::Whole, &mut focus);
         }
         focus
     }
@@ -289,30 +301,53 @@ pub fn build(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
 
 // =========================================================================== focus ==
 
-/// Every card named anywhere under one pick.
-fn collect_focus(state: &GameState, pick: &Pick, focus: &mut Focus) {
+/// How much of an action a row has actually settled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Picking this row *is* the move. Everything it names is decided, so everything it
+    /// names lights up.
+    Whole,
+    /// This row is one question of several, and the rest of the move is still open. Only
+    /// the card being acted **with** lights up; what it might be aimed at is a list the
+    /// player has not been shown yet, and reddening all of it says nothing about the choice
+    /// in front of them.
+    Actor,
+}
+
+/// Every card named under one pick, at the reach that pick has settled.
+///
+/// A row that opens another question drops to [`Reach::Actor`] and stays there however deep
+/// the recursion goes, so `ATTACK` lights up the cards that could attack, choosing one keeps
+/// only that one lit, and the enemy card lights up on the page that asks for it.
+fn collect_focus(state: &GameState, pick: &Pick, reach: Reach, focus: &mut Focus) {
     match pick {
-        Pick::Take(action) => focus_action(state, *action, focus),
+        Pick::Take(action) => focus_action(state, *action, reach, focus),
         Pick::Open(sub) => {
             for pick in &sub.picks {
-                collect_focus(state, pick, focus);
+                collect_focus(state, pick, Reach::Actor, focus);
             }
         }
         Pick::Unavailable => {}
     }
 }
 
-/// The cards one action puts its hands on: the actor's card, and whatever it is aimed at.
+/// The cards one action puts its hands on, filtered by what `reach` has settled.
 ///
-/// Both go in, undifferentiated, because both are what the player is checking before they
-/// commit — an attack is a matchup, and lighting up only one half of it answers half the
-/// question. [`Action::Play`] names no card on the board yet, so it contributes its lane,
-/// which is the whole of what the move decides.
-fn focus_action(state: &GameState, action: Action, focus: &mut Focus) {
+/// The split is between the card a move is made **with** and the card it is aimed **at**.
+/// The first is settled the moment its row is picked; the second is a question of its own,
+/// and is lit only on the page that asks it. [`Action::Play`] is neither — it names no card
+/// on the board yet, so it contributes the lane it would go into, which is the whole of
+/// what the move decides and is decided only at the step that asks for it.
+fn focus_action(state: &GameState, action: Action, reach: Reach, focus: &mut Focus) {
     let me = state.acting_player();
     let them = me.other();
+    let settled = reach == Reach::Whole;
     match action {
-        Action::Play { lane, .. } => focus.lane(lane as usize),
+        Action::Play { lane, .. } => {
+            if settled {
+                focus.lane(lane as usize)
+            }
+        }
         Action::Flip { lane, slot }
         | Action::ResolveNext { lane, slot }
         | Action::MoveHere { lane, slot } => focus.at(state, lane as usize, me, slot as usize),
@@ -322,8 +357,12 @@ fn focus_action(state: &GameState, action: Action, focus: &mut Focus) {
             target,
         } => {
             focus.at(state, lane as usize, me, attacker as usize);
-            focus.at(state, lane as usize, them, target as usize);
+            if settled {
+                focus.at(state, lane as usize, them, target as usize);
+            }
         }
+        // Both halves of a pair are the actor's own, and a pair is symmetric — there is no
+        // "aimed at" to hold back, so choosing one card lights the partners it could take.
         Action::DeclarePair {
             lane,
             slot_a,
@@ -332,21 +371,26 @@ fn focus_action(state: &GameState, action: Action, focus: &mut Focus) {
             focus.at(state, lane as usize, me, slot_a as usize);
             focus.at(state, lane as usize, me, slot_b as usize);
         }
-        // A peek reaches either side of the board, and the side is in the action.
+        // A peek is all target and no actor: the 4 is already spent, and the card being
+        // looked at is what the row picks. The side is in the action.
         Action::Peek { side, lane, slot } => {
-            let owner = match side {
-                Side::Mine => me,
-                Side::Theirs => them,
-            };
-            focus.at(state, lane as usize, owner, slot as usize);
+            if settled {
+                let owner = match side {
+                    Side::Mine => me,
+                    Side::Theirs => them,
+                };
+                focus.at(state, lane as usize, owner, slot as usize);
+            }
         }
         // The lane is not in the action — the second half of a twinstrike happens wherever
         // the first half did, which only the pending decision knows.
         Action::SplitTarget { slot } => {
             if let Some(Pending::SplitTarget { lane, attackers, .. }) = state.pending.last() {
-                focus.at(state, *lane as usize, them, slot as usize);
                 for &id in attackers {
                     focus.card(id);
+                }
+                if settled {
+                    focus.at(state, *lane as usize, them, slot as usize);
                 }
             }
         }
@@ -1228,6 +1272,65 @@ mod tests {
         // these" rather than pointing at something arbitrary.
         assert_eq!(targets.focus(&state, 0), Focus::none(), "0 is BACK");
         assert_eq!(targets.focus(&state, 9), Focus::none(), "out of range");
+
+        // Choosing what to attack *with* is a different question from choosing what to
+        // attack. Reddening every enemy card the 10 could reach, while the player is still
+        // being asked which of their own cards to use, says nothing about that choice and
+        // costs the target highlight the thing that makes it worth having: being one card.
+        let picking_the_attacker = attack.focus(&state, 1);
+        assert_eq!(
+            picking_the_attacker.cards(),
+            &[crate::testkit::card_at(&state, 0, Player::P0, attacker).id],
+            "the attacker alone, no targets yet"
+        );
+        // And the same one card again from the top, where the verb is all that is settled.
+        assert_eq!(menu.focus(&state, 3), picking_the_attacker);
+    }
+
+    /// A lane goes red only where the lane *is* the move: a `PLAY` has no card on the board
+    /// to point at, so the lane it would go into is the whole of what the step decides.
+    ///
+    /// Everywhere else the card is the answer. Reddening its column heading too would widen
+    /// what the eye has to check, in the one situation — several identical face-down cards
+    /// in one column — where narrowing it is the entire point.
+    #[test]
+    fn only_a_play_lights_a_lane() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.hand(Player::P0, &[Rank::NINE]);
+        p.face_up(0, Player::P0, Rank::TEN);
+        p.face_down(1, Player::P0, Rank::SIX);
+        p.face_down(0, Player::P1, Rank::SEVEN);
+        let state = p.build();
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        // PLAY: no lane until the step that asks for one, and then exactly that lane.
+        let Pick::Open(play) = &menu.picks[0] else {
+            panic!("playing must be on\n{}", menu.render(false));
+        };
+        assert!(menu.focus(&state, 1).is_empty(), "the verb decides no lane");
+        let Pick::Open(play_lanes) = &play.picks[0] else {
+            panic!("the 9 must ask which lane\n{}", play.render(false));
+        };
+        for lane in 0..state.lane_count() {
+            let focus = play_lanes.focus(&state, lane + 1);
+            assert_eq!(focus.lanes(), &[lane], "LANE {} lights lane {lane}", lane + 1);
+            assert!(focus.cards().is_empty(), "a card in hand is not on the board");
+        }
+
+        // Every other verb points at cards and never at a lane, however deep it is walked.
+        for number in [2, 3] {
+            let mut seen = vec![menu.focus(&state, number)];
+            if let Pick::Open(sub) = &menu.picks[number - 1] {
+                seen.extend((1..=sub.len()).map(|n| sub.focus(&state, n)));
+            }
+            for focus in seen {
+                assert!(
+                    focus.lanes().is_empty(),
+                    "#{number} lit lane(s) {:?}",
+                    focus.lanes()
+                );
+            }
+        }
     }
 
     /// A row that leads to another question stands for everything under it, so `ATTACK`

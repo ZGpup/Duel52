@@ -1281,14 +1281,18 @@ Choosing a move — one question at a time:
   directly below the board it applies to, with the last few moves above it. Run with
   --no-clear to keep every prompt in the scrollback instead.
 
-  TYPE A NUMBER AND LOOK UP. Before you press Enter, that line and the cards it names turn
-  red on the board — the lane heading, your card, and what it is aimed at. This is how you
-  tell three identical `(? ²♥)` in an enemy lane apart: type 1, 2, 3 and watch which one
-  lights up. Backspace or Ctrl-U takes it back; nothing is committed until Enter. A number
-  no line has lights nothing up, so you know it is not one of the choices before you commit.
+  TYPE A NUMBER AND LOOK UP. Before you press Enter, that line and the card it names turn
+  red on the board. This is how you tell three identical `(? ²♥)` in an enemy lane apart:
+  type 1, 2, 3 and watch which one lights up. Backspace or Ctrl-U takes it back; nothing is
+  committed until Enter. A number no line has lights nothing up, so you know it is not one
+  of the choices before you commit.
 
-  A row that leads to another question lights up everything under it, so `2` at the top
-  menu shows every card you could flip at once, and picking one narrows it to that card.
+  A line lights only what it settles. `3` at the top reddens the cards that could attack;
+  choosing one leaves just that card lit, and the enemy card reddens on the page that asks
+  which enemy card — not before, or the list you are picking from would be red already.
+
+  PLAY is the one step that reddens a lane heading rather than a card, because until the
+  card is on the table the lane is the whole of the move.
 
   (Needs a colour terminal. Under --no-clear, or piped to a file, or with NO_COLOR set,
   the prompt goes back to plain lines with no preview.)

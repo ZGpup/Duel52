@@ -94,24 +94,23 @@ impl Focus {
         &self.cards
     }
 
-    /// The lanes being pointed at — the lane of every focused card, plus the lane a `PLAY`
-    /// would put a card into, which names no card yet.
+    /// The lanes being pointed at.
+    ///
+    /// Only a move whose *whole* subject is a lane puts one here — a `PLAY`, which names no
+    /// card on the board yet. A card's own lane deliberately does not come along with it:
+    /// the card is the answer, and reddening its column heading as well only widens the
+    /// thing the eye has to check.
     pub fn lanes(&self) -> &[usize] {
         &self.lanes
     }
 
-    /// Highlight one card on the board, and the lane it sits in.
-    ///
-    /// The lane comes along because it is what turns "one of these tokens is red" into
-    /// "*that* one is": the lane heading is the only fixed landmark on the board, and a
-    /// column is much easier to find than a cell.
+    /// Highlight one card on the board.
     ///
     /// An out-of-range slot is ignored rather than panicking — a menu built against a
     /// state cannot name one, but this is decoration and is not worth a crash.
     pub fn at(&mut self, state: &GameState, lane: usize, owner: Player, slot: usize) {
         if let Some(card) = state.at(lane, owner, slot) {
             self.card(card.id);
-            self.lane(lane);
         }
     }
 
