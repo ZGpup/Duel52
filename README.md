@@ -121,9 +121,11 @@ Now with agents that actually try. Full provenance in [FINDINGS.md](FINDINGS.md)
   scores 0.689 against a compute-matched PIMC. And for PIMC, eight-fold more sampled worlds
   buys nothing measurable while one extra ply of search is worth +0.28 — the signature of
   strategy fusion, which is bias rather than variance. This is the phase's main result, and
-  it said belief modelling in Phase 3 would buy something real. It did. The ladder above puts
-  PIMC last of the five, now level with `greedy` — re-measured post-ruling at 0.505 ± 0.049
-  over 400 games, where `FINDINGS.md` F2.3 had it at 0.638 ± 0.066.
+  it said belief modelling in Phase 3 would buy something real. It did. This is also the one
+  Phase 2 result that has been re-measured since the §4 ruling and come back *stronger*: flat
+  Monte Carlo now beats `pimc:8x1` **0.835 ± 0.036** over 400 games, against F2's 0.689. PIMC
+  has dropped to last of the five, level with `greedy` — 0.505 ± 0.049, where `FINDINGS.md`
+  F2.3 has 0.638 ± 0.066 and the intervals do not overlap.
 - **The stalemate rule fired, and then stopped existing.** Greedy — the only rung that
   prices material, so the only one that can decline a trade — stalled in 0.7–1.7% of its
   self-play games, most often in the mirrored variant where symmetric decks make neither
