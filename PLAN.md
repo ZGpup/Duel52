@@ -2,24 +2,46 @@
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Current phase: 3, steps 1–3 built; the first training run has not been done yet.** Phase 2
-delivered five agents, determinization, a frozen Elo ladder and the first strategic
-measurements (`FINDINGS.md` F2). Phase 3 step 1 delivered the encoders, the network and the
-inference path, with a test proving the Rust and PyTorch forward passes compute the same
-function. Step 2 added `netmcts` — PUCT over the policy prior with the value head in place of
-rollouts — and step 3 added the loop around it: `duel52 selfplay` writes trajectory shards,
-`python -m duel52.train` replays, fits, gates and promotes.
+**Current phase: 3 done and shipped; Phase 4 has started by accident.** Phase 2 delivered five
+agents, determinization, a frozen Elo ladder and the first strategic measurements
+(`FINDINGS.md` F2). Phase 3 delivered the encoders, the network, the inference path,
+`netmcts`, and the AlphaZero loop around them. `configs/train-fast.toml` has now been run:
+57,000 self-play games, 19 generations, 1.94 hours. The result is
+`models/duel52-split-gen016.d52nn`, tracked in git, **+495 Elo clear of `ismcts:800`** on the
+first ladder fitted since the §4 ruling (F3.7).
 
-**The next thing to do is run it.** The loop has been exercised for one generation only, to
-size it and prove it is connected — `FINDINGS.md` F3.5: from a random initialisation, one
-generation of 3000 self-play games takes 8m01s and lands at 0.93 against `random` and 0.56
-against `greedy`. No network has been trained past that. The first real pass is
-`configs/train-fast.toml`: ~18 generations in 2.5 hours on 8 cores.
+**The next thing to do is run it again, bigger — with three things changed first.** F3.8
+measured where the first run's ceiling actually was, and it was not compute:
 
-**Still open from Phase 1, and it is the owner's:** the exit criterion. Nobody has played
-the engine yet and confirmed the rules by hand. That is now a better-value hour than it was
-— `duel52 play --opponent ismcts:2000` gives an opponent that actually resists, so a rules
-error is likelier to show up as something that looks *wrong* rather than as noise.
+1. **The gate, first, because it is free.** 200 games at a 0.55 threshold gives the promotion
+   test a standard error of 0.035. A generation genuinely improving at a true 0.54 passes only
+   **39%** of the time, and there is a **23%** chance of three consecutive refusals — the stop
+   condition — while genuinely improving throughout. The run was ended by a measurement with
+   no power to make the call, not by a learner that had stopped learning. Raise `gate.games`
+   to ~600, or drop `gate.threshold` to 0.52.
+2. **`selfplay.sims` 64 → 256.** Search returns are *constant* at ~+145 Elo per 4× out to 1024
+   simulations, with no knee anywhere in the measured range (F3.8). The policy target **is**
+   the visit distribution, so training at 64 caps the teacher roughly 300 Elo below what the
+   same weights produce given more thinking time. Trade `selfplay.games` down to ~1500 to pay
+   for it; better targets beat more of the same targets now that the policy is decent.
+3. **`net.blocks` 3 → 10 — not `net.width`.** Only **10.5%** of the 949k parameters are in the
+   residual trunk. 58% is the input projection and 30% the policy head, both pinned by
+   `obs_dim = 4290` and `action_dim = 2194`. Going 3→10 blocks costs +25% parameters and
+   triples the reasoning depth; going 128→256 wide costs +120% for less of it. The comment in
+   `train-fast.toml` says to raise width first, and the parameter accounting says otherwise.
+
+Minor, same run: there is no LR schedule — `train.lr` is a constant 2e-3 through AdamW for the
+whole run — and `temperature_decisions = 24` samples only the first 18% of a ~130-decision
+game, which is thin exploration for a long game.
+
+**Then, and only then, rent the GPU.** Nothing measured so far argues for changing the
+*method*; see Phase 4's tripwire for what would.
+
+**Still open from Phase 1, and it is the owner's:** the exit criterion. Nobody has played the
+engine and confirmed the rules by hand. That hour is worth more than it was —
+`duel52 play --encoding-slots 21 --opponent netmcts:models/duel52-split-gen016.d52nn@2048`
+is an opponent that genuinely resists at ~137 ms a move, so a rules error is likelier to
+surface as something that looks *wrong* rather than as noise.
 
 ---
 
@@ -148,8 +170,12 @@ which is a cleaner premise for the belief modeling in Phase 3.
 
 ## Phase 3 — Neural self-play `[~]`
 
-**Step 1 is done** (encoders, network, inference path — see below). Step 2 is net-guided
-search; step 3 is the training loop.
+**Steps 1–3 are done and a run has been through them** — encoders, network and inference path;
+`netmcts`; the self-play/replay/gate/promote loop. `configs/train-fast.toml` produced
+`models/duel52-split-gen016.d52nn` (F3.7). Still open: the CFR cross-check on a scaled down
+variant, which is the only item from the original Phase 3 plan not delivered, and a run at a
+budget where the gate can actually resolve a generation — see the three changes at the top of
+this file.
 
 - [x] Observation + action encoders (`DESIGN.md` §4–5) — `engine/src/encode.rs`, 3300 floats
       and a 1324-logit head, both config-derived. Exposed to Python through
@@ -270,20 +296,90 @@ that constrain later work:
 
 ---
 
-## Phase 4 — Extract the insight `[ ]`
+## Phase 4 — Extract the insight `[~]`
 
 **This is the actual point of the project.** It is a separate job from training and should
 not be treated as a victory lap.
 
-- [ ] Learned rank values — what is each card actually worth?
+Phase 4 started earlier than planned, and by accident. Running `probe` against gen016 to
+characterise it produced three of the results on the original list, because **the trained
+agent is the first player in this project capable of the behaviour the hypotheses are about.**
+Every Phase 2 rung was measured and found flat on H2 and H3; that was never evidence about the
+game, it was evidence about the agents. The lesson generalises to everything below: a null
+from an agent that *cannot do the thing* is not a null.
+
+### Banked
+
+- [x] **Hand size at pile-empty — H2 has a real measurement at last.** `FINDINGS.md` F3.9.
+      Within-agent, 1000 self-play games, with `greedy` as a control: the trained net shows a
+      **+1.25 ± 0.17** card gap between the games it wins and the games it loses; `greedy`
+      shows **−0.04 ± 0.07**, reproducing F2.5's null exactly. F2.5's null was a null about
+      agents incapable of hoarding. **Not yet causal — see below.**
+- [x] **Flip-timing curves.** F3.10. The net's flip ply spans **21 plies** across ranks
+      (8 at 12.9, J at 15.7 … 3 at 32.0, Q at 33.8) where `ismcts:800` spans 5 and is
+      essentially flat. The ordering tracks power *type*: constant powers early (they are
+      wasted face-down), one-shot powers late (flipping spends them), and the 3 latest and
+      least-flipped of all — 0.59–0.63 against ~0.95 for everything else — because Trap only
+      fires while the card is face-down. This is the clearest evidence the agent has learned
+      structure rather than tactics.
+- [~] **First-player advantage with error bars.** Partial, `split` only. 1000 clean self-play
+      games: `netmcts@64` 0.5380 ± 0.0435, `greedy` 0.5245 ± 0.0435 — both still cover even,
+      and the two are indistinguishable from each other. H8 survives contact with a strong
+      agent. Still owed: the other two variants, and tighter intervals.
+
+### The confound that has to be closed before H2 counts
+
+**F3.9 is correlational and the causal arrow is genuinely ambiguous.** Holding cards may win
+games; or a winning position may simply be one that does not force you to commit cards. F2.5
+had the same confound and never had to face it, because its effect was zero.
+
+- [ ] **Intervention test.** Build positions with `testkit`, identical but for hand size at
+      unlock, and evaluate both with a fixed strong agent. If hand size *causes* the win rate,
+      the constructed advantage survives; if it is a symptom, it does not.
+- [ ] **Forced-commitment test.** Constrain the agent to play a card on turns where it would
+      have hoarded, and measure what the constraint costs. This prices the resource rather
+      than merely correlating it.
+
+Until one of these lands, H2's status in `FINDINGS.md` is **supported, not confirmed**.
+
+### Open
+
+- [ ] Learned rank values — what is each card actually worth? The value head plus `testkit`
+      positions is the direct route; the flip-timing curve already implies an ordering to
+      check it against.
 - [ ] Opening action-triplet frequencies
-- [ ] Flip-timing curves: when does revealing beat holding information?
 - [ ] Lane allocation: does optimal play concentrate on two lanes, and when does it commit?
-- [ ] Hand size at pile-empty — quantify hand-as-defensive-resource (see hypotheses in `FINDINGS.md`)
+      H3 is Phase 2's other agent-limited null and deserves the same re-run F3.9 gave H2 —
+      the net's lane concentration is 0.904–0.910 against `ismcts`'s 0.774, which is a large
+      enough gap to be worth a proper test rather than an eyeball.
 - [ ] Tempo value of the Ace and the King+Ace line
-- [ ] First-player advantage with error bars, per variant
 - [ ] Probe the value net on hand-constructed positions
+- [ ] **Re-run every Phase 2 hypothesis against the trained agent, not just H2 and H3.** The
+      whole F2 hypothesis table was scored by agents that could not deliberately do most of
+      the things being hypothesised about.
 - [ ] **Deliverable:** written findings + an interactive page
+
+### The tripwire — when to stop scaling and change method
+
+Recorded here because it is a Phase 4 judgement, not a training one, and because the answer
+today is *not yet*. AZ over determinized ISMCTS has a real ceiling in an imperfect-information
+game: no equilibrium guarantee, and no way to learn to conceal or signal deliberately. The
+project already knows fusion is punishing — F2.2 is PIMC collapsing under exactly that.
+
+But `netmcts` shows **no fusion signature**. The same test that exposed PIMC — more sampling,
+does it buy anything — gives PIMC nothing at 8× worlds and gives `netmcts` +145 Elo per 4×,
+twice over (F3.8). Per-simulation determinization is doing its job.
+
+Switch to R-NaD (see Stretch) when **either** of these appears, and not before:
+
+1. Search still scales but the network stops absorbing it across a run whose gate actually has
+   power — that is a representation limit, not a compute one.
+2. Self-play looks healthy while scores against a *fixed external* opponent flatten or fall.
+   That is the exploitability signature, and it is the one no amount of compute fixes.
+
+Neither is present as of gen016. The P0 self-play drift (51.4% → 56.7% over the run) looked
+like signature 2 and turned out not to be: it does not survive without exploration noise, and
+`greedy` shows the same tilt (F3.9).
 
 ---
 

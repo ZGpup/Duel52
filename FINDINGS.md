@@ -2,20 +2,27 @@
 
 What we actually learn about the game. **This file is the point of the project.**
 
-**Status: Phase 2 measured; Phase 3 step 1 built.** Five agents on a frozen Elo ladder, plus
-instrumented self-play. The encoders and the inference path are in (F3), but nothing is
-trained yet, so no hypothesis has moved since Phase 2. Six of the eight have data:
+**Status: Phase 3 trained and measured.** Five hand-written agents on a frozen Elo ladder, plus
+`models/duel52-split-gen016.d52nn` — the first trained agent, +495 Elo clear of the ladder
+(F3.7). Six of the eight hypotheses have data, and **the first one has moved**:
 
 | | verdict | where |
 |---|---|---|
 | H1 — the draw phase is positional | untested directly, but implied by H3's null | F2.6 |
-| H2 — hand size at pile-empty is the resource | **unsupported**, effect bounded under ±0.2 cards | F2.5 |
-| H3 — optimal play concentrates on two lanes | **unsupported**, no rung beats the random baseline | F2.6 |
+| H2 — hand size at pile-empty is the resource | **supported** — +1.25 ± 0.17 cards, ~14σ, with a control. Causation open | **F3.9** |
+| H3 — optimal play concentrates on two lanes | **unsupported**, no rung beats the random baseline — but agent-limited, see below | F2.6 |
 | H4 — information is worth less than tempo | **split** — the 4 is weak, but the framing is wrong | F2.9 |
-| H5 — the Jack is the strongest card | flip-timing half **confirmed**, value half open | F2.9 |
+| H5 — the Jack is the strongest card | flip-timing half **confirmed**, value half open | F2.9, F3.10 |
 | H6 — the 7 scales with board commitment | timing half **supported** | F2.9 |
 | H7 — the King is a combo enabler | consistent, too weak to call | F2.9 |
-| H8 — first-player advantage is small | **confirmed**, and it is zero, not small | F2.8 |
+| H8 — first-player advantage is small | **confirmed**, and it is zero, not small — survives a strong agent | F2.8, F3.9 |
+
+⚠️ **Read every Phase 2 null with this in mind.** H2 was recorded as "unsupported, effect
+bounded under ±0.2 cards" for the whole of Phase 2. It was wrong, and not because the
+measurement was bad — F3.9 reproduces F2.5's null exactly on `greedy`, using the same test.
+**No Phase 2 agent could hoard deliberately, so the within-agent test had nothing to detect.**
+A null from an agent that cannot do the thing is not a null about the game. H3 is the other
+hypothesis in that position and has not yet been re-run.
 
 The pattern is worth naming up front: **the hypotheses about card-level behaviour are
 holding up and the hypotheses about strategic shape are not.** Read them with the caveat in
@@ -322,6 +329,13 @@ agents rather than as absolute rates.
 **F2.1 — The ladder is cleanly ordered and fully transitive.** No cycles: every agent beats
 everything below it in the table and loses to everything above.
 
+⚠️ **This table predates the §4 mandatory-action ruling** (2026-09-03) and was fitted on a
+game where players could pass. **F3.7 carries the first post-ruling ladder.** The two do not
+compare — F3.7 also adds a trained agent and swaps `pimc:32x1` for `pimc:8x1`, and Elo is
+roster-relative — so `ismcts:800` reading +1186 here and +981 there is two different fits of
+two different games, not a rung that got worse. The *ordering* below survives except for PIMC,
+which has dropped to last; see F2.3.
+
 | agent | Elo | ± | vs. random | vs. greedy | vs. flatmc | vs. pimc |
 |---|---:|---:|---:|---:|---:|---:|
 | ismcts:800 | +1186 | 16 | 1.000 | 0.944 | 0.796 | 0.912 |
@@ -357,6 +371,14 @@ hand-written evaluation buy inside each world, they do not survive averaging acr
 **F2.3 — For PIMC, depth buys strength and determinizations do not.** Against a fixed greedy
 opponent, 200 colour-paired games each on seeds 1–100
 (`duel52 match --a pimc:WxD --b greedy --games 200 --seed 1`):
+
+⚠️ **The `pimc:8x1` row is stale and now measurably wrong.** It predates the §4
+mandatory-action ruling. Re-run post-ruling over 400 games at seed 1, `pimc:8x1` vs `greedy`
+scores **0.5050 ± 0.0488** — dead even — against the 0.638 ± 0.066 below. The intervals do not
+overlap. Removing the pass cost PIMC its edge over `greedy` outright, which is why F3.7's
+ladder puts PIMC last. **The conclusions drawn from the table survive and one is stronger:**
+`flatmc:600` now beats `pimc:8x1` **0.835 ± 0.036** post-ruling (400 games, seed 1) against
+the 0.689 recorded here. The depth-vs-width conclusion has *not* been re-measured.
 
 | PIMC budget | score vs. greedy (95% CI) | throughput | cost vs. 8×1 |
 |---|---:|---:|---:|
@@ -998,20 +1020,175 @@ measurement after that was fixed. The lesson survives intact and gains a sharper
 [ENGINE] audit should have asked not only *what is this worth?* but *is this in the rules at
 all?* The pass had no ruling behind it, in any section, and nobody had looked.
 
+### F3.7 — The first trained agent, and why the run stopped
+
+`configs/train-fast.toml`, seed `1000000`, run dir `runs/third`. 57,000 self-play games, 19
+generations on top of a random init, 1.94 h on an 8-core M-series Mac. Thirteen candidates
+passed the gate; **generation 16 was the last of them** and is published as
+`models/duel52-split-gen016.d52nn` (SHA-256 `03de8583…`, 949,267 parameters). `models/README.md`
+carries the full provenance.
+
+The first ladder fitted since the §4 mandatory-action ruling — 200 games per pairing, seeds
+from 1, `split`:
+
+| agent | Elo | ± | vs. anchor |
+|---|---:|---:|---:|
+| **netmcts:gen016@64** | **+1476** | 42 | 1.000 |
+| ismcts:800 | +981 | 19 | 0.996 |
+| flatmc:600 | +835 | 17 | 0.992 |
+| greedy | +581 | 17 | 0.966 |
+| pimc:8x1 | +547 | 17 | 0.959 |
+| random | +0 | 0 | 0.500 |
+
+**+495 Elo clear of the previous best, on one twelfth its simulation budget.** Head to head,
+200 games each at seed 1: `netmcts@64` beats `ismcts:800` **0.9300 ± 0.0354** and `greedy`
+0.9675 ± 0.0241; `netpolicy` — the policy head's argmax, no search at all — beats `greedy`
+**0.9400 ± 0.0329** and `random` 1.0000. The fit and the head-to-head agree: a +495 gap
+predicts 0.945 and the match measured 0.930.
+
+⚠️ **This table does not compare to F2.1**, which was fitted before the §4 ruling and used
+`pimc:32x1`. `ismcts:800` reading +1186 there and +981 here is two different games.
+
+**Why the run stopped, and it is not what the log looks like.** Generations 17–19 all failed
+the gate (0.503, 0.543, 0.528), which trips `max_consecutive_refusals = 3`. But at
+`gate.games = 200` the decisive-score standard error is 0.035, and the threshold is 0.55:
+
+| a generation whose true strength is… | passes the gate |
+|---|---:|
+| 0.50 — no improvement | 7.9% |
+| 0.54 — real improvement | **38.9%** |
+| 0.56 | 61.2% |
+| 0.58 | 80.4% |
+
+P(three consecutive refusals while genuinely improving at 0.54) = **22.9%**. The three refused
+generations average **0.525 ± 0.040**, an interval covering both "dead flat" and "real +2.5%
+per generation". **The run was ended by a measurement with no power to make the call.** Policy
+loss was still falling (2.02 → 1.94) and never plateaued.
+
+Reproduce: `duel52 ladder --games 200 --markdown --variant split --encoding-slots 21 --agents
+random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:models/duel52-split-gen016.d52nn@64`.
+
+### F3.8 — Search returns are constant to 1024 sims, and there is no fusion signature
+
+gen016 played against itself at different budgets, `--seed 1`, `--encoding-slots 21`:
+
+| step (each 4× compute) | score | Elo |
+|---|---:|---:|
+| `netpolicy` → `@64` | 0.8100 ± 0.054 | +252 |
+| `@64` → `@256` | 0.6925 ± 0.064 | **+141** |
+| `@256` → `@1024` | 0.7100 ± 0.088 | **+156** |
+
++141 then +156, intervals overlapping heavily: **~+145 Elo per 4×, flat, no knee anywhere in
+the measured range.** Two consequences.
+
+**For training.** The policy target *is* the visit distribution, so a run at
+`selfplay.sims = 64` teaches the network to imitate a search ~300 Elo weaker than the same
+weights produce at 1024. The teacher was capped, and `train-fast.toml`'s reasoning — "the
+policy target only needs to be better than the current policy, not good" — is right from a
+random init and stops being right once the policy is decent.
+
+**For the method, and this is the more important half.** F2.3 ran this exact test on PIMC:
+8× more sampled worlds bought **nothing measurable**, the signature of strategy fusion. The
+same test on `netmcts` buys +145 Elo per 4×, twice over. Fusion saturates under more sampling;
+this does not. Per-simulation determinization (`net_mcts.rs`, `state.determinize` *inside* the
+simulation loop) is genuinely avoiding the trap that killed PIMC. **The failure mode that
+would justify abandoning AZ-over-ISMCTS is measurably not occurring.** See `PLAN.md` Phase 4's
+tripwire for what would.
+
+**Capacity is also misallocated.** Of gen016's 949,267 parameters, the input projection is
+549,248 (57.9%) and the policy head 283,026 (29.8%) — both pinned by `obs_dim = 4290` and
+`action_dim = 2194` — leaving **99,840, or 10.5%, in the residual trunk that does the actual
+reasoning.** `blocks` 3 → 10 costs +25% parameters and takes the trunk to 28.2%; `width`
+128 → 256 costs +120% for 18.9%. Depth is much the better buy here, and the config comment
+recommending width first is wrong.
+
+### F3.9 — H2 at last: the hoard is real, the causation is not established
+
+`duel52 probe --agents netmcts:models/duel52-split-gen016.d52nn@64,greedy --games 1000
+--seed 1 --encoding-slots 21`. Self-play, no exploration noise. `greedy` is the control: it is
+the Phase 2 rung that prices material and still cannot hoard deliberately.
+
+| agent | hand@unlock | won − lost | P0 score |
+|---|---:|---:|---:|
+| netmcts:gen016@64 | 6.64 | **+1.25 ± 0.17** | 0.5380 ± 0.0435 |
+| greedy | 0.52 | −0.04 ± 0.07 | 0.5245 ± 0.0435 |
+
+**The trained agent reaches the endgame holding 6.6 cards where `greedy` holds 0.5, and within
+its own games the side holding more is the side that wins — by 1.25 cards, at ~14σ.** The
+control shows −0.04 ± 0.07, reproducing F2.5's null exactly.
+
+**F2.5's null was never a null about the game. It was a null about the agents.** No Phase 2
+rung could hoard on purpose, so the within-agent test had nothing to detect. This is the
+strongest support H2 has ever had, and it replicates across every pairing measured on the same
+day: +1.51 ± 0.73 vs `ismcts:800`, +1.53 ± 0.40 vs `netpolicy`, +1.40 ± 0.42 and +1.09 ± 0.42
+in self-play at mixed budgets.
+
+⚠️ **Supported, not confirmed.** The measurement is correlational and the causal arrow is
+ambiguous: holding cards may win games, or a winning position may simply be one that never
+forces you to commit. F2.5 carried the same confound and never had to face it because its
+effect was zero. `PLAN.md` Phase 4 names the two interventions that would close it.
+
+**Also settled here: the P0 drift is not an alarm.** Training-time self-play P0 rose
+monotonically 51.4% → 56.7% across the 19 generations, which looked like a policy pair sliding
+off equilibrium. It does not survive clean play — 0.5380 ± 0.0435 covers even — and `greedy`
+shows the same tilt at 0.5245 under identical conditions, so nothing about it is
+net-specific. The training-time figure is measured *with* Dirichlet noise and temperature
+sampling; the most likely explanation is that exploration damages the more delicate side.
+H8 survives contact with a strong agent.
+
+### F3.10 — The net learned flip timing keyed to power *type*
+
+Same probe, 200 games. Mean ply at which each rank is turned face-up:
+
+| agent | 8 | J | A | 5 | 10 | K | 6 | 3 | Q | spread |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| netmcts:gen016@64 | **12.9** | **15.7** | 18.1 | 20.7 | 25.3 | 27.1 | 30.3 | **32.0** | **33.8** | **21** |
+| ismcts:800 | 18.9 | 20.6 | 21.2 | 20.2 | 18.9 | 22.0 | 23.9 | 26.6 | 20.4 | 5 |
+
+`ismcts` flips everything around ply 20 regardless of rank. The net spans 21 plies, and the
+ordering tracks what *kind* of power the card has:
+
+- **Constant powers first** — the 8 (Retaliate) at 12.9 and the Jack (Taunt) at 15.7. They do
+  nothing face-down, so every turn unflipped is wasted.
+- **One-shot powers last** — the Queen (Move) at 33.8 and the 6 (Freeze) at 30.3. Flipping
+  spends them, so hold until the board makes them worth spending.
+- **The 3 latest of all, and least flipped.** Fraction of each rank flipped once played:
+
+| agent | A | 3 | 8 | J |
+|---|---:|---:|---:|---:|
+| netmcts@64 | 0.93 | **0.63** | 0.98 | 0.97 |
+| netmcts@256 | 0.93 | **0.59** | 0.97 | 0.98 |
+| ismcts:800 | 0.68 | 0.49 | 0.78 | 0.79 |
+
+The 3's Trap fires *if killed while face-down* (`game_rules.md` §5). It is the one card whose
+power is strictly better unflipped, it is the least-flipped rank in the net's repertoire by a
+wide margin against ~0.95 for everything else, and the net holds it ~6 plies longer than
+`ismcts` does. **This is the clearest evidence the agent has learned structure rather than
+tactics** — the ordering is not something a flat search discovers, and it is legible enough to
+hand to a human player as advice.
+
+Note `ismcts` flips less *overall* (0.49–0.79 against the net's ~0.95); the finding is in the
+per-rank spread, not the level.
+
 ### Learned card values — Phase 3/4
 From the value net and from ablation. F2.9 gives flip *priority* per rank, which is a
-different quantity and should not be quoted as a value table.
+different quantity and should not be quoted as a value table. F3.10 now gives a *timing*
+curve from a strong agent, which is closer but still not a value table.
 
 ### Policy characterization — Phase 4
 Opening frequencies, flip timing, lane commitment, hand-hoarding curve. Three probes Phase 2
 found it needed and did not have, all cheap to add:
 
 - **Lane share restricted to post-unlock plies** (H3). A whole-game share cannot see a
-  commitment that only pays in the endgame — see F2.6.
+  commitment that only pays in the endgame — see F2.6. **Now the priority**: H3 is the last
+  Phase 2 null still resting on agents that could not deliberately do the thing, and the
+  trained net's lane concentration is 0.904–0.910 against `ismcts:800`'s 0.774. That gap is
+  large enough to deserve a real test rather than an eyeball.
 - **King readiness at flip** (H7): reactivatable allies face-up in the King's lane when it is
   flipped, against the number available. Separates "flipped late" from "flipped when ready".
-- **F2.5's within-agent hand-size test, re-run against the trained net** (H2). The Phase 2
-  agents cannot hoard deliberately, so the null is not yet a fair test of the hypothesis.
+- ~~**F2.5's within-agent hand-size test, re-run against the trained net** (H2).~~ **Done —
+  F3.9.** The effect is +1.25 ± 0.17 cards with `greedy` as a control at −0.04 ± 0.07. What
+  remains is causal, not correlational: see `PLAN.md` Phase 4 for the two interventions.
 
 ---
 
