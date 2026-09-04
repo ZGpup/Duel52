@@ -24,9 +24,22 @@ replays and fits them, and a gate promotes a candidate only when it beats the in
 
 The first real run went through it: 57,000 self-play games, 19 generations, 1.94 hours on a
 laptop. Thirteen candidates passed the gate, and the last of them is committed here as
-[models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn). At 64 simulations —
-one twelfth of its opponent's budget — it scores **0.930 ± 0.035 against `ismcts:800`**, the
-strongest hand-written rung, over 200 games.
+[models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn). On the ladder, at 64
+simulations — one twelfth of its opponent's budget — it lands **+495 Elo clear of
+`ismcts:800`**, the strongest hand-written rung, and beats it 0.930 ± 0.035 head to head.
+
+| agent | Elo | ± | vs. anchor |
+|---|---:|---:|---:|
+| **`netmcts@64`** | **+1476** | 42 | 1.000 |
+| `ismcts:800` | +981 | 19 | 0.996 |
+| `flatmc:600` | +835 | 17 | 0.992 |
+| `greedy` | +581 | 17 | 0.966 |
+| `pimc:8x1` | +547 | 17 | 0.959 |
+| `random` | +0 | 0 | 0.500 |
+
+200 games per pairing, seeds from 1, `split`. This is also the first ladder fitted since the
+§4 mandatory-action ruling, so it supersedes the Phase 2 table below rather than extending
+it — see [models/README.md](models/README.md) for why the two do not compare.
 
 It did not converge, though; it stalled. Three generations running failed to beat gen016
 while the policy loss kept falling, which is the shape of a search too small to keep
@@ -108,7 +121,9 @@ Now with agents that actually try. Full provenance in [FINDINGS.md](FINDINGS.md)
   scores 0.689 against a compute-matched PIMC. And for PIMC, eight-fold more sampled worlds
   buys nothing measurable while one extra ply of search is worth +0.28 — the signature of
   strategy fusion, which is bias rather than variance. This is the phase's main result, and
-  it says belief modelling in Phase 3 is buying something real.
+  it said belief modelling in Phase 3 would buy something real. It did. The ladder above puts
+  PIMC last of the five, now level with `greedy` — re-measured post-ruling at 0.505 ± 0.049
+  over 400 games, where `FINDINGS.md` F2.3 had it at 0.638 ± 0.066.
 - **The stalemate rule fired, and then stopped existing.** Greedy — the only rung that
   prices material, so the only one that can decline a trade — stalled in 0.7–1.7% of its
   self-play games, most often in the mirrored variant where symmetric decks make neither

@@ -64,6 +64,41 @@ any better, which is the shape of a run that has run out of the thing it was lea
 
 ### How strong it is
 
+On the ladder, 200 games per pairing, seeds from 1:
+
+| agent | Elo | ± | vs. anchor |
+|---|---:|---:|---:|
+| **`netmcts@64`** | **+1476** | 42 | 1.000 |
+| `ismcts:800` | +981 | 19 | 0.996 |
+| `flatmc:600` | +835 | 17 | 0.992 |
+| `greedy` | +581 | 17 | 0.966 |
+| `pimc:8x1` | +547 | 17 | 0.959 |
+| `random` | +0 | 0 | 0.500 |
+
+```bash
+./target/release/duel52 ladder --games 200 --markdown --variant split --encoding-slots 21 \
+    --agents random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:models/duel52-split-gen016.d52nn@64
+```
+
+**+495 Elo clear of the previous best**, on one twelfth its simulation budget. Two cautions
+about reading that number:
+
+- **This does not compare to the frozen Phase 2 ladder** (`FINDINGS.md` F2.1), for two
+  reasons and the second is the serious one. Elo is roster-relative and anchored at
+  `random = 0`, and that roster had no net and used `pimc:32x1`. But F2.1 also **predates the
+  §4 mandatory-action ruling**, so it was fitted on a game where players could pass. This is
+  the first ladder run on the rules as they now stand. `ismcts:800` reading +1186 there and
+  +981 here is two different games, not a rung that got worse.
+- **±42 is the widest interval in the table**, because Elo is steep at these margins: an
+  agent that scores 0.93 sits where a small change in score is a large change in rating. The
+  gap is better read as "several hundred Elo" than as 495 ± 46.
+
+That said, the fit and the direct measurement agree. A +495 gap predicts a 0.945 score
+against `ismcts:800`; the head-to-head below measured 0.930 ± 0.035. Two independent routes
+to the same answer.
+
+### Head to head
+
 Scores are for the checkpoint's side; 0.5 is even. 200 games each, `--seed 1`, variant
 `split`, `two_power = bottom`.
 
