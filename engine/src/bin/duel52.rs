@@ -1004,14 +1004,19 @@ fn play_help() -> String {
     "\
 Choosing a move — one question at a time:
   PLAY   #1   which card from hand, then which lane
-  FLIP   #2   which lane, then which card
-  ATTACK #3   which lane, then which of your cards, then which of theirs
+  FLIP   #2   which card, then which lane — only if that card is in more than one
+  ATTACK #3   using which card, then which lane — only if that card is in more than
+              one — then which of theirs
   PAIR   #4   which lane, then the two cards
-  PASS   #5
 
-  Those five numbers never move. A verb, lane or card that cannot be used right now keeps
+  Those four numbers never move. A verb, lane or card that cannot be used right now keeps
   its place in the list and shows `—` instead of a number, so `3` is attack every turn and
   the second card in a lane is `#2` whether or not the first one can act.
+
+  FLIP and ATTACK list your cards by rank, with `×2` when you have two of them and the
+  lanes they are sitting in. A rank you have one of needs no second question. Two copies in
+  one lane that are the same card in every respect are one move, so the menu takes the
+  first rather than asking a question with one answer.
 
   A card's number counts DOWN its column on the board, so what you read off the board is
   what you type. `powers` has the full text of every power.

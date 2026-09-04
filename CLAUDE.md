@@ -152,7 +152,7 @@ config rather than a game config — it carries the loop's knobs and sets
 | `engine/src/config.rs` | Every tunable; the three variant presets |
 | `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 4 probes |
 | `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and cards are numbered from 1, and the only definition of the order a lane's cards are drawn in (`column_slots`) |
-| `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's verb → lane → card question tree, with every number fixed to the thing it picks |
+| `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's question tree — verb, then card, then lane only when the card is in more than one — with every verb and lane number fixed to the thing it picks |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
 | `engine/src/encode.rs` | Observation and action tensors, and the layout hashes that pin them |
 | `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass |
