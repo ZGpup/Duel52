@@ -122,6 +122,23 @@ class TrainSettings:
     #: schedule silently restarts at full learning rate after every interruption. The
     #: generation index is reconstructed from ``log.jsonl``, which does survive.
     lr_schedule: list[list[float]] = field(default_factory=list)
+    #: Passes over the replay buffer per generation. When set, it **overrides**
+    #: ``steps_per_generation``, which is a fixed step count and therefore a different
+    #: number of epochs every time the buffer is a different size.
+    #:
+    #: That difference is not academic. A fixed 600 steps of batch 512 is 0.9 epochs of a
+    #: 340k buffer and **4.1 epochs of the 74k buffer a run holds at generation 1** — and
+    #: four passes over a quarter of a generation, applied to weights that are already
+    #: good, memorises the shard. Measured, on the first generation of `runs/fourth`: the
+    #: training batches fell to a value MSE of 0.225 while the held-out set rose to 0.870,
+    #: from the 0.774 the starting checkpoint came in at. Both heads got worse at the job
+    #: and better at the sample.
+    #:
+    #: The third run never hit this because it started from a random net, where the first
+    #: generation's overfit is harmless — every candidate beats random — and by generation 3
+    #: its buffer was full and it settled at 1.04 epochs for the rest of the run. A
+    #: warm-started run has no such grace period, and this is what gives it one.
+    epochs_per_generation: float = 0.0
     #: Samples carved out of the run's **first** shard and never trained on, scored every
     #: generation (``PLAN.md`` §4.2 change 7). 0 disables it.
     #:
@@ -133,7 +150,22 @@ class TrainSettings:
     #: measures the same question getting answered better, not the current question.
     holdout_samples: int = 0
 
+    def steps_for(self, buffer_samples: int) -> int:
+        """How many optimisation steps this generation gets.
+
+        ``epochs_per_generation`` when it is set, so the fitting scales with the data
+        available rather than with a constant chosen for a buffer that is not full yet;
+        ``steps_per_generation`` otherwise, which is what every Phase 3 run used.
+        """
+        if self.epochs_per_generation <= 0:
+            return self.steps_per_generation
+        return max(1, round(self.epochs_per_generation * buffer_samples / self.batch_size))
+
     def __post_init__(self) -> None:
+        if self.epochs_per_generation < 0:
+            raise ValueError(
+                f"[train] epochs_per_generation cannot be negative; got {self.epochs_per_generation}"
+            )
         previous = -1
         for entry in self.lr_schedule:
             if len(entry) != 2:

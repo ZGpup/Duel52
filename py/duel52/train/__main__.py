@@ -47,11 +47,26 @@ def _check(args: argparse.Namespace) -> int:
         print(f"            {version.stdout.strip()}")
 
     sp = config.selfplay
+    tr = config.train
+    fitting = (
+        f"{tr.epochs_per_generation:.2f} epochs of the buffer"
+        if tr.epochs_per_generation > 0
+        else f"{tr.steps_per_generation} training steps"
+    )
     print(
         f"\nper generation: {sp.games} self-play games at {sp.sims} sims, "
-        f"{config.train.steps_per_generation} training steps of {config.train.batch_size}, "
-        f"a {config.gate.games}-game gate"
+        f"{fitting} in batches of {tr.batch_size}, a {config.gate.games}-game gate"
     )
+    # What a fixed step count actually means depends on how full the buffer is, and the
+    # answer at generation 1 is what cost `runs/fourth` its first generation.
+    if tr.epochs_per_generation <= 0:
+        per_gen = sp.games * 136 // tr.sample_stride
+        full = min(per_gen * tr.buffer_generations, tr.buffer_samples)
+        presentations = tr.steps_per_generation * tr.batch_size
+        print(
+            f"                which is {presentations / max(per_gen - tr.holdout_samples, 1):.1f} epochs "
+            f"at generation 1 and {presentations / max(full, 1):.1f} once the buffer is full"
+        )
     print(
         f"budget:         {config.run.generations} generations or {config.run.hours} hours, "
         f"whichever comes first"

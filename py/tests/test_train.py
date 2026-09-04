@@ -261,6 +261,44 @@ def test_the_lr_schedule_is_keyed_to_the_generation_index():
     assert trainer.lr_for(0) == trainer.lr_for(50) == pytest.approx(2e-3)
 
 
+def test_the_fitting_scales_with_the_buffer_rather_than_being_a_fixed_step_count():
+    """Generation 1 of `runs/fourth`, as an assertion.
+
+    A fixed 600 steps of batch 512 is 0.9 epochs of a full buffer and **4.1 epochs of the
+    74k one a warm-started run holds at generation 1**. Four passes over a quarter of a
+    generation, on weights that were already good, memorised the shard: the training value
+    MSE fell to 0.225 while the held-out set rose to 0.870, from the 0.774 the starting
+    checkpoint came in at. The third run never met this because it started from a random
+    net, where an overfitted first generation still beats random.
+    """
+    from dataclasses import replace
+
+    from duel52.train.config import TrainConfig
+
+    train = TrainConfig().train
+    fixed = replace(train, steps_per_generation=600, batch_size=512, epochs_per_generation=0.0)
+    # The bug: the same step count is four times the passes when the buffer is a quarter full.
+    assert fixed.steps_for(74_250) == fixed.steps_for(340_000) == 600
+    assert 600 * 512 / 74_250 == pytest.approx(4.1, abs=0.05)
+
+    scaled = replace(fixed, epochs_per_generation=0.9)
+    assert scaled.steps_for(74_250) * 512 / 74_250 == pytest.approx(0.9, abs=0.01)
+    assert scaled.steps_for(490_000) * 512 / 490_000 == pytest.approx(0.9, abs=0.01)
+    # Never zero steps, however empty the buffer.
+    assert scaled.steps_for(1) >= 1
+
+    with pytest.raises(ValueError, match="negative"):
+        load_config(_toml("[train]\nepochs_per_generation = -1.0\n"))
+
+
+def _toml(text: str) -> str:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write(text)
+        return f.name
+
+
 def test_an_lr_schedule_that_does_not_ascend_is_rejected():
     """Out of order, the last matching entry wins and the decay silently runs backwards."""
     import tempfile

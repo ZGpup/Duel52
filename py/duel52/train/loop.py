@@ -234,6 +234,8 @@ class TrainingLoop:
             used = dict(config.as_dict())
             used["init_from"] = str(init_from) if init_from is not None else None
             (run_dir / "train.toml.used").write_text(json.dumps(used, indent=2))
+        else:
+            self._record_config_change()
 
         self.trainer = Trainer(config, self.spec, self.best if self.best.exists() else None)
         if not self.best.exists():
@@ -248,6 +250,25 @@ class TrainingLoop:
         # also the row every later generation's reference column is read against.
         if init_from is not None and not resume and self.config.gate.reference:
             self._measure_baseline(Path(init_from))
+
+    def _record_config_change(self) -> None:
+        """On a resume with a different config, record the new one beside the old.
+
+        ``--resume`` re-reads the TOML, so a run can change shape halfway through — and
+        this one did, at generation 2. ``CLAUDE.md``: an unreproducible finding is not a
+        finding, and a run directory whose ``train.toml.used`` describes only the first
+        generation cannot say what produced the rest. The original is never overwritten;
+        each change is stamped with the generation it takes effect from.
+        """
+        recorded = sorted(self.run_dir.glob("train.toml.used*"))
+        current = dict(self.config.as_dict())
+        if recorded:
+            previous = json.loads(recorded[-1].read_text())
+            if {k: v for k, v in previous.items() if k != "init_from"} == current:
+                return
+        path = self.run_dir / f"train.toml.used.from-gen{self.generation + 1:03d}"
+        path.write_text(json.dumps(current, indent=2))
+        say(f"  config changed since this run started — recorded as {path.name}")
 
     # ---------------------------------------------------------------- warm start --
 
@@ -448,11 +469,15 @@ class TrainingLoop:
             f"value targets win {won:.0%} draw {drew:.0%} loss {lost:.0%}"
         )
 
-        stats = self.trainer.fit(
-            self.buffer, self.rng, self.config.train.steps_per_generation, generation=g
-        )
+        # Scaled to the buffer, not fixed: a constant step count is a different number of
+        # passes over the data every time the window is a different size, and four passes
+        # over a quarter-full buffer is how generation 1 of `runs/fourth` memorised its
+        # shard. See `TrainSettings.epochs_per_generation`.
+        steps = self.config.train.steps_for(self.buffer.samples)
+        epochs = steps * self.config.train.batch_size / max(self.buffer.samples, 1)
+        stats = self.trainer.fit(self.buffer, self.rng, steps, generation=g)
         say(
-            f"  train       {stats.steps} steps · lr {stats.lr:.2e} · "
+            f"  train       {stats.steps} steps · {epochs:.2f} epochs · lr {stats.lr:.2e} · "
             f"policy {stats.policy_first:.3f} → {stats.policy_last:.3f} "
             f"(mean {stats.policy_mean:.3f}) · value {stats.value_first:.3f} → {stats.value_last:.3f} "
             f"(mean {stats.value_mean:.3f}) · {_hms(stats.seconds)}"
@@ -518,6 +543,8 @@ class TrainingLoop:
             "buffer_samples": self.buffer.samples,
             "value_mix": {"win": won, "draw": drew, "loss": lost},
             "lr": stats.lr,
+            "steps": stats.steps,
+            "epochs": epochs,
             "policy_loss": stats.policy_mean,
             "value_loss": stats.value_mean,
             "holdout_samples": held.samples if held else 0,
