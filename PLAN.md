@@ -372,11 +372,8 @@ essentially linearly with cores until memory bandwidth bites. 95% of the loop is
      busy one. The single most common way to waste money here is forgetting to destroy the
      instance after the run finishes.
 
-**Rough rates as of mid-2026 — verify current listings before booking.** A 4090-class box with
-32–64 vCPU runs ~$0.35–0.90/hr on Vast.ai or RunPod community; a single A100 with ~30 vCPU
-runs ~$1.10–1.60/hr on Lambda or RunPod secure; an 8×A100/H100 box runs $10–30/hr. A 24-hour
-run in the first bracket is **$10–20**, which is worth stating plainly because it is easy to
-assume this needs a budget it does not.
+**Rough rates as of mid-2026 — verify current listings before booking.** A 4090-class box with 32–64 vCPU runs ~0.35–0.90/hr on Vast.ai or RunPod community; a single A100 with ~30 vCPU
+runs ~1.10–1.60/hr on Lambda or RunPod secure; an 8×A100/H100 box runs 10–30/hr. A 24-hour run in the first bracket is **$10–20**, which is worth stating plainly because it is easy to assume this needs a budget it does not.
 
 **When a GPU would start to matter**, and therefore what is *not* worth doing yet: the network
 is ~80% of per-simulation cost (F3.11), so a GPU inference backend behind the batch-shaped
