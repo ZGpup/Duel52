@@ -18,7 +18,11 @@ venv/
 *.pyd
 *.dylib
 
-# Training artifacts — never commit these, they belong in object storage
+# Training artifacts. A run is reproducible from its config and its seed, so the shards and
+# the per-generation checkpoints are not worth their weight in git.
+# /models/ is the deliberate exception: the one checkpoint per run worth publishing is copied
+# there by hand and tracked, so a clone can play the agent without training one. Keep any
+# future *.d52nn rule out of this block, or it will swallow models/ too.
 /runs/
 /checkpoints/
 *.pt

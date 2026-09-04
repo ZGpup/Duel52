@@ -10,35 +10,70 @@ analysis for this game. The agent is the instrument. The insight is the delivera
 
 ## Status
 
-**Phase 2 complete; Phase 3 step 1 in.** The engine plays the full game to spec, with 268
-Rust tests named after the rule sections they check, 64 Python tests, PyO3 bindings, and a
-text CLI. On top of it there is a frozen five-rung Elo ladder — random, greedy, flat Monte
-Carlo, PIMC and SO-ISMCTS — built on determinization, so every search agent reasons from its
-own information set rather than from the engine's ground truth.
+**Phase 3 is in: there is a trained agent in the repo, and you can play it.** The engine
+plays the full game to spec, with 300 Rust tests named after the rule sections they check, 77
+Python tests, PyO3 bindings, and a text CLI. On top of it sits a frozen five-rung Elo ladder
+— random, greedy, flat Monte Carlo, PIMC and SO-ISMCTS — built on determinization, so every
+search agent reasons from its own information set rather than from the engine's ground truth.
 
-Phase 3 has started. The observation and action encoders, a residual MLP, and the checkpoint
-format that joins them are in: a network is defined and trained in PyTorch, and evaluated in
-Rust, so a checkpoint plays through the same `ladder` / `match` / `probe` harness every other
-agent uses. A test asserts the two forward passes compute the same function. Nothing is
-trained yet — that is step 3.
+The AlphaZero loop now runs end to end. There is exactly one encoder and it lives in Rust; a
+network is defined and trained in PyTorch, evaluated in Rust, and a test asserts the two
+forward passes compute the same function. Self-play writes trajectory shards, the trainer
+replays and fits them, and a gate promotes a candidate only when it beats the incumbent over
+200 games.
+
+The first real run went through it: 57,000 self-play games, 19 generations, 1.94 hours on a
+laptop. Thirteen candidates passed the gate, and the last of them is committed here as
+[models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn). At 64 simulations —
+one twelfth of its opponent's budget — it scores **0.930 ± 0.035 against `ismcts:800`**, the
+strongest hand-written rung, over 200 games.
+
+It did not converge, though; it stalled. Three generations running failed to beat gen016
+while the policy loss kept falling, which is the shape of a search too small to keep
+producing targets the network cannot already fit. More simulations and a longer run are the
+obvious next lever, and that is a rented-GPU job rather than a laptop one.
 
 ## Try it
 
+A Rust toolchain is all you need to play. The trained agent ships with the repo —
+[models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn), 3.6 MB, an ordinary
+git blob with no LFS to install.
+
 ```bash
+git clone https://github.com/ZGpup/Duel52.git && cd Duel52
 cargo build --release
-./target/release/duel52 play --seed 1                 # play the engine in your terminal
-./target/release/duel52 play --opponent ismcts:2000   # play something that resists
+
+# Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
+# size of the observation, and the checkpoint refuses to load against any other value.
+./target/release/duel52 play --encoding-slots 21 \
+    --opponent netmcts:models/duel52-split-gen016.d52nn@256
+```
+
+`netmcts:<checkpoint>@<sims>` is net-guided information-set MCTS — the policy head supplies
+the prior, the value head stands in for rollouts. Raise `@256` for a slower and stronger
+opponent, or lower it to `@64`, the budget it was trained and gated at.
+`netpolicy:<checkpoint>` takes the policy head's argmax with no search at all: instant, and
+much weaker. Both are agent names anywhere an agent is accepted, so the checkpoint also goes
+straight into `match`, `ladder` and `probe`.
+
+```bash
+# The hand-written rungs need no checkpoint, and no --encoding-slots.
+./target/release/duel52 play --seed 1                 # a random bot; --seed replays exactly
+./target/release/duel52 play --opponent ismcts:2000   # the strongest rung on the ladder
 ./target/release/duel52 powers                        # what every card does
-./target/release/duel52 stats --all                   # the Phase 1 numbers
+./target/release/duel52 demo --seed 47                # watch a whole game, ply by ply
+
+# Measure instead of playing.
+./target/release/duel52 match --a netmcts:models/duel52-split-gen016.d52nn@64 \
+    --b ismcts:800 --games 200 --seed 1 --encoding-slots 21
+./target/release/duel52 stats  --all                  # the Phase 1 numbers
 ./target/release/duel52 ladder --games 400            # the Phase 2 Elo table
 ./target/release/duel52 probe  --games 400            # how each agent actually plays
-
-# Phase 3: build a network in Python, play it in Rust. The two --encoding-slots must
-# match; 21 rather than the default 16 because of FINDINGS.md F3.1.
-.venv/bin/python -m duel52.nn init --out checkpoints/init.d52nn --encoding-slots 21
-./target/release/duel52 match --a netpolicy:checkpoints/init.d52nn --b random \
-    --games 100 --encoding-slots 21
 ```
+
+[models/README.md](models/README.md) records how that checkpoint was produced, what it
+scores, and where it is weak. Training your own is a Python job — [CLAUDE.md](CLAUDE.md) has
+the full command set.
 
 Every prompt names the rule it is applying, so if the engine does something that looks
 wrong you can point at exactly which ruling it thinks it is following. `--seed N` makes a
@@ -81,10 +116,14 @@ Now with agents that actually try. Full provenance in [FINDINGS.md](FINDINGS.md)
   letting players **pass**, which is not a rule and never was. With §4's three actions made
   mandatory, greedy's stalemate rate is **0 in 4,000 games per variant**, and the only draw
   left in Duel 52 is the mutual lane win. Every Phase 2 number above predates that ruling.
-- **Hoarding cards does not appear to win games.** Within a single agent's self-play, the
-  side holding more cards when the draw pile empties wins no more often, at any rung. That is
-  the project's headline hypothesis, and it is unsupported so far — though no Phase 2 agent
-  is capable of hoarding deliberately, so it is not yet a fair test.
+- **Hoarding cards does not appear to win games** — *at this level of play*. Within a single
+  agent's self-play, the side holding more cards when the draw pile empties wins no more
+  often, at any rung. That is the project's headline hypothesis, and Phase 2 could not
+  support it, though no Phase 2 agent is capable of hoarding deliberately, so it was never a
+  fair test. **The trained agent hoards.** It reaches the endgame holding 7.98 cards against
+  `ismcts:800`'s 1.00, and its own wins are the games where it held more. That is the first
+  evidence in the hypothesis's favour and it is not yet a finding — see
+  [models/README.md](models/README.md).
 - **Nor does concentrating on two lanes.** No rung puts a larger share of its cards into its
   busiest two lanes than a uniformly random player does.
 - **Phase 1's encoding bound was backwards.** Competent play tops out at 8–12 cards on one
@@ -113,10 +152,11 @@ text CLI to play against. Ends with random vs random statistics.
 rollouts, on determinized worlds. Frozen as a permanent Elo ladder, plus instrumented
 self-play for the first strategic measurements.
 
-**Phase 3: Neural self-play.** 🚧 AlphaZero style loop using information set MCTS, validated
-against exact CFR on a scaled down variant before being trusted on the full game. Step 1 —
-encoders, network, and the inference path — is done; net-guided search and the training loop
-are next.
+**Phase 3: Neural self-play.** ✅ AlphaZero style loop using information set MCTS: encoders,
+network and inference path, then net-guided search, then self-play, replay, fitting and a
+promotion gate around them. The first trained checkpoint is in [models/](models/). One item
+from the original plan is still outstanding — the cross-check against exact CFR on a scaled
+down variant, which would say how far from equilibrium a merely strong agent is.
 
 **Phase 4: Extract the insight.** Learned card values, opening frequencies, flip timing,
 lane commitment, and first player advantage with error bars.
@@ -135,6 +175,7 @@ Everything runs locally on an M series Mac and scales to rented CUDA through con
 | [PLAN.md](PLAN.md) | Phased roadmap with status. |
 | [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) | Unresolved rules and design questions. |
 | [FINDINGS.md](FINDINGS.md) | Results, and hypotheses recorded before any data. |
+| [models/README.md](models/README.md) | The shipped checkpoints: how each was trained, and what it scores. |
 | [CLAUDE.md](CLAUDE.md) | Commands, repo layout, and the facts that are easy to get wrong. |
 
 ## Layout
@@ -145,7 +186,12 @@ engine/      the rules engine (zero dependencies) and the `duel52` CLI
 bindings/    PyO3 wrapper, kept separate so the engine never depends on Python
 py/duel52/   the Python package
 configs/     variant configs: split (default), base, mirrored, split-raw-two
+models/      trained checkpoints, tracked in git, with their provenance
 ```
+
+Training output — `runs/` and `checkpoints/` — is deliberately not tracked. A run is
+reproducible from its config and seed, and the one checkpoint worth keeping is copied into
+`models/` by hand.
 
 ## A note on rules
 
