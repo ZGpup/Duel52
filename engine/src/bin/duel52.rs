@@ -11,10 +11,12 @@
 //!
 //! Run `duel52 help` for usage.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 
 use duel52_engine::agents::Agent;
-use duel52_engine::display::{describe_action, describe_move, power_reference, render};
+use duel52_engine::display::{
+    describe_action, describe_move, power_reference, render, render_focus, Focus,
+};
 use duel52_engine::nn::Evaluator;
 use duel52_engine::{
     ladder, menu, stats, Action, AgentSpec, GameConfig, GameState, Outcome, Player, Rank,
@@ -105,7 +107,9 @@ OPTIONS
   --reveal                        DEBUG: show all hidden information (both hands, base
                                   cards, pile order). Do not use while genuinely playing.
   --no-clear                      do not redraw over the screen; keep every prompt in the
-                                  scrollback, which is what you want when checking a rule
+                                  scrollback, which is what you want when checking a rule.
+                                  Turns off the live highlight, which is a redraw per
+                                  keystroke. `NO_COLOR` turns off the colour alone.
 
   stats only:
   --all                           run all three variants, and both settings of the 2
@@ -786,6 +790,197 @@ impl Note {
     }
 }
 
+/// What one read from the prompt produced.
+enum Key {
+    /// The player typed something that is not yet an answer. Redraw and keep waiting — this
+    /// is what puts the live highlight on the board as a number is being typed.
+    Edit,
+    /// Enter. The buffer holds the whole line.
+    Submit,
+    /// No more input: end of a piped script, or Ctrl-D at an empty prompt.
+    Eof,
+}
+
+/// The prompt's keyboard, in the two shapes it comes in.
+///
+/// `Keys` is the interactive one: it takes the terminal out of line mode so that every
+/// keystroke arrives immediately, which is what lets the board light up the card a number
+/// points at *before* Enter commits to it. Everything else — a pipe, a test script,
+/// `--no-clear` — gets `Lines`, which reads whole lines exactly as this CLI always has.
+///
+/// The two are the same interface on purpose: there is one prompt loop, and the only thing
+/// that changes between them is how often it is asked to redraw.
+enum Keyboard {
+    /// The `RawMode` is never read. It is held because dropping it is what puts the
+    /// terminal back the way it was found.
+    Keys(#[allow(dead_code)] RawMode),
+    Lines(io::Lines<io::StdinLock<'static>>),
+}
+
+impl Keyboard {
+    /// Interactive if the terminal can support it, line-based otherwise.
+    ///
+    /// `redraws` is [`Screen::clear`]: without it every keystroke would print a fresh copy
+    /// of the whole screen underneath the last one, so the live highlight is exactly as
+    /// available as redrawing is.
+    fn open(redraws: bool) -> Keyboard {
+        match redraws.then(RawMode::enter).flatten() {
+            Some(raw) => Keyboard::Keys(raw),
+            None => Keyboard::Lines(io::stdin().lock().lines()),
+        }
+    }
+
+    fn interactive(&self) -> bool {
+        matches!(self, Keyboard::Keys(_))
+    }
+
+    /// Read until there is something for the caller to do. `buf` is the line so far.
+    fn read(&mut self, buf: &mut String) -> io::Result<Key> {
+        match self {
+            Keyboard::Keys(_) => read_key(buf),
+            Keyboard::Lines(lines) => match lines.next() {
+                None => Ok(Key::Eof),
+                Some(line) => {
+                    *buf = line?;
+                    Ok(Key::Submit)
+                }
+            },
+        }
+    }
+
+    /// Wait for Enter and throw the line away — what an interlude needs.
+    fn wait(&mut self) {
+        let mut scratch = String::new();
+        while !matches!(self.read(&mut scratch), Ok(Key::Submit) | Ok(Key::Eof)) {}
+    }
+}
+
+/// One keystroke, applied to `buf`.
+fn read_key(buf: &mut String) -> io::Result<Key> {
+    let Some(byte) = read_byte()? else {
+        return Ok(Key::Eof);
+    };
+    match byte {
+        b'\r' | b'\n' => Ok(Key::Submit),
+        // Backspace arrives as DEL on every terminal worth naming, and as BS on the rest.
+        0x7f | 0x08 => {
+            buf.pop();
+            Ok(Key::Edit)
+        }
+        // Ctrl-C. `-isig` means the terminal no longer turns this into a signal, which is
+        // deliberate: a signal would kill the process with the terminal still in raw mode.
+        // Quitting through the same door as `q` is what puts it back.
+        0x03 => {
+            *buf = "q".to_string();
+            Ok(Key::Submit)
+        }
+        // Ctrl-D ends the game only at an empty prompt, as a shell would.
+        0x04 => match buf.is_empty() {
+            true => Ok(Key::Eof),
+            false => Ok(Key::Edit),
+        },
+        // Ctrl-U clears the line.
+        0x15 => {
+            buf.clear();
+            Ok(Key::Edit)
+        }
+        // An escape sequence — an arrow or a function key. Swallow the two bytes that
+        // introduce it so they do not land in the buffer as text. A bare Esc is not
+        // followed by `[` or `O`, and then the byte after it is treated normally.
+        0x1b => match read_byte()? {
+            Some(b'[') | Some(b'O') => {
+                read_byte()?;
+                Ok(Key::Edit)
+            }
+            Some(other) => Ok(push_key(buf, other)),
+            None => Ok(Key::Edit),
+        },
+        other => Ok(push_key(buf, other)),
+    }
+}
+
+/// Take a printable character. Anything else is ignored rather than echoed, so a stray
+/// control code cannot make the prompt unreadable.
+fn push_key(buf: &mut String, byte: u8) -> Key {
+    // Long enough for `powers`, and short enough that leaning on a key does nothing
+    // interesting.
+    if (byte.is_ascii_graphic() || byte == b' ') && buf.chars().count() < 16 {
+        buf.push(byte as char);
+    }
+    Key::Edit
+}
+
+/// One byte from the terminal. `None` is end of input.
+///
+/// Reading one byte at a time is safe because `Stdin`'s buffer is shared and outlives each
+/// lock, so a keystroke that arrived alongside others is not lost between calls.
+fn read_byte() -> io::Result<Option<u8>> {
+    let mut byte = [0u8; 1];
+    match io::stdin().read(&mut byte)? {
+        0 => Ok(None),
+        _ => Ok(Some(byte[0])),
+    }
+}
+
+/// The terminal in character-at-a-time mode, restored on the way out.
+///
+/// Done by shelling out to `stty`, because the engine crate has **no dependencies** and this
+/// is not the thing to break that for (see the workspace `Cargo.toml`). The cost is one
+/// process per decision, against a human deciding what to do, which is nothing.
+///
+/// Held for the length of one decision rather than the whole game, so that a thinking bot
+/// or a crash between turns never leaves the terminal in this state.
+struct RawMode {
+    /// The settings as they were, in `stty -g` form.
+    saved: String,
+}
+
+impl RawMode {
+    fn enter() -> Option<RawMode> {
+        if !io::stdin().is_terminal() {
+            return None;
+        }
+        let saved = stty_saved()?;
+        // `-icanon` delivers keystrokes as they are typed, `-echo` lets the redraw print
+        // them, and `-isig` hands us Ctrl-C rather than letting it kill us mid-raw-mode.
+        // `min 1 time 0` keeps the read blocking, so waiting costs nothing.
+        if !stty(&["-icanon", "-echo", "-isig", "min", "1", "time", "0"]) {
+            return None;
+        }
+        Some(RawMode { saved })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        stty(&[self.saved.as_str()]);
+    }
+}
+
+/// The current terminal settings, in the opaque form `stty` takes back.
+fn stty_saved() -> Option<String> {
+    // `output()` would otherwise give `stty` a null stdin, and `stty` reads the terminal it
+    // is asked about from there.
+    let out = std::process::Command::new("stty")
+        .arg("-g")
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|saved| !saved.is_empty())
+}
+
+fn stty(args: &[&str]) -> bool {
+    std::process::Command::new("stty")
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// The play screen: a banner, the recent moves, the board, and the decision being asked —
 /// redrawn in that order after every selection, so what you are choosing between is always
 /// directly under the board it applies to.
@@ -793,6 +988,9 @@ struct Screen {
     /// Clear the terminal before each redraw. Off when stdout is not a terminal (a pipe
     /// gets a plain transcript instead of escape codes) and off under `--no-clear`.
     clear: bool,
+    /// Paint the row being typed, and the cards it names, in red. Same conditions as
+    /// `clear`, plus the `NO_COLOR` convention.
+    color: bool,
     banner: String,
     log: Vec<Note>,
 }
@@ -817,23 +1015,33 @@ impl Screen {
         }
     }
 
-    /// Redraw everything, ending with `menu` immediately below the board.
-    fn draw(&self, board: &str, menu: &str, observer: Option<Player>) {
-        if self.clear {
-            // Home the cursor, then erase. Deliberately not `\x1b[3J`, which would throw
-            // away the scrollback along with the screen.
-            print!("\x1b[H\x1b[2J");
-        }
-        println!(" {}", self.banner);
+    /// Redraw everything, ending with `menu` immediately below the board and the prompt —
+    /// carrying whatever has been typed so far — under that.
+    ///
+    /// One write, and no `\x1b[2J`. In interactive mode this runs on **every keystroke**,
+    /// and erasing the screen before redrawing it is what makes that flicker: each line
+    /// clears its own tail with `\x1b[K` instead, and `\x1b[J` takes whatever the last
+    /// frame left below. The cursor ends up after the typed text, where a cursor belongs.
+    fn draw(&self, board: &str, menu: &str, observer: Option<Player>, prompt: &str) {
+        let mut frame = format!(" {}\n", self.banner);
         for note in &self.log {
-            println!("{}", note.line(observer));
+            frame.push_str(&format!("{}\n", note.line(observer)));
         }
-        print!("{board}{menu}");
+        frame.push_str(board);
+        frame.push_str(menu);
+        frame.push_str(&format!("\n{prompt}"));
+        if self.clear {
+            // Home the cursor rather than erasing to it. Deliberately not `\x1b[3J`, which
+            // would throw away the scrollback along with the screen.
+            frame = format!("\x1b[H{}\x1b[K\x1b[J", frame.replace('\n', "\x1b[K\n"));
+        }
+        print!("{frame}");
+        io::stdout().flush().ok();
     }
 
     /// Show something that is not the board — the help, the power reference — and wait, so
     /// that the next redraw does not wipe it before it has been read.
-    fn interlude(&self, text: &str, lines: &mut impl Iterator<Item = io::Result<String>>) {
+    fn interlude(&self, text: &str, keys: &mut Keyboard) {
         if self.clear {
             print!("\x1b[H\x1b[2J");
         }
@@ -841,7 +1049,7 @@ impl Screen {
         if self.clear {
             print!("\n(press Enter to go back to the board) ");
             io::stdout().flush().ok();
-            lines.next();
+            keys.wait();
         }
     }
 }
@@ -859,23 +1067,45 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         None => "hotseat".to_string(),
         Some(spec) => format!("you are {} vs `{}`", opts.human, spec.name()),
     };
+    let redraws = !opts.no_clear && io::stdout().is_terminal();
+    // Why the live highlight is off, if it is. Checked in the order the conditions are
+    // imposed, and the last of them by *doing the thing* — entering character-at-a-time
+    // mode and leaving again — because a terminal that will not switch is the one case
+    // that cannot be predicted from a flag. A player whose board is not lighting up is
+    // owed the reason on screen rather than left to wonder whether they built the change.
+    let plain: Option<&str> = if opts.no_clear {
+        Some("--no-clear")
+    } else if !io::stdout().is_terminal() {
+        Some("output is not a terminal")
+    } else if !io::stdin().is_terminal() {
+        Some("input is not a terminal")
+    } else if RawMode::enter().is_none() {
+        Some("stty will not switch this terminal")
+    } else if std::env::var_os("NO_COLOR").is_some() {
+        Some("NO_COLOR is set")
+    } else {
+        None
+    };
     let mut screen = Screen {
         // Clearing only makes sense on a terminal. Piped output — the way the CLI is
         // scripted in tests — stays a readable transcript.
-        clear: !opts.no_clear && io::stdout().is_terminal(),
+        clear: redraws,
+        // https://no-color.org — set to anything, and we emit no escape colours.
+        color: plain.is_none(),
         // The board's own header already carries the config and the engine version, so the
         // banner adds only what the board does not: how to replay this game, who is who,
         // and how to get help.
         banner: format!(
-            "seed {} · {mode}{} · `help` for commands, `q` to quit",
+            "seed {} · {mode}{}{} · `help` for commands, `q` to quit",
             state.seed,
             if opts.reveal { " · REVEALED" } else { "" },
+            match plain {
+                Some(why) => format!(" · no live highlight ({why})"),
+                None => String::new(),
+            },
         ),
         log: Vec::new(),
     };
-
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
 
     while !state.outcome.is_over() {
         let acting = state.acting_player();
@@ -894,47 +1124,70 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         let observer = if opts.reveal { None } else { Some(acting) };
         let legal = state.legal_actions();
         let root = menu::build(&state, &legal, observer);
-        let board = render(&state, observer);
+
+        // Character-at-a-time for the length of this decision only, so that a thinking bot
+        // between turns is never waiting with the terminal in raw mode.
+        let mut keys = Keyboard::open(screen.clear);
 
         // Walk the tree: pick a card, then pick what it does. `path` is where we are in it.
         // The state cannot change while we navigate, so the tree stays valid throughout —
         // and every step redraws the whole screen rather than printing under the last menu.
         let mut path: Vec<usize> = Vec::new();
         let mut complaint = String::new();
+        let mut typed = String::new();
         let action = loop {
             let node = root.at(&path);
-            let mut menu_text = node.render(!path.is_empty());
+
+            // What the number typed so far points at. Recomputed on every keystroke, which
+            // is the whole point: three identical `(? ²♥)` in an enemy lane are told apart
+            // by watching which one turns red, before Enter commits to it.
+            let hovered = (screen.color && keys.interactive())
+                .then(|| typed.trim().parse::<usize>().ok())
+                .flatten();
+            let focus = match hovered {
+                Some(number) => node.focus(&state, number),
+                None => Focus::none(),
+            };
+
+            let board = render_focus(&state, observer, &focus);
+            let mut menu_text = node.render_with(!path.is_empty(), hovered);
             if !complaint.is_empty() {
                 menu_text.push_str(&format!("\n !! {complaint}\n"));
-                complaint.clear();
             }
-            screen.draw(&board, &menu_text, observer);
-            print!("\n{acting}> ");
-            io::stdout().flush().ok();
+            screen.draw(&board, &menu_text, observer, &format!("{acting}> {typed}"));
 
-            let Some(line) = lines.next() else {
-                println!("\n(end of input)");
-                return Ok(());
-            };
-            let input = line.map_err(|e| format!("cannot read input: {e}"))?;
+            match keys.read(&mut typed) {
+                Err(e) => return Err(format!("cannot read input: {e}")),
+                Ok(Key::Eof) => {
+                    println!("\n(end of input)");
+                    return Ok(());
+                }
+                // Still typing. Round the loop to redraw with the new highlight.
+                Ok(Key::Edit) => continue,
+                Ok(Key::Submit) => {}
+            }
+            let input = std::mem::take(&mut typed);
             let input = input.trim();
+            // The complaint has now been read — it survived every keystroke of the line
+            // that follows it, and goes when that line is answered.
+            complaint.clear();
 
             match input {
                 "" => continue,
                 "q" | "quit" | "exit" => {
-                    println!("Quitting. Replay this game with --seed {}", state.seed);
+                    println!("\nQuitting. Replay this game with --seed {}", state.seed);
                     return Ok(());
                 }
                 "help" | "?" => {
-                    screen.interlude(&play_help(), &mut lines);
+                    screen.interlude(&play_help(), &mut keys);
                     continue;
                 }
                 "powers" => {
-                    screen.interlude(&power_reference(), &mut lines);
+                    screen.interlude(&power_reference(), &mut keys);
                     continue;
                 }
                 "rules" => {
-                    screen.interlude(&rules_reminder(), &mut lines);
+                    screen.interlude(&rules_reminder(), &mut keys);
                     continue;
                 }
                 "board" => continue, // the loop redraws it
@@ -966,6 +1219,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                 None => complaint = format!("{number} is out of range (1..{})", node.len()),
             }
         };
+        // Back to line mode before anything is applied: the rest of the turn belongs to the
+        // engine, and a panic there should not land on a terminal that cannot echo.
+        drop(keys);
 
         // Logged before it is applied, because that is when the description is accurate.
         let prefix = if bot.is_none() {
@@ -1025,8 +1281,21 @@ Choosing a move — one question at a time:
   directly below the board it applies to, with the last few moves above it. Run with
   --no-clear to keep every prompt in the scrollback instead.
 
+  TYPE A NUMBER AND LOOK UP. Before you press Enter, that line and the cards it names turn
+  red on the board — the lane heading, your card, and what it is aimed at. This is how you
+  tell three identical `(? ²♥)` in an enemy lane apart: type 1, 2, 3 and watch which one
+  lights up. Backspace or Ctrl-U takes it back; nothing is committed until Enter. A number
+  no line has lights nothing up, so you know it is not one of the choices before you commit.
+
+  A row that leads to another question lights up everything under it, so `2` at the top
+  menu shows every card you could flip at once, and picking one narrows it to that card.
+
+  (Needs a colour terminal. Under --no-clear, or piped to a file, or with NO_COLOR set,
+  the prompt goes back to plain lines with no preview.)
+
 Commands at the prompt:
-  <number>   pick that numbered line
+  <number>   pick that numbered line — see it on the board first
+  Ctrl-U     clear what you have typed
   0 / b      back one question
   help / ?   this message
   powers     the card-power reference

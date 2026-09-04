@@ -39,6 +39,21 @@
 //! worse trade than reading a short list. It is ordered by rank, with the cards the actor
 //! cannot name last, so it is at least the same order every turn.
 //!
+//! # A number points at the board before it is committed to
+//!
+//! Numbering a card by its position in its column is only half an answer when three of that
+//! column's cards render identically — `(? ²♥)` three times over is exactly the position a
+//! player most needs to be sure about. [`Menu::focus`] closes that: it turns a number into
+//! the set of cards the row names, which the CLI paints red on the board while the number is
+//! being typed, alongside [`Menu::render_with`] painting the row itself. So the number is
+//! checked against the board *before* Enter, rather than regretted after it.
+//!
+//! The focus is derived from the actions under a row rather than stored beside it, so a menu
+//! cannot point at a card it does not offer, and a row that leads to another question stands
+//! for the union of everything beneath it — walking down the tree only ever narrows what is
+//! lit. It leaks nothing: it names cards by [`CardId`](crate::card::CardId) and the renderer
+//! can only colour tokens it was already drawing.
+//!
 //! Nothing here decides legality. Every leaf of the tree is an [`Action`] taken verbatim from
 //! the list the engine handed over, and every action in that list appears at exactly one
 //! leaf, so the tree can neither invent a move nor hide one. `CLAUDE.md`: the engine is the
@@ -50,7 +65,8 @@
 
 use crate::action::{Action, Side};
 use crate::display::{
-    card_number, card_token, column_slots, combat_notes, knows, lane_label, Observer,
+    card_number, card_token, column_slots, combat_notes, knows, lane_label, Focus, Observer,
+    HIGHLIGHT, RESET,
 };
 use crate::player::Player;
 use crate::rank::Rank;
@@ -114,11 +130,42 @@ impl Menu {
         }
     }
 
+    /// Everything on the board that typing `number` would act on or with.
+    ///
+    /// `number` is what the player types, so `0` is `BACK` and names nothing. A row that
+    /// leads to another question contributes the union of everything under it: hovering
+    /// `FLIP` lights up every card you could flip, and choosing one narrows it down.
+    ///
+    /// Derived from the actions themselves rather than stored alongside the rows, so a menu
+    /// cannot point at a card it does not actually offer.
+    pub fn focus(&self, state: &GameState, number: usize) -> Focus {
+        let mut focus = Focus::none();
+        if let Some(pick) = number.checked_sub(1).and_then(|i| self.picks.get(i)) {
+            collect_focus(state, pick, &mut focus);
+        }
+        focus
+    }
+
     /// The menu as printed: the question, then the numbered rows under their headings.
     ///
     /// `nested` adds the row that goes back up a level. It lives here rather than at the
     /// call site so that it lines up with everything above it.
     pub fn render(&self, nested: bool) -> String {
+        self.render_with(nested, None)
+    }
+
+    /// [`Menu::render`], with the row the player is part-way through typing shown in red —
+    /// the same red the matching cards are wearing on the board above.
+    ///
+    /// `selected` is the number typed, so `Some(0)` picks out `BACK`. A number with no row
+    /// behind it highlights nothing, which is what says "that is not one of these".
+    pub fn render_with(&self, nested: bool, selected: Option<usize>) -> String {
+        let paint = |number: usize, line: String| -> String {
+            match selected == Some(number) {
+                true => format!("{HIGHLIGHT}{line}{RESET}"),
+                false => line,
+            }
+        };
         let mut out = format!("\n {}\n", self.prompt);
         if !self.hint.is_empty() {
             out.push_str(&format!("   {}\n", self.hint));
@@ -145,14 +192,16 @@ impl Menu {
                 _ => format!("#{}", i + 1),
             };
             let head = format!("   {:<width$} {number:>2}", row.name);
-            if row.note.is_empty() {
-                out.push_str(&format!("{head}\n"));
+            let line = if row.note.is_empty() {
+                head
             } else {
-                out.push_str(&format!("{head}   {}\n", row.note));
-            }
+                format!("{head}   {}", row.note)
+            };
+            out.push_str(&format!("{}\n", paint(i + 1, line)));
         }
         if nested {
-            out.push_str(&format!("\n   {:<width$} {:>2}\n", "BACK", "#0"));
+            let back = format!("   {:<width$} {:>2}", "BACK", "#0");
+            out.push_str(&format!("\n{}\n", paint(0, back)));
         }
         out
     }
@@ -235,6 +284,74 @@ pub fn build(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
         Some(Pending::SplitTarget { lane, attackers, .. }) => {
             build_split_target(state, legal, observer, *lane, attackers.first().copied())
         }
+    }
+}
+
+// =========================================================================== focus ==
+
+/// Every card named anywhere under one pick.
+fn collect_focus(state: &GameState, pick: &Pick, focus: &mut Focus) {
+    match pick {
+        Pick::Take(action) => focus_action(state, *action, focus),
+        Pick::Open(sub) => {
+            for pick in &sub.picks {
+                collect_focus(state, pick, focus);
+            }
+        }
+        Pick::Unavailable => {}
+    }
+}
+
+/// The cards one action puts its hands on: the actor's card, and whatever it is aimed at.
+///
+/// Both go in, undifferentiated, because both are what the player is checking before they
+/// commit — an attack is a matchup, and lighting up only one half of it answers half the
+/// question. [`Action::Play`] names no card on the board yet, so it contributes its lane,
+/// which is the whole of what the move decides.
+fn focus_action(state: &GameState, action: Action, focus: &mut Focus) {
+    let me = state.acting_player();
+    let them = me.other();
+    match action {
+        Action::Play { lane, .. } => focus.lane(lane as usize),
+        Action::Flip { lane, slot }
+        | Action::ResolveNext { lane, slot }
+        | Action::MoveHere { lane, slot } => focus.at(state, lane as usize, me, slot as usize),
+        Action::Attack {
+            lane,
+            attacker,
+            target,
+        } => {
+            focus.at(state, lane as usize, me, attacker as usize);
+            focus.at(state, lane as usize, them, target as usize);
+        }
+        Action::DeclarePair {
+            lane,
+            slot_a,
+            slot_b,
+        } => {
+            focus.at(state, lane as usize, me, slot_a as usize);
+            focus.at(state, lane as usize, me, slot_b as usize);
+        }
+        // A peek reaches either side of the board, and the side is in the action.
+        Action::Peek { side, lane, slot } => {
+            let owner = match side {
+                Side::Mine => me,
+                Side::Theirs => them,
+            };
+            focus.at(state, lane as usize, owner, slot as usize);
+        }
+        // The lane is not in the action — the second half of a twinstrike happens wherever
+        // the first half did, which only the pending decision knows.
+        Action::SplitTarget { slot } => {
+            if let Some(Pending::SplitTarget { lane, attackers, .. }) = state.pending.last() {
+                focus.at(state, *lane as usize, them, slot as usize);
+                for &id in attackers {
+                    focus.card(id);
+                }
+            }
+        }
+        // A card in hand is not on the board, so there is nothing to point at.
+        Action::GiveBack { .. } => {}
     }
 }
 
@@ -1066,6 +1183,110 @@ mod tests {
         assert!(matches!(targets.picks[1], Pick::Unavailable), "the 8, taunted\n{text}");
         assert!(matches!(targets.picks[2], Pick::Take(_)), "the Jack\n{text}");
         assert!(targets.rows[2].note.starts_with("[J "), "{text}");
+    }
+
+    /// The case the highlight exists for: three enemy cards in a lane, all face-down, all
+    /// rendering as the same `(? ²♥)`. Nothing in the target list tells them apart, so the
+    /// number typed has to point at one of them on the board.
+    ///
+    /// Each number focuses **its own** card and no other, plus the attacker — an attack is
+    /// a matchup, and lighting up one half of it answers half the question.
+    #[test]
+    fn a_target_number_points_at_that_card_and_the_attacker() {
+        let mut p = Position::new(GameConfig::split_deck());
+        let attacker = p.face_up(0, Player::P0, Rank::TEN);
+        p.base(0, Player::P1, Rank::ACE);
+        p.face_down(0, Player::P1, Rank::SEVEN);
+        p.face_down(0, Player::P1, Rank::NINE);
+        // A second lane with a card in it, so a focus that strayed out of lane 1 would show.
+        p.face_down(1, Player::P1, Rank::FOUR);
+        let state = p.build();
+
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on\n{}", menu.render(false));
+        };
+        // One 10, in one lane, so the card question is a complete answer and picking it
+        // lands straight on the target list.
+        let Pick::Open(targets) = &attack.picks[0] else {
+            panic!("the 10 must be able to attack\n{}", attack.render(false));
+        };
+        assert_eq!(targets.len(), 3, "every enemy card in lane 1 is listed");
+
+        let mine = |slot: usize| {
+            let mut f = Focus::none();
+            f.at(&state, 0, Player::P0, attacker);
+            f.at(&state, 0, Player::P1, slot);
+            f
+        };
+        // The base card is at slot 0 and untouchable while the base is locked (§3), so it
+        // is a `—` and names nothing; the two played cards each name themselves.
+        assert_eq!(targets.focus(&state, 1), Focus::none(), "a `—` row is not a card");
+        assert_eq!(targets.focus(&state, 2), mine(1));
+        assert_eq!(targets.focus(&state, 3), mine(2));
+        // Typing a number no row has is not a highlight, which is what says "not one of
+        // these" rather than pointing at something arbitrary.
+        assert_eq!(targets.focus(&state, 0), Focus::none(), "0 is BACK");
+        assert_eq!(targets.focus(&state, 9), Focus::none(), "out of range");
+    }
+
+    /// A row that leads to another question stands for everything under it, so `ATTACK`
+    /// lights up every card that could attack and everything they could attack — and each
+    /// step down the tree narrows that to a subset.
+    #[test]
+    fn walking_the_tree_only_ever_narrows_the_highlight() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.face_up(0, Player::P0, Rank::TEN);
+        p.face_up(1, Player::P0, Rank::TEN);
+        p.face_down(0, Player::P1, Rank::SEVEN);
+        p.face_down(1, Player::P1, Rank::NINE);
+        let state = p.build();
+
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+        let whole_verb = menu.focus(&state, 3);
+        assert!(!whole_verb.is_empty(), "ATTACK must point somewhere");
+
+        // Two 10s in two lanes, so the card question is followed by a lane question.
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on");
+        };
+        let Pick::Open(lanes) = &attack.picks[0] else {
+            panic!("the two 10s must ask which lane\n{}", attack.render(false));
+        };
+        let one_lane = lanes.focus(&state, 1);
+        assert!(!one_lane.is_empty());
+        assert_ne!(one_lane, whole_verb, "one lane is less than both");
+        for id in one_lane.cards() {
+            assert!(
+                whole_verb.cards().contains(id),
+                "a step down cannot add a card"
+            );
+        }
+    }
+
+    /// Nothing is coloured until something is being typed, and then it is one row.
+    #[test]
+    fn only_the_row_being_typed_is_coloured() {
+        let state = GameState::new(GameConfig::split_deck(), 5);
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        let plain = menu.render(false);
+        assert!(!plain.contains('\x1b'), "no colour without a selection\n{plain}");
+        assert_eq!(menu.render_with(false, None), plain);
+        assert_eq!(
+            menu.render_with(false, Some(99)),
+            plain,
+            "a number no row has colours nothing"
+        );
+
+        let painted = menu.render_with(false, Some(1));
+        assert_eq!(painted.matches(HIGHLIGHT).count(), 1, "exactly one row\n{painted}");
+        assert!(
+            painted.contains(&format!("{HIGHLIGHT}   PLAY   #1{RESET}")),
+            "the whole line, padding included\n{painted}"
+        );
+        // The escape codes wrap the line, so the menu reads the same without them.
+        assert_eq!(painted.replace(HIGHLIGHT, "").replace(RESET, ""), plain);
     }
 
     /// Which *move* an action is, as distinct from which card it happens to name.

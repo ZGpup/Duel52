@@ -26,6 +26,11 @@
 //! Every card is a six-column token ([`card_token`]) whatever its rank, damage or state, so
 //! a column never shifts sideways as the position changes.
 //!
+//! A [`Focus`] paints some of those cells red without changing any of them: the escape
+//! codes wrap a finished, fixed-width cell, so a highlighted column is the same width as
+//! every other and the grid does not shift as the highlight moves. That is what lets the
+//! CLI redraw the board on every keystroke.
+//!
 //! # Lanes and cards are numbered from 1 here, and only here
 //!
 //! The engine indexes lanes and slots from 0, and so do [`Action`], the Python action dicts,
@@ -40,7 +45,7 @@
 //! order, and both the renderer and the CLI's menus go through it.
 
 use crate::action::{Action, Side};
-use crate::card::Card;
+use crate::card::{Card, CardId};
 use crate::player::Player;
 use crate::rank::Rank;
 use crate::state::{GameState, Pending};
@@ -50,6 +55,92 @@ use crate::state::{GameState, Pending};
 /// `Some(p)` renders the board as player `p` is entitled to see it. `None` is omniscient
 /// and is for debugging only — the CLI hides it behind an explicit `--reveal` flag.
 pub type Observer = Option<Player>;
+
+/// Bold red — what a highlight looks like. Bold as well as red so that the highlight
+/// survives a terminal whose red is close to its foreground, and a colour-blind reader.
+pub(crate) const HIGHLIGHT: &str = "\x1b[1;31m";
+/// Back to whatever the terminal was doing.
+pub(crate) const RESET: &str = "\x1b[0m";
+
+/// What the board should point at: the cards a menu row names, and the lanes they are in.
+///
+/// This is a **presentation** overlay and nothing more. It can only paint tokens the
+/// renderer was already going to draw, so it cannot leak: a focused card that the observer
+/// may not identify still renders as `(? ²♥)`, in red. The test that pins this is
+/// [`tests::focus_only_adds_colour_never_information`].
+///
+/// Cards are held as [`CardId`]s rather than slots, per `CLAUDE.md`: a focus is built from
+/// a menu and consumed by the renderer, and while nothing moves in between, an id cannot
+/// silently come to mean a different card if that ever changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Focus {
+    cards: Vec<CardId>,
+    lanes: Vec<usize>,
+}
+
+impl Focus {
+    /// Highlight nothing — what [`render`] draws with, and what the CLI uses whenever the
+    /// output is not a colour terminal.
+    pub fn none() -> Focus {
+        Focus::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cards.is_empty() && self.lanes.is_empty()
+    }
+
+    /// The cards being pointed at, in the order they were added.
+    pub fn cards(&self) -> &[CardId] {
+        &self.cards
+    }
+
+    /// The lanes being pointed at — the lane of every focused card, plus the lane a `PLAY`
+    /// would put a card into, which names no card yet.
+    pub fn lanes(&self) -> &[usize] {
+        &self.lanes
+    }
+
+    /// Highlight one card on the board, and the lane it sits in.
+    ///
+    /// The lane comes along because it is what turns "one of these tokens is red" into
+    /// "*that* one is": the lane heading is the only fixed landmark on the board, and a
+    /// column is much easier to find than a cell.
+    ///
+    /// An out-of-range slot is ignored rather than panicking — a menu built against a
+    /// state cannot name one, but this is decoration and is not worth a crash.
+    pub fn at(&mut self, state: &GameState, lane: usize, owner: Player, slot: usize) {
+        if let Some(card) = state.at(lane, owner, slot) {
+            self.card(card.id);
+            self.lane(lane);
+        }
+    }
+
+    pub fn card(&mut self, id: CardId) {
+        if !self.cards.contains(&id) {
+            self.cards.push(id);
+        }
+    }
+
+    pub fn lane(&mut self, lane: usize) {
+        if !self.lanes.contains(&lane) {
+            self.lanes.push(lane);
+        }
+    }
+
+    fn paint(&self, id: CardId, text: String) -> String {
+        match self.cards.contains(&id) {
+            true => format!("{HIGHLIGHT}{text}{RESET}"),
+            false => text,
+        }
+    }
+
+    fn paint_lane(&self, lane: usize, text: String) -> String {
+        match self.lanes.contains(&lane) {
+            true => format!("{HIGHLIGHT}{text}{RESET}"),
+            false => text,
+        }
+    }
+}
 
 /// The lane number a human reads, given the engine's 0-based lane index.
 #[inline]
@@ -279,6 +370,17 @@ const CELL: usize = TOKEN_WIDTH + 2 + 2;
 /// bottom; each side's base card sits at the far end of its column. The double rule across
 /// the middle is the front line — the only place cards can reach each other.
 pub fn render(state: &GameState, observer: Observer) -> String {
+    render_focus(state, observer, &Focus::none())
+}
+
+/// [`render`], with the cards in `focus` picked out in red.
+///
+/// The CLI calls this once per keystroke while a number is being typed, so that the card a
+/// menu number refers to lights up on the board before Enter commits to it — three
+/// identical `(? ²♥)` tokens in an enemy lane are otherwise impossible to tell apart.
+///
+/// An empty focus emits no escape codes at all, so it is byte-identical to [`render`].
+pub fn render_focus(state: &GameState, observer: Observer, focus: &Focus) -> String {
     let me = observer.unwrap_or(state.to_move);
     let them = me.other();
     let lanes = state.lane_count();
@@ -307,11 +409,19 @@ pub fn render(state: &GameState, observer: Observer) -> String {
     };
     let cell = |lane: usize, owner: Player, slot: Option<usize>| -> String {
         match slot {
-            Some(slot) => format!(
-                "  {}{}",
-                card_token(&state.lanes[lane].side(owner)[slot], observer),
-                card_status(state, lane, owner, slot)
-            ),
+            Some(slot) => {
+                let card = &state.lanes[lane].side(owner)[slot];
+                // The escape codes go *outside* the finished cell, so a highlighted column
+                // is exactly as wide as an unhighlighted one and the grid stays still.
+                focus.paint(
+                    card.id,
+                    format!(
+                        "  {}{}",
+                        card_token(card, observer),
+                        card_status(state, lane, owner, slot)
+                    ),
+                )
+            }
             None => empty.clone(),
         }
     };
@@ -364,7 +474,12 @@ pub fn render(state: &GameState, observer: Observer) -> String {
     // --- The board --------------------------------------------------------------------
     out.push_str(&cells(
         (0..lanes)
-            .map(|lane| format!("  lane {:<width$}", lane_label(lane), width = CELL - 7))
+            .map(|lane| {
+                focus.paint_lane(
+                    lane,
+                    format!("  lane {:<width$}", lane_label(lane), width = CELL - 7),
+                )
+            })
             .collect(),
     ));
     out.push_str(&base_row(them));
@@ -731,6 +846,92 @@ mod tests {
     use super::*;
     use crate::config::GameConfig;
     use crate::testkit::Position;
+
+    /// The board with every escape sequence taken back out.
+    fn uncoloured(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            // Every sequence this module emits is a CSI ending in `m`.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// A lane with three face-down enemy cards in it, one of them the base card — the
+    /// position that makes a target list unreadable, because every row says `(? ²♥)`.
+    fn crowded_lane() -> GameState {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.face_up(0, Player::P0, Rank::TEN);
+        p.base(0, Player::P1, Rank::ACE);
+        p.face_down(0, Player::P1, Rank::SEVEN);
+        p.face_down(0, Player::P1, Rank::NINE);
+        p.build()
+    }
+
+    /// A highlight is decoration. It can only paint a cell the renderer was already going
+    /// to draw, so the board underneath it says exactly what it said before — including
+    /// `(? ²♥)` for a card the observer may not identify.
+    ///
+    /// This is the guard that keeps the CLI's live highlight out of `game_rules.md` §5: if
+    /// picking things off the board could ever *add* a character, it could add a rank.
+    #[test]
+    fn rule_5_a_focus_adds_colour_and_never_information() {
+        let state = crowded_lane();
+        let observer = Some(Player::P0);
+        let plain = render(&state, observer);
+
+        // Every card on the board, one at a time, plus all of them at once.
+        let mut everything = Focus::none();
+        for lane in 0..state.lane_count() {
+            for owner in [Player::P0, Player::P1] {
+                for slot in 0..state.lanes[lane].side(owner).len() {
+                    let mut one = Focus::none();
+                    one.at(&state, lane, owner, slot);
+                    everything.at(&state, lane, owner, slot);
+                    let painted = render_focus(&state, observer, &one);
+                    assert_ne!(painted, plain, "lane {lane} slot {slot} must be picked out");
+                    assert_eq!(
+                        uncoloured(&painted),
+                        plain,
+                        "the board itself must be untouched\n{painted}"
+                    );
+                }
+            }
+        }
+        assert_eq!(uncoloured(&render_focus(&state, observer, &everything)), plain);
+
+        // And an empty focus is not merely equivalent to no focus, it is the same bytes:
+        // nothing that is not a colour terminal ever sees an escape code.
+        assert_eq!(render_focus(&state, observer, &Focus::none()), plain);
+        assert!(!plain.contains('\x1b'), "no escape codes without a focus");
+    }
+
+    /// The highlight goes round a *finished* cell, so a highlighted column is exactly as
+    /// wide as an unhighlighted one and the grid does not shift as the highlight moves —
+    /// which is what lets the CLI redraw on every keystroke.
+    #[test]
+    fn a_highlight_does_not_move_the_board() {
+        let state = crowded_lane();
+        let observer = Some(Player::P0);
+        let mut focus = Focus::none();
+        focus.at(&state, 0, Player::P1, 2);
+
+        let plain: Vec<usize> = render(&state, observer).lines().map(|l| l.len()).collect();
+        let painted: Vec<usize> = uncoloured(&render_focus(&state, observer, &focus))
+            .lines()
+            .map(|l| l.len())
+            .collect();
+        assert_eq!(plain, painted);
+    }
 
     /// A card played from hand lands **face-down** (`game_rules.md` §4), so an observer who
     /// is not the player making the move may not be told which card it was.

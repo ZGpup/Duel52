@@ -335,7 +335,7 @@ position lookup and an append.
 
 ```bash
 for s in 101 102 103; do
-  ./target/release/duel52 play --encoding-slots 21 --as p0 --seed $s --no-clear \
+  ./target/release/duel52 play --encoding-slots 21 --as p0 --seed $s \
       --record games/owner-vs-gen016.jsonl \
       --opponent netmcts:models/duel52-split-gen016.d52nn@4096
 done   # then the same three seeds with --as p1

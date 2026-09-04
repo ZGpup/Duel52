@@ -97,6 +97,11 @@ Every prompt names the rule it is applying, so if the engine does something that
 wrong you can point at exactly which ruling it thinks it is following. `--seed N` makes a
 game exactly reproducible, so a rules complaint travels as a seed and a move number.
 
+Type a number and look up before you press Enter: that line, and the cards it names, turn
+red on the board. It is how you tell three identical `(? ²♥)` in an enemy lane apart —
+type 1, 2, 3 and watch which one lights up. Nothing is committed until Enter. (`--no-clear`
+turns the redraw off, and the highlight with it.)
+
 ## The game, briefly
 
 Three lanes, three actions per turn, every card has a power tied to its rank. Cards are
