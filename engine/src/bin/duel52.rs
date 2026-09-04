@@ -1046,9 +1046,11 @@ Reading the board:
              power, cannot attack, and a blank 2 HP whatever its rank, so a face-down Jack
              dies to two hits like anything else. Flip it and its ceiling rises to 3.
   (? ²♥)     face-down, and nobody has told you what it is
-  {? ²♥}     a BASE card: untouchable until every draw pile is empty, and hidden from you
-             as well as from your opponent — which is why a 4 can usefully peek at your own
   [10³♥]     the 10 eats the space; the width does not change
+
+  The card on the far end of a column is that side's BASE card: untouchable until every
+  draw pile is empty, and while it is face-down it is hidden from you as well as from your
+  opponent — which is why a 4 can usefully peek at your own.
 
   Two columns follow each card when there is something to say:
   a b c      member of that declared pair: attacks only together, and only a Queen or a

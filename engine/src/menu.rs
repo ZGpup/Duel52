@@ -1237,7 +1237,7 @@ mod tests {
             "the base card must be offered, or the test proves nothing"
         );
         let text = render_all(&build(&state, &legal, Some(Player::P0)));
-        for token in ["(K ", "[K ", "{Q ", "[Q "] {
+        for token in ["(K ", "[K ", "(Q ", "[Q "] {
             assert!(!text.contains(token), "menu leaked a hidden {token}\n{text}");
         }
         // The actor's own hand is theirs to see, so the 3 must still be named.

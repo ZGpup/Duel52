@@ -9,7 +9,7 @@
 //!   you, and the identity/position of a card you bottomed with a 2;
 //! - hidden from **everyone**: base cards, and the cards removed unseen at setup.
 //!
-//! One detail is easy to get wrong and is handled explicitly below: **`{?  ²♥}` must be
+//! One detail is easy to get wrong and is handled explicitly below: **`(?  ²♥)` must be
 //! used for the owner's own base cards.** Base cards are hidden from their owner too (§3),
 //! which is exactly the fact a careless renderer misses.
 //!
@@ -125,19 +125,23 @@ const HP_GLYPH: [&str; 4] = ["⁰", "¹", "²", "³"];
 /// The width of [`card_token`], in columns. Every token is exactly this wide.
 pub const TOKEN_WIDTH: usize = 6;
 
-/// One card as a **fixed-width six-column token**: `[3 ²♥]`, `(? ²♥)`, `{K ¹♥}`, `[10³♥]`.
+/// One card as a **fixed-width six-column token**: `[3 ²♥]`, `(? ²♥)`, `[K ¹♥]`, `[10³♥]`.
 ///
 /// The width never varies, so a lane column never shifts sideways as cards take damage or a
 /// 10 arrives. The rank field is two columns, left-aligned, which is exactly what lets the
 /// 10 eat the space that separates rank from hit points for every other rank.
 ///
-/// The brackets carry the two facts a bare rank cannot:
+/// The brackets carry the one fact a bare rank cannot — which way up the card is:
 ///
-/// - `{…}` a **base card**: untouchable until every draw pile is empty (§3), and hidden from
-///   its owner as well as from the opponent — which is why its rank is normally `?`.
 /// - `[…]` **face-up**: power live, can attack.
 /// - `(…)` **face-down**: a blank 2-HP card with no power (§4, §6). Shows a rank only to an
 ///   observer entitled to know it.
+///
+/// A base card gets no bracket of its own. It is drawn on its own row at the far end of the
+/// column ([`column_slots`]), so its position already says it is a base card; what a reader
+/// cannot otherwise tell is whether it is still face-down (untouchable until every draw pile
+/// is empty, §3, and hidden from its owner as well as from the opponent — which is why its
+/// rank is normally `?`) or has since been flipped.
 ///
 /// The number is the hit points **remaining**, which is public for every card: §5 makes a
 /// face-down card a blank 2 HP whatever its rank, so this leaks nothing.
@@ -148,13 +152,7 @@ pub fn card_token(card: &Card, observer: Observer) -> String {
         "?"
     };
     let hp = HP_GLYPH[card.hp_remaining().min(3) as usize];
-    let (open, close) = if card.is_base {
-        ('{', '}')
-    } else if card.face_up {
-        ('[', ']')
-    } else {
-        ('(', ')')
-    };
+    let (open, close) = if card.face_up { ('[', ']') } else { ('(', ')') };
     format!("{open}{label:<2}{hp}♥{close}")
 }
 
@@ -800,8 +798,8 @@ mod tests {
         let state = GameState::new(GameConfig::split_deck(), 5);
         for observer in [Some(Player::P0), Some(Player::P1)] {
             let text = render(&state, observer);
-            // Six base cards, all unknown, and nothing else is on the board yet.
-            let unknown = text.matches("{? ²♥}").count();
+            // Six base cards, all unknown and face-down, and nothing else is on the board.
+            let unknown = text.matches("(? ²♥)").count();
             assert_eq!(
                 unknown, 6,
                 "expected all six base cards to render as unknown\n{text}"

@@ -414,7 +414,7 @@ fn rule_5_the_renderer_never_shows_a_rank_the_observer_may_not_know() {
                     .count();
                 let text = render(&s, Some(observer));
                 // `?` in the rank field is the only way a card can render unknown, whichever
-                // brackets it wears — `{…}` for a base card, `(…)` for anything else.
+                // brackets it wears — `(…)` face-down, `[…]` face-up.
                 let rendered_unknown = text.matches("? ").count();
                 assert_eq!(
                     rendered_unknown, unknown_cards,
