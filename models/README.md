@@ -24,7 +24,7 @@ It beats the top of the hand-written ladder by a wide margin, while searching tw
 less. That says it is far ahead of anything else available to play against; it says nothing
 about how close to optimal it is, because there is no stronger reference to measure it
 against — and the one external check there is says it is not close: **the project owner beats
-it.** Closing that gap is Phase 4's problem (a scaled-up run), and measuring how far it really
+it 5–0.** Closing that gap is Phase 4's problem (a scaled-up run), and measuring how far it really
 is from optimal is Phase 6's (local best-response, and the CFR cross-check on a scaled down
 variant).
 

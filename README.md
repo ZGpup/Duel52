@@ -128,7 +128,7 @@ on a laptop, and +495 Elo clear of the hand-written ladder.
 capped the first run fixed first: a promotion gate with no statistical power, a teacher capped
 at 64 simulations, and a residual trunk holding 10.5% of the network's parameters. The exit
 criterion is not an Elo number — the ladder is anchored at `random` and every rung was written
-here. It is that the agent beats the project owner, who currently beats it.
+here. It is that the agent takes a game off the project owner, who currently beats it 5–0.
 
 **Phase 5: Extract the insight.** Learned card values, opening frequencies, flip timing,
 lane commitment, and first player advantage with error bars. Hand size and flip timing are

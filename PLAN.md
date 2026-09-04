@@ -9,13 +9,21 @@ path, `netmcts`, and the AZ loop around them; `configs/train-fast.toml` ran for 
 produced `models/duel52-split-gen016.d52nn`, **+495 Elo clear of `ismcts:800`** (F3.7). The
 owner has played the engine and found no rules errors, which closes the last Phase 1 item.
 
-**The one number that sets Phase 4's agenda: the owner still beats gen016.** It is +1476 Elo
-on a ladder whose anchor is `random`, and the owner wins more often than not against it at
-`@4096`. Ladder Elo is *internal* — it measures the distance
-to five hand-written agents, and nothing in it says how far that is from good play. The human
-result is the only external yardstick this project has, and it says the agent is not there yet.
-**Phase 4's exit criterion is therefore a human one**, not a self-referential one: a net that
-wins a recorded series against the owner.
+**The one number that sets Phase 4's agenda: the owner beats gen016, 5–0.** It is +1476 Elo on
+a ladder whose anchor is `random`, and it has not taken a game off the one human who has played
+it, at `@4096` and `@8192`. Ladder Elo is *internal* — it measures the distance to five
+hand-written agents, and nothing in it says how far that is from good play. The human result is
+the only external yardstick this project has, and it says the agent is not close.
+**Phase 4's exit criterion is therefore a human one**, not a self-referential one.
+
+⚠️ **5–0 is qualitatively decisive and statistically thin, and the two should not be
+conflated.** Five wins in five bounds the owner's true rate only at *p* > 0.55 (95%, one-sided)
+— a coin that came up heads five times. What carries the weight is the *manner*: the owner
+reports winning comfortably, and characterises the agent as playing reasonably move to move
+while lacking long-term plan and making occasional obviously bad plays even at 8192
+simulations. That description is corroborated from inside the run — see §4.2 change 7. It also
+does not meet this project's own recording standard, because nothing recorded the games. §4.0
+fixes that, and it is the first task in the phase.
 
 Phase 4 is a scale-up, not a redesign. Nothing measured so far argues for changing the method
 — `netmcts` shows no strategy-fusion signature (F3.8), search still pays at 4096 simulations,
@@ -281,7 +289,11 @@ things F3.8 identified as the first run's actual ceiling fixed first.
 
 1. The new net beats `netmcts:gen016@256` head-to-head by **≥ 0.70** over 400 games at equal
    simulations (≈ +150 Elo). Below that, the run did not buy anything and §4.8 applies.
-2. It wins the owner's recorded 20-game series (§4.0). This is the criterion that matters.
+2. **It takes at least one game off the owner** in a recorded six-game series (§4.0). This is
+   the criterion that matters, and it is deliberately a low bar: against a 0–5 record, one win
+   in six is a real change and the signal to invest in a longer series. Zero in six, on top of
+   0–5, is 0–11 and puts the owner above 0.76 — at which point the honest reading is that
+   compute was not the binding constraint and §4.8 applies.
 3. The search-scaling sweep (F3.8) is repeated on the new net, because whether it still
    absorbs more search is the input to every decision after Phase 4.
 4. `FINDINGS.md` gets the ladder, the sweep, the `probe` table and the human series, all with
@@ -290,29 +302,85 @@ things F3.8 identified as the first run's actual ceiling fixed first.
 Sections 4.1–4.7 are written for someone who has not rented a machine before. §4.1 is the
 one that saves money; read it before booking anything.
 
-### 4.0 First, spend an evening making the human benchmark a number `[ ]`
+### 4.0 Record the human games, then play six `[ ]`
 
-Right now "I can still beat it" is the most important fact about the project and it is not
-written down anywhere. Twenty games, ten in each seat, fixed seeds so the *same deals* can be
-replayed against the Phase 4 net later — which makes the rematch paired, and paired is worth
-about a doubling of sample size here:
+Right now "I beat it 5–0" is the most important fact about the project and **not one ply of it
+was written down.** The games are gone: no seeds, no moves, no way to ask what the net was
+thinking when it played the moves that lost. That is the single cheapest thing to fix in this
+phase and it needs no rented hardware.
+
+**Why recording is nearly free here.** A Duel 52 game is fully determined by
+`(config, seed, the sequence of chosen indices into legal_actions())` — the engine is
+deterministic, so those few hundred bytes replay the game *exactly*, hidden information
+included. It is the same insight the `.d52sp` trajectory format is built on
+(`selfplay.rs`'s header). `cmd_play` already holds both `legal` and the chosen `action` in
+each of its two branches ([duel52.rs:886](engine/src/bin/duel52.rs#L886) for the bot,
+[duel52.rs:981](engine/src/bin/duel52.rs#L981) for the human), so `--record <file>` is a
+position lookup and an append.
+
+- [ ] **[code] `duel52 play --record <file>`** — append one line per game:
+      config, seed, which seat the human took, the opponent spec, the chosen-index sequence,
+      and the outcome. **Plain text (JSONL), not `.d52sp`.** A human decision has no visit
+      distribution and no root value, and the shard format's invariant is that every row
+      carries a policy target — a shard that can hold rows without one is a shard the trainer
+      can silently train on. Keep the corpus format strict and let human games be a different,
+      inspectable, git-committable few kilobytes.
+- [ ] **[code] `duel52 replay --record <file> --game N`** — walk a recorded game ply by ply,
+      and at each of the human's decisions print what the net thought: the value head's score
+      for the side to move, the policy prior over the legal actions, and what `netmcts` would
+      have played at a given budget. This is the instrument §4.0's analysis needs, and it is
+      also a rules-checking tool: a disagreement you can point at, in a position you remember.
+- [ ] **Then play six games**, three in each seat, seeds recorded. `@4096` is the strongest
+      measured setting (F3.8) and costs well under a second a move:
 
 ```bash
-for s in 101 102 103 104 105 106 107 108 109 110; do
+for s in 101 102 103; do
   ./target/release/duel52 play --encoding-slots 21 --as p0 --seed $s --no-clear \
+      --record games/owner-vs-gen016.jsonl \
       --opponent netmcts:models/duel52-split-gen016.d52nn@4096
-done
-# then the same ten seeds again with --as p1
+done   # then the same three seeds with --as p1
 ```
 
-Record W/L/D per seed in `FINDINGS.md` as F4.1. Twenty games has a standard error of 0.11, so
-it resolves "the human wins 3 games in 4" and does not resolve "the human wins 11 in 20" —
-that is the honest resolution of an evening, and it is enough for an exit criterion. `@4096`
-is the strongest measured setting (F3.8) and costs well under a second a move.
+Six games, not twenty. Twenty was the sample size for *measuring* a win rate, and the owner
+does not want to spend an evening on it — reasonably, because at 0–5 the measurement is not the
+question any more. Six is enough to (a) leave a recorded artefact, and (b) fix the deals so the
+Phase 4 rematch is paired on the same six seeds. Commit the file; it is a few kilobytes and it
+is the project's only external data.
 
-⚠️ This is the *only* external measurement in the project. Everything else is scored against
-agents this project wrote, on a ladder anchored at `random`, which is why a +1476 Elo rating
-and a losing record against one human are not in contradiction.
+### 4.0a What the recorded games are actually for `[ ]`
+
+Worth being blunt about the tiers, because the intuitive answer is the wrong one:
+
+| use | verdict |
+|---|---|
+| **Training data** — fine-tune on the human's moves | **No.** Six games is ~800 decisions against a replay buffer of ~6M. Even weighted 100× it is noise, and imitating one player over six games is a good way to overfit to one player over six games. |
+| **Search roots** — replay the positions, run deep search on each, add the targets to the buffer | Legitimate technique, negligible at this volume. ~800 roots at 4096 sims is ~3 minutes of compute and 0.01% of the buffer. Revisit only if there are ever hundreds of human games. |
+| **Diagnosis** — find the plies where the net was confident and wrong | **Yes, and this is the point.** See below. |
+| **A fixed evaluation set** — score every future checkpoint on the same positions | **Yes.** Cheap, permanent, and the only non-self-referential test the project has. |
+
+- [ ] **Diagnosis.** For each of the human's winning games, find the plies where the value head
+      was confident (|v| > 0.6) in the side that went on to lose, and the plies where the
+      owner would call the net's move obviously bad. Sort them into three buckets: *(i)* moves
+      the net itself fixes given more search — a search-budget problem; *(ii)* moves it plays
+      the same way at any budget but the value head scores wrongly — a value-function problem,
+      which is what §4.2 change 7 predicts; *(iii)* moves that look fine at every budget and
+      are still wrong — a blind spot, and the only category no amount of compute reaches.
+      **Bucket (iii) is why a human series is worth more than another self-play table:** errors
+      invisible from inside the system are exactly the ones self-play cannot label.
+- [ ] **A fixed evaluation set.** Lift the positions into `testkit` form and score every
+      checkpoint on them: does the value head still think it is winning at the ply where it
+      actually lost? Seconds to run, and it never goes stale.
+- [ ] **[code, optional] Disagreement mining — the automatic version, and it scales.** The
+      human is a slow labeller. Run gen016 self-play and, at each decision, compute both the
+      `@64` and the `@4096` choice; log the positions where they disagree by a wide visit
+      margin. That is thousands of labelled policy errors overnight on the Mac, for free, and
+      it directly measures how much of a teacher `selfplay.sims` is buying. It finds bucket
+      *(i)* and *(ii)* errors in volume and bucket *(iii)* never — which is precisely why it
+      complements the six human games rather than replacing them.
+
+⚠️ The human series is the *only* external measurement in the project. Everything else is
+scored against agents this project wrote, on a ladder anchored at `random`, which is why a
++1476 Elo rating and an 0–5 record against one human are not in contradiction.
 
 ### 4.1 What to rent — and it is cores, not a GPU `[ ]`
 
@@ -384,8 +452,9 @@ pass dominates a determinization. Filed in Phase 6. Rent cores now.
 
 ### 4.2 What to change before the run, and why `[ ]`
 
-Six changes. The first two are the ones F3.7 and F3.8 actually diagnosed; the rest follow from
-the run being longer. Each is `configs/train-big.toml` unless marked **[code]**.
+Seven changes. The first two are the ones F3.7 and F3.8 actually diagnosed; 3–6 follow from the
+run being longer; the seventh is the one the owner's games pointed at. Each is
+`configs/train-big.toml` unless marked **[code]**.
 
 **1. Make the promotion gate able to make a call — and correct what this file said before.**
 An earlier version of this plan said to *either* raise `gate.games` to 600 *or* drop
@@ -483,10 +552,44 @@ hundred steps of re-warm per interruption. Persisting them next to `best.d52nn` 
 same reason (clean value targets), so 18% is not obviously wrong. If Stage 1 leaves spare
 compute, that is the cheapest ablation on the list — one short run at 40 against one at 24.
 
-⚠️ **This changes six things at once, which means a failure will not say which one caused
+**7. Watch the value head, because it is the half that stopped learning.** The owner's
+description of gen016 — reasonable move to move, no long-term plan, occasional obviously bad
+plays even at 8192 simulations — has an exact signature in `runs/third/log.jsonl`:
+
+| gen | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| policy loss | 2.206 | 2.168 | 2.155 | 2.124 | 2.081 | 2.021 | 1.999 | 1.961 | **1.942** |
+| value loss | 0.482 | 0.504 | 0.519 | 0.487 | 0.499 | 0.479 | 0.464 | 0.490 | **0.506** |
+
+**The policy kept improving for the whole run. The value head plateaued around generation 11**
+and then oscillated around 0.49 — roughly half the outcome variance explained, on a ±1 target.
+This matters because of where the two are used: search resolves the next handful of decisions
+accurately, and *everything past its horizon is the value head*. A Duel 52 game is ~130
+decisions and the §7 seam sits at ply 25, so from the mid-draw-phase the thing that decides
+whether hoarding a card is worth it is ~45 decisions away — far outside any tree of 8192
+simulations over a branching factor of ~21, and redetermizing every simulation on top. So the
+agent executes a plateaued long-run judgement very precisely. That is the described symptom.
+
+The levers are not the same as the policy's, and one of them cuts the other way:
+
+- **`sims` improves the policy target; *games* improve the value target.** Each game
+  contributes one outcome, however many decisions it has. §4.3's budget buys 5× the games and
+  4× the sims at once, so there is no conflict here — but it is the reason not to trade games
+  away for sims as an earlier draft of this plan proposed.
+- **Depth helps both**, since the trunk is shared — change 4.
+- **[code] Log a held-out value MSE**, not just the training-batch number. The figures above
+  are computed on batches drawn from a replay window that slides underneath them, so a flat
+  curve is ambiguous between "learned all it can" and "the task got harder". Hold out one
+  generation's shard and score against it every generation. Small, and it is what makes this
+  claim testable rather than suggestive.
+- Resist raising `value_weight` as a first move. If the value head is capacity- or
+  data-limited, upweighting its loss trades policy quality for nothing.
+
+⚠️ **This changes seven things at once, which means a failure will not say which one caused
 it.** That is a deliberate trade — the run is a scale-up, not an ablation — and the mitigation
-is the per-generation gen016 column from change 2, which says *during* the run whether it is
-working. If it is not, §4.5 Stage 4 runs the grid.
+is the per-generation gen016 column from change 2 plus the held-out value MSE from change 7,
+which together say *during* the run whether it is working. If it is not, §4.5 Stage 4 runs the
+grid.
 
 ### 4.3 Sizing the run — the arithmetic `[ ]`
 
@@ -564,6 +667,10 @@ fewer, larger generations is the wrong direction.
 Everything here is small, and all of it should be done and committed **on the Mac**, because
 debugging on a metered box is the expensive way to do it.
 
+- [ ] **`duel52 play --record` and `duel52 replay`** (§4.0). First, because they are the
+      instrument for the exit criterion and they cost nothing to run.
+- [ ] **Held-out value MSE, logged per generation** (§4.2 change 7). Hold one shard out of the
+      training window and score it every generation, into `log.jsonl` and the readout.
 - [ ] `configs/train-big.toml` per §4.3, with the reasoning in comments as `train-fast.toml`
       does. `python -m duel52.train check --config configs/train-big.toml` must pass.
 - [ ] LR schedule in `py/duel52/train/trainer.py`, keyed to generation index (§4.2 change 5).
@@ -640,9 +747,10 @@ and the rented cores make them minutes instead of hours; a ladder at 400 games i
 - **Sync the small things off the box every few hours**, because a spot instance can vanish:
   `rsync -avz box:duel52/runs/big/checkpoints/ runs/big/checkpoints/` plus `log.jsonl`. The
   checkpoints are 4.7 MB each and the log is kilobytes; the shards are 13 GB and can stay.
-- **Watch three numbers only:** the gen016 reference score (must rise), the self-play draw
-  rate (must stay ~0%; anything else means an equilibrium is forming — F3.6), and the gate's
-  decisive score with its interval.
+- **Watch four numbers only:** the gen016 reference score (must rise), the **held-out value
+  MSE** (must fall — it is the half that plateaued last time, §4.2 change 7), the self-play
+  draw rate (must stay ~0%; anything else means an equilibrium is forming — F3.6), and the
+  gate's decisive score with its interval.
 - **`nohup` is not a substitute for `tmux`** if you want to read the progress output.
 - **Destroy the instance when the run is done**, and check the provider's dashboard rather
   than trusting that stopping the container stopped the billing. Persistent volumes usually
@@ -660,7 +768,9 @@ and the rented cores make them minutes instead of hours; a ladder at 400 games i
       lane concentration and the flip-timing curve can be compared generation to generation.
       If the behavioural statistics moved, the strategy moved, and Phase 5's findings need
       re-checking against the new net.
-- [ ] **The owner's 20-game rematch on the same 20 seeds** as §4.0 — exit criterion 2.
+- [ ] **The owner's six-game rematch on the same six seeds** as §4.0, recorded — exit
+      criterion 2. Paired on the deal, so it is worth more than six independent games; and
+      recorded, so a loss is diagnosable through `duel52 replay` rather than remembered.
 - [ ] **Cost and wall clock**, recorded with the config. Someone repeating this needs to know
       what an hour of what hardware bought.
 
@@ -761,10 +871,13 @@ Until one of these lands, H2's status in `FINDINGS.md` is **supported, not confi
       whole F2 hypothesis table was scored by agents that could not deliberately do most of
       the things being hypothesised about.
 - [ ] **Where does the human beat the agent?** New, and it is the best question on this list
-      as long as §4.0's answer is "the human wins". The owner's twenty logged games are
-      twenty games in which a +1476-Elo agent lost to a human, which is a far richer signal
-      than another self-play table. Replay them, find the plies where the value
-      head was confident and wrong, and characterise them.
+      as long as §4.0's answer is "the human wins". Each recorded human game is one in which a
+      +1476-Elo agent lost to a person, which is a far richer signal than another self-play
+      table — and §4.0a's bucket *(iii)*, the moves that look fine to the agent at every search
+      budget and are still wrong, is a class of error self-play cannot label at any scale.
+      Whatever those turn out to be is a **finding about Duel 52**, not only about the agent:
+      a systematic error a strong search makes is a place the game rewards something the
+      search's own evaluation cannot see.
 - [ ] **Deliverable:** written findings + an interactive page
 
 ---
