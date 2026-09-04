@@ -137,15 +137,44 @@ Now with agents that actually try. Full provenance in [FINDINGS.md](FINDINGS.md)
   agent's self-play, the side holding more cards when the draw pile empties wins no more
   often, at any rung. That is the project's headline hypothesis, and Phase 2 could not
   support it, though no Phase 2 agent is capable of hoarding deliberately, so it was never a
-  fair test. **The trained agent hoards.** It reaches the endgame holding 7.98 cards against
-  `ismcts:800`'s 1.00, and its own wins are the games where it held more. That is the first
-  evidence in the hypothesis's favour and it is not yet a finding — see
-  [models/README.md](models/README.md).
+  fair test. **It has now had one, and H2 moved.** Same within-agent test, 1000 self-play
+  games, with `greedy` as a control: the trained agent wins the games where it held more cards
+  by **+1.25 ± 0.17** (~14σ) while `greedy` shows −0.04 ± 0.07, reproducing the old null
+  exactly. A null from an agent that cannot do the thing was never a null about the game.
+  Supported, not confirmed — the effect is correlational and the causal arrow is still open
+  (F3.9).
 - **Nor does concentrating on two lanes.** No rung puts a larger share of its cards into its
   busiest two lanes than a uniformly random player does.
 - **Phase 1's encoding bound was backwards.** Competent play tops out at 8–12 cards on one
   side of a lane; it is *random* play that sprawls to 17–20. Random play is not a
   conservative upper bound on real play — it is a different distribution.
+
+## What Phase 3 found
+
+The first results that are about *how to play* rather than about the game tree. Provenance in
+[FINDINGS.md](FINDINGS.md) F3.7–F3.10.
+
+- **A null from an agent that cannot do the thing is not a null.** This is the methodological
+  result, and it invalidates a chunk of Phase 2. H2 sat at "unsupported" for the whole of
+  Phase 2 on a test that was sound — F3.9 reproduces its null exactly on `greedy` — but that
+  was never evidence about the game. No Phase 2 agent could hoard on purpose. Every remaining
+  Phase 2 null needs re-running against an agent capable of the behaviour, starting with H3.
+- **The agent flips cards in an order keyed to what kind of power they have.** Constant powers
+  first (the 8's Retaliate at ply 12.9, the Jack's Taunt at 15.7 — they do nothing face-down),
+  one-shot powers last (the Queen's Move at 33.8 — flipping spends them). **The 3 is latest
+  and least-flipped of all**, at 0.59–0.63 against ~0.95 for every other rank, because Trap
+  only fires while the card is face-down. `ismcts:800` flips everything at ply ~20 regardless
+  of rank: a 5-ply spread against the net's 21.
+- **Search is not where the strength is.** The policy head alone, argmax with no tree at all,
+  beats `greedy` 0.940. Search on top adds a further 0.027 against that opponent — though
+  against *itself* search is worth a great deal, +145 Elo per 4× simulations with no
+  saturation out to 1024.
+- **PIMC's strategy fusion does not affect the net.** The same test that exposed it — does
+  more sampling buy anything — gives PIMC nothing at 8× worlds and the net +145 Elo per 4×,
+  twice over. Re-determinizing inside the simulation loop is doing real work.
+- **The gate that stopped the first training run had no power to make that call.** At 200
+  games and a 0.55 threshold, a generation genuinely improving at 0.54 passes 39% of the time.
+  Worth stating because the failure is invisible: the loss curves look healthy throughout.
 
 ## The game, briefly
 
@@ -175,8 +204,12 @@ promotion gate around them. The first trained checkpoint is in [models/](models/
 from the original plan is still outstanding — the cross-check against exact CFR on a scaled
 down variant, which would say how far from equilibrium a merely strong agent is.
 
-**Phase 4: Extract the insight.** Learned card values, opening frequencies, flip timing,
-lane commitment, and first player advantage with error bars.
+**Phase 4: Extract the insight.** 🚧 Started early and by accident — instrumenting the trained
+agent answered three items straight away, because it is the first player in the project
+*capable* of the behaviour the hypotheses are about. Hand size at pile-empty and flip timing
+are in ([FINDINGS.md](FINDINGS.md) F3.9, F3.10); learned card values, opening frequencies and
+lane commitment are open, along with the intervention that would turn the hand-size
+correlation into a causal claim.
 
 **Stretch:** R-NaD on real compute for an approximate Nash policy rather than a merely
 strong one.
