@@ -538,6 +538,43 @@ random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:models/duel52-split-gen016.
 Infrastructure findings, newest first. Nothing here is about Duel 52; F3.6 is about training
 in general and is the one worth reading twice.
 
+### F3.12 — At 256 simulations a generation is two-thirds self-play, and evaluation is the other third
+
+Sizing measurements for the Phase 4 configs, taken on the 8-core M-series Mac on 2026-09-04.
+Config `variant=split two_power=bottom encoding_slots=21 stalemate_value=0.0`, seed 1,
+`models/duel52-split-gen016.d52nn` (128 × 3) on every net side, all cores.
+
+**Self-play**, 64 games, `--sims 256`, root noise on: **2.0 games/sec**, 136.3 decisions/game,
+0% draws, widest lane side 9 — comfortably inside the 21 slots the encoder reserves.
+
+That is 7,200 games/hour. `PLAN.md` §4.3's formula — `28,000 × (cores / 8) × (64 / sims) ×
+trunk_factor` — predicts 7,000, so **the formula extrapolates to 4× the search budget within
+3%**, having been calibrated only at 64 simulations. It is worth one more check on the rented
+box (§4.5 Stage 1) but it is not the thing most likely to be wrong.
+
+**Evaluation**, 20 games a row, `duel52 match`, no root noise. The candidate side plays at 256
+simulations throughout, which is what `gate.sims = 256` means:
+
+| opponent | games/sec | seconds per 100 games |
+|---|---:|---:|
+| `netmcts:gen016@256` — the mirror gate, and the equal-budget reference | 2.0 | 50 |
+| `netmcts:gen016@64` | 3.3 | 30 |
+| `greedy` | 4.0 | 25 |
+| `random` | 5.0 | 20 |
+| `ismcts:800` | 1.25 | 80 |
+
+**An evaluation game costs what its two sides think, which is the obvious thing and not what
+the first run's 8% evaluation overhead suggests.** A mirror match is two 256-simulation
+searches per ply and costs exactly a self-play game; a match against `random` is one, and
+`random`'s half is free. So the panel is cheap and the mirror gate is not, and the sizing
+consequence is specific: at 1,200 games a generation, `gate.games = 600` would be 5 minutes of
+a 15-minute generation. `configs/train-2h.toml` takes 300 and keeps the 0.52 threshold, which
+`PLAN.md` §4.2's table says is the half of that trade that matters — the threshold is what
+made the first run's gate refuse real improvements, and the sample size only sets how often.
+
+`ismcts:800` is listed because it is the Phase 2 top rung and the row people reach for; it is
+the most expensive opponent in the table and it is not in either config's panel.
+
 ### F3.11 — The trunk costs self-play throughput roughly linearly, and the GPU is irrelevant at this model size
 
 Two measurements taken to size the Phase 4 run. Config `variant=split two_power=bottom

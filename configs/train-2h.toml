@@ -1,0 +1,171 @@
+# Phase 4, scaled down to one laptop evening — PLAN.md §4.5 Stage 0, with teeth.
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-2h.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-2h.toml \
+#       --run-dir runs/fourth --init-from models/duel52-split-gen016.d52nn
+#
+# This is `configs/train-big.toml` with the numbers re-derived for 8 cores and two hours,
+# and one deliberate difference of kind: **it starts from gen016 rather than from a random
+# init.** That is what makes a two-hour run answerable. From scratch, two hours at 256 sims
+# buys ~8,600 self-play games against the 57,000 that produced gen016, so the run would end
+# weaker than the checkpoint it is being compared to and the comparison would measure the
+# budget rather than the change. Warm-started, every generation's gate *is* the comparison:
+# the candidate plays the incumbent, and the incumbent starts out as gen016.
+#
+# So this config answers one question — **does training on a 4× deeper teacher move
+# gen016?** — and does not answer whether the Phase 4 architecture works from scratch.
+# `train-big.toml` is the one that answers that, and it needs the rented box.
+#
+# Measured on the machine this is sized for (M-series, 8 cores, 2026-09-04, seed 1):
+#
+#   self-play, 128×3 trunk, 256 sims      2.0 games/sec
+#   mirror match, netmcts@256 both sides  2.0 games/sec
+#   vs `netmcts:gen016@256`               2.0 games/sec
+#   vs `greedy`                           4.0 games/sec
+#   vs `random`                           5.0 games/sec
+#
+# which puts a generation at ~14.7 minutes: 600s of self-play, 150s of gate, 114s of
+# reference panel, ~15s of everything else. Eight generations fit in the budget. Re-measure
+# before trusting any of that on another machine — `PLAN.md` §4.5 Stage 1 is the procedure.
+
+[game]
+variant = "split"
+# Must match gen016. It is what fixes obs_dim, so a mismatch is a refused checkpoint
+# rather than a silent misread. FINDINGS.md F3.1 for why 21 and not the default 16.
+encoding_slots = 21
+# FINDINGS.md F3.6. Since the §4 mandatory-action ruling this is close to a no-op — an
+# engine stalemate now needs a position where NEITHER player has a legal action — but an
+# engine-defined terminal condition should never be worth having.
+stalemate_value = 0.0
+
+[net]
+# **Pinned to gen016's trunk by the warm start**, not chosen. `--init-from` refuses a
+# checkpoint whose shape disagrees with this block, because the checkpoint would win and
+# these three numbers would silently mean nothing.
+#
+# This is the cost of warm-starting: PLAN.md §4.2 change 4 wants 6 blocks, and 6 blocks
+# cannot inherit a 3-block checkpoint. Depth is `train-big.toml`'s change to make. The
+# trade was taken this way round because in two hours the teacher matters more than the
+# trunk — F3.8 puts 64 → 256 sims at +141 Elo, and F3.11 puts 3 → 6 blocks at 0.67× the
+# games, which in a fixed budget is a real cost against an unmeasured gain.
+width = 128
+blocks = 3
+value_hidden = 128
+
+[selfplay]
+# 1200 games at 2.0 g/s is 10 minutes, which leaves the gate and the panel room inside a
+# ~15-minute generation. Eight generations of policy improvement beats four fat ones:
+# a generation is one improvement step and the run needs several, not a few enormous ones.
+games = 1200
+
+# **The headline change.** PLAN.md §4.2 change 3: the policy target *is* the visit
+# distribution, so training at 64 sims teaches the net to imitate a search ~370 Elo weaker
+# than the same weights produce at 4096 (FINDINGS.md F3.8). The teacher was capped, and
+# this is the cap coming off. Cost is close to linear — 4× the sims is 4× the self-play
+# second — which is why `games` came down from train-fast's 3000 to pay for it.
+sims = 256
+c_puct = 1.25
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+device = "auto"
+batch_size = 512
+
+# ~81,600 new samples a generation (1200 games × 136 decisions ÷ stride 2). train-fast's
+# ratio of sample-presentations to new samples was 1200 × 512 ÷ 220k ≈ 2.8, which here is
+# 446 steps. 600 is deliberately above it — PLAN.md §4.3: fitting is under 3% of the loop,
+# so err high and let the gate catch overfitting.
+steps_per_generation = 600
+
+# Unchanged from train-fast on purpose. This run already changes the teacher, the gate and
+# the starting weights; moving the learning rate as well would leave nothing to attribute a
+# result to. 2e-3 is the rate that produced gen016, applied to gen016.
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# PLAN.md §4.2 change 5, at eight generations: full rate for the first three, a quarter for
+# the middle three, a sixteenth for the last two. Keyed to the generation index rather than
+# to an optimiser step count, because `--resume` rebuilds the Trainer and the step count
+# does not survive it — the generation index is read back out of log.jsonl.
+lr_schedule = [[0, 1.0], [4, 0.25], [7, 0.0625]]
+
+sample_stride = 2
+
+# 4 × 81,600 ≈ 326k samples ≈ 520 MB. The cap is headroom, not the binding constraint:
+# `buffer_generations` is what sets the window, and a cap that silently truncates it to
+# two-thirds of one generation is the failure mode this number exists to avoid.
+buffer_generations = 4
+buffer_samples = 500000
+
+# PLAN.md §4.2 change 7 — the value head is the half that plateaued, and the per-generation
+# value loss in runs/third/log.jsonl could not prove it because it is computed on batches
+# from a window that slides underneath it. 8,000 samples carved off generation 1's shard,
+# never trained on, scored every generation: a fixed yardstick, so a flat curve means the
+# value head stopped learning rather than that the positions got harder. Costs ~1% of one
+# generation's data and about a second a generation to score.
+holdout_samples = 8000
+
+[gate]
+# PLAN.md §4.2 change 1. The first run died on three consecutive refusals of candidates
+# that were every one of them inside their own confidence interval of even, and the fix is
+# not "more games" — more games makes a true-0.54 candidate clear a 0.55 bar *less* often,
+# because the estimate concentrates on 0.54. **The threshold is the bug.**
+#
+# 300 games at 0.52 (`check` prints these):
+#   a candidate that is really 0.500 passes 24% of the time — a wasted promotion, and the
+#   new weights are as good as the old ones, so it costs approximately nothing
+#   a candidate that is really 0.540 passes 76% of the time — and a refused improvement,
+#   five times running, ends the run
+# The two errors are wildly asymmetric and the threshold is set to the cheap side of them.
+#
+# 300 rather than train-big's 600 because a gate game costs a self-play game here: 600
+# would be 5 minutes of a 15-minute generation. `min_decisive` stays at 10% of `games`.
+games = 300
+threshold = 0.52
+min_decisive = 30
+
+# Matches selfplay.sims, per PLAN.md §4.3: the gate should measure the weights at the
+# budget they are being trained for, not at 64.
+sims = 256
+
+# PLAN.md §4.2 change 2 — the most valuable single change. By generation 19 the old panel
+# read `random=1.000 greedy=1.000`: it could detect a catastrophe and nothing else. The
+# third entry is the run's headline, and it is Phase 4 exit criterion 1 measured every
+# generation rather than once at the end.
+#
+# **@256 rather than the plan's @64**: equal simulations on both sides, so the column is
+# "does the new net beat the old one" and not "does the new net beat the old one given 4×
+# the search". It costs about 30 seconds a generation more than @64 and it is the number
+# the run exists to produce. `random` and `greedy` stay because they are cheap and because
+# their saturation is itself information — they are catastrophe detectors now, not tests.
+#
+# A veto, never a target: the panel only ever blocks a promotion.
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen016.d52nn@256"]
+reference_games = 120
+reference_tolerance = 0.05
+
+# Five, not three. A refusal is not a wasted generation — self-play continues from the
+# incumbent, so the buffer grows and the next candidate trains on more data.
+max_consecutive_refusals = 5
+
+[run]
+# `hours` is what binds; `generations` is a backstop. The loop stops *before* a generation
+# that would overrun, so this is a bound and not a target. Expect 8 generations, and about
+# two minutes on top of the budget for the one-off baseline measurement of the starting
+# checkpoint, which happens before the clock starts.
+generations = 12
+hours = 2.0
+
+# The first run occupies 1,000,000–1,057,000 and PLAN.md §4.3 reserves 2,000,000 for the
+# rented run. The loop advances the seed by `selfplay.games` each generation, so this run
+# spans 3,000,000–3,014,400 and cannot re-deal a game any earlier run has trained on.
+seed = 3000000
+
+threads = 0                       # 0 = every core
+engine = "./target/release/duel52"

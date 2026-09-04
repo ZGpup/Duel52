@@ -1,0 +1,149 @@
+# Phase 4's run — PLAN.md §4.3, sized for a 64-core rented box and 24 hours.
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-big.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-big.toml --run-dir runs/big
+#   .venv/bin/python -m duel52.train run --config configs/train-big.toml --run-dir runs/big --resume
+#
+# **Do not start this without doing PLAN.md §4.5 Stage 1 first.** Every number below is
+# derived from `games/hour ≈ 28,000 × (cores / 8) × (64 / sims) × trunk_factor`, which is
+# calibrated on this project's own runs and on nobody else's hardware. Stage 1 measures the
+# box's real core count in about ten minutes; `selfplay.games` is then re-derived from the
+# measurement and only then is the long run worth starting.
+#
+# At 64 cores this is ~37,500 games/hour, ~15,000 a generation, ~29 minutes a generation and
+# ~48 generations in 24 hours — 13× the first run's games with 4× the search in each, so
+# roughly 50× the teacher compute. `configs/train-2h.toml` is the same seven changes on a
+# laptop, and it is worth running first: it is free and it has caught things.
+#
+# This run starts from a **random init**, not from gen016 — `net.blocks = 6` cannot inherit
+# gen016's 3-block trunk. That is the deliberate cost of change 4, and it is why the
+# gen016 reference column below is the run's progress chart rather than a formality.
+
+[game]
+variant = "split"
+encoding_slots = 21               # FINDINGS.md F3.1; also what fixes obs_dim
+stalemate_value = 0.0             # FINDINGS.md F3.6
+
+[net]
+# PLAN.md §4.2 change 4. Only 10.5% of gen016's 949k parameters are in the residual trunk;
+# 58% is the input projection and 30% the policy head, both pinned by obs_dim and
+# action_dim. Depth is much the better buy than width — but F3.11 measured what it costs,
+# and "+25% parameters" reads as free and is not:
+#
+#   128×3  949k params  1078 decisions/sec  1.00× self-play throughput
+#   128×6  1049k        721                 0.67×
+#   128×10 1182k        471                 0.44×
+#   256×3  2093k        324                 0.30×
+#
+# 6 blocks at 32 cores, 10 blocks only at ≥96 cores. If Stage 1 shows the box is bigger
+# than expected, spend it on depth before width.
+width = 128
+blocks = 6
+value_hidden = 128
+
+[selfplay]
+# 15,000 at 64 cores is ~24 minutes of self-play in a ~29-minute generation, which puts the
+# run in the 40–50 generation band PLAN.md §4.3 asks for. **Re-derive this from Stage 1's
+# measured throughput**; it is the one number in this file that is about the box.
+games = 15000
+
+# PLAN.md §4.2 change 3, and the reason the whole run is shaped the way it is. The policy
+# target is the visit distribution, so training at 64 sims teaches the network to imitate a
+# search ~370 Elo weaker than the same weights produce at 4096 (F3.8). 256 rather than 1024
+# because 64 → 256 is the cheapest large gain (+141 Elo) and the return per 4× halves above
+# 1024. Cost is close to linear.
+sims = 256
+c_puct = 1.25
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+# Stays at 24. This is ~18% of a ~136-decision game; AlphaZero samples ~19% for the same
+# reason (clean value targets), so 24 is not obviously thin. If Stage 1 leaves spare
+# compute, one short run at 40 against one at 24 is the cheapest ablation on the list.
+temperature_decisions = 24
+
+[train]
+# "auto" resolves to CUDA on a rented box and MPS here. Worth knowing what it is and is not
+# buying: F3.11 measured the gradient step at 1.4× faster on a GPU than on eight CPU cores,
+# against self-play at 87% of the loop. `run.threads` matters more than this string.
+device = "auto"
+batch_size = 1024
+
+# PLAN.md §4.3: keep the first run's ratio of sample-presentations to new samples
+# (1200 × 512 ÷ 220k ≈ 2.8). At 15,000 games that is 1.02M new samples a generation, so
+# 2.8 × 1.02M ÷ 1024 ≈ 2800 steps — about a minute. Fitting stays under 3% of the loop.
+steps_per_generation = 2800
+
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# PLAN.md §4.2 change 5. A constant rate is fine for 19 generations and not for 50: full
+# rate to 40% of the run, a quarter to 75%, a sixteenth after. Keyed to the generation
+# index, because `--resume` rebuilds the Trainer and an optimiser step counter does not
+# survive it — which on a preemptible box means a step-keyed schedule silently restarts at
+# full learning rate every time the instance is reclaimed.
+lr_schedule = [[0, 1.0], [20, 0.25], [38, 0.0625]]
+
+# 1.02M samples a generation at ~1.6 KB each, so six generations is 6.1M samples ≈ 10 GB —
+# fits 64 GB with room. Raise `sample_stride` to 3 if RAM is tight; it costs little signal.
+# **`buffer_samples` must be raised with `games`** or it silently truncates the window to a
+# fraction of one generation, which is invisible in the readout.
+sample_stride = 2
+buffer_generations = 6
+buffer_samples = 6500000
+
+# PLAN.md §4.2 change 7. The policy loss fell for the whole first run; the value loss
+# plateaued around generation 11 and then oscillated. That matters because search resolves
+# the next few decisions and *everything past its horizon is the value head* — and a Duel 52
+# game is ~130 decisions with the §7 seam at ply 25, so from the mid-draw phase the thing
+# deciding whether a hoard is worth it is ~45 decisions away, far outside any tree. A fixed
+# holdout is what turns "the value head plateaued" from suggestive into testable.
+holdout_samples = 50000
+
+[gate]
+# PLAN.md §4.2 change 1 — 600 games at 0.52, not 200 at 0.55. `check` prints the power:
+# at 600 decisive games a true-0.500 candidate passes 16% of the time (harmless — the new
+# weights are as good as the old) and a true-0.540 candidate passes 84% (the error that
+# ended the first run, and five in a row of it ends this one).
+games = 600
+threshold = 0.52
+min_decisive = 60                 # the same 10% of `games` the first run's 20-of-200 was
+
+# Matches selfplay.sims: measure the weights at the budget they are trained for.
+sims = 256
+
+# PLAN.md §4.2 change 2. `random` and `greedy` were both saturated at 1.000 by generation
+# 19 of the first run — they detect a catastrophe and nothing else, which is worth keeping
+# and is not a measurement. The gen016 column is the one to watch: rising monotonically
+# means the loop is working, and flat-or-falling while the mirror gate keeps passing is the
+# exploitability signature §4.8 tripwire 2 is looking for.
+#
+# @64 rather than @256 because a from-scratch net spends its first generations far below
+# gen016 at any budget, and @64 is ~40% cheaper. When the new net saturates this too
+# (≥ 0.95 for several generations), freeze the current best and add it as a fourth entry.
+#
+# A veto, never a target.
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen016.d52nn@64"]
+reference_games = 300
+reference_tolerance = 0.05
+
+max_consecutive_refusals = 5
+
+[run]
+generations = 60                  # a backstop; `hours` is what binds
+hours = 24
+
+# The loop advances the seed by `selfplay.games` each generation, so this run spans
+# 2,000,000–2,720,000. The first run occupies 1,000,000–1,057,000 and a collision would
+# silently re-deal games the net has already trained on.
+seed = 2000000
+
+# **Set this from Stage 1's measured flattening point**, which is the box's real core
+# count. 0 means every core, which is right when the box is yours alone and wrong when it
+# is a shared or throttled instance.
+threads = 0
+
+engine = "./target/release/duel52"

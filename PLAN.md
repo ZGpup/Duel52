@@ -669,17 +669,41 @@ debugging on a metered box is the expensive way to do it.
 
 - [ ] **`duel52 play --record` and `duel52 replay`** (§4.0). First, because they are the
       instrument for the exit criterion and they cost nothing to run.
-- [ ] **Held-out value MSE, logged per generation** (§4.2 change 7). Hold one shard out of the
-      training window and score it every generation, into `log.jsonl` and the readout.
-- [ ] `configs/train-big.toml` per §4.3, with the reasoning in comments as `train-fast.toml`
+- [x] **Held-out value MSE, logged per generation** (§4.2 change 7). `train.holdout_samples`
+      carves a fixed prefix off generation 1's shard, never trains on it, and scores it every
+      generation into `log.jsonl` (`holdout_value_mse`, `holdout_policy_loss`) and both the
+      readout and the summary table. **Fixed, not rolling** — a holdout that slides with the
+      window has the same ambiguity the training-batch number has, and the point is a
+      yardstick that does not move. The cost is that it drifts off-policy as the net improves:
+      it measures the same question being answered better, not the current question. The carve
+      happens on every path into the buffer, including the refill after a `--resume`, because
+      "held out except after a restart" is not a distinction anyone would notice in a log file.
+- [x] `configs/train-big.toml` per §4.3, with the reasoning in comments as `train-fast.toml`
       does. `python -m duel52.train check --config configs/train-big.toml` must pass.
-- [ ] LR schedule in `py/duel52/train/trainer.py`, keyed to generation index (§4.2 change 5).
-- [ ] Persist AdamW moment state across `--resume` (§4.2 change 5, minor).
-- [ ] Add the gate's decisive count and its 95% interval to the per-generation readout and to
+- [x] LR schedule in `py/duel52/train/trainer.py`, keyed to generation index (§4.2 change 5).
+      `train.lr_schedule = [[from_generation, multiplier], ...]`; empty means a constant rate,
+      so every Phase 3 run reproduces unchanged. A schedule that does not ascend is rejected
+      by the config loader rather than silently running the decay backwards.
+- [x] Persist AdamW moment state across `--resume` (§4.2 change 5, minor). Saved every
+      generation to `checkpoints/optimizer.pt`, whether or not the candidate was promoted — a
+      refusal rolls the weights back and deliberately keeps the momentum.
+- [x] Add the gate's decisive count and its 95% interval to the per-generation readout and to
       `log.jsonl`, so "did the gate have power" is answerable from the log without recomputing
       it. This is the single thing that would have made F3.7 obvious while the run was live.
-- [ ] Confirm a `netmcts:<path>@<sims>` string works as a `gate.reference` entry end-to-end
-      (one generation of a 100-game local run is enough).
+      `python -m duel52.train check` now also prints the gate's power *before* the run: at
+      600 games and 0.52, a true-0.500 candidate passes 16% and a true-0.540 candidate 84%,
+      which is §4.2's table computed from the config rather than copied out of it.
+- [x] Confirm a `netmcts:<path>@<sims>` string works as a `gate.reference` entry end-to-end.
+      Four generations of a 20-game local run, including a `--resume` in the middle.
+- [x] **[not in the original list] `--init-from <checkpoint>`**, so a run can start from a
+      shipped checkpoint instead of a random init. Needed because a two-hour laptop run cannot
+      reach gen016 from scratch — see §4.5 Stage 0 — and useful on the box for continuing a
+      run whose config changed. It refuses a checkpoint whose trunk disagrees with `[net]`:
+      the shape comes from the checkpoint, which is correct on `--resume` and a trap here,
+      where someone asking for 6 blocks while inheriting a 3-block checkpoint would silently
+      get 3. It also scores the starting checkpoint on the reference panel once, before
+      generation 1, so the veto has a high-water mark from the first candidate rather than the
+      second, and so the run's reference column has a row to be read against.
 - [ ] **Optional, only if there is more than one machine:** let a generation consume several
       shards, so `duel52 selfplay` can run on N boxes with disjoint seed ranges and the
       trainer concatenate them. This is the natural way to use a second box and is a
@@ -687,11 +711,36 @@ debugging on a metered box is the expensive way to do it.
 
 ### 4.5 The staged plan `[ ]`
 
-**Stage 0 — rehearse locally, 30–40 minutes, free.** On the Mac, run `train-big.toml` with
-`games = 200`, `generations = 2`, `hours = 0.5` into `runs/rehearsal`. What this proves is not
-strength; it is that the config parses, the LR schedule fires, the gen016 reference opponent
-loads, the buffer sizes do not blow up RAM, and `--resume` works after a deliberate Ctrl-C.
-Every one of those failing on a paid box costs money.
+**Stage 0 — two hours locally, free, and it answers something.** `configs/train-2h.toml`:
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-2h.toml \
+    --run-dir runs/fourth --init-from models/duel52-split-gen016.d52nn
+```
+
+The mechanical rehearsal this stage used to be — the config parses, the LR schedule fires, the
+`netmcts` reference opponent loads, the buffer does not blow up RAM, `--resume` survives a
+Ctrl-C — is done and is covered by tests and by a four-generation smoke run. What is left is
+worth two hours because it is a measurement rather than a rehearsal.
+
+**It warm-starts from gen016 and it is `128 × 3` because of that.** From a random init, two
+hours at 256 simulations buys ~8,600 self-play games against the 57,000 that produced gen016,
+so the run would finish weaker than the checkpoint it is being compared to and the comparison
+would measure the budget rather than the change. Warm-started, every generation's mirror gate
+*is* the comparison and the reference panel carries `netmcts:gen016@256` — equal simulations,
+which is exit criterion 1 measured every generation instead of once at the end.
+
+The price is that change 4 is not in it: 6 blocks cannot inherit a 3-block trunk. So Stage 0
+answers **does training on a 4× deeper teacher move gen016** — which is change 3, the one F3.8
+diagnosed as the first run's ceiling — and says nothing about depth. That is the right half to
+test first on a machine this size, because F3.11 prices depth at 0.67× the games and the games
+are what two hours is short of.
+
+Read it as: the gen016 column rising across generations is the loop working; flat while the
+mirror gate keeps passing is the exploitability signature (§4.8 tripwire 2); the held-out value
+MSE falling is change 7 having been the right diagnosis. If the gen016 column is flat after
+eight generations, the teacher was not the binding constraint and `train-big.toml`'s 24 hours
+should be spent knowing that.
 
 **Stage 1 — one paid hour, measuring, before committing to 24.** In order:
 

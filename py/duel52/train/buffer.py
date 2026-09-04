@@ -66,6 +66,48 @@ class Generation:
             + self.value.nbytes
         )
 
+    def slice(self, start: int, stop: int) -> Generation:
+        """Samples ``[start, stop)`` as a generation in their own right.
+
+        Used to carve a fixed holdout off the front of a shard (``PLAN.md`` §4.2 change 7)
+        without spending a whole generation of self-play on one. Views into the same
+        buffers — the CSR payload is re-based, not copied.
+
+        ``games`` becomes 0: a slice is a set of positions, and the games they came from are
+        cut across. Nothing reads it, and a plausible-looking wrong number would be worse.
+        """
+        if not 0 <= start <= stop <= self.samples:
+            raise ValueError(f"slice [{start}, {stop}) is outside 0..{self.samples}")
+        obs_from, obs_to = int(self.obs_offset[start]), int(self.obs_offset[stop])
+        pol_from, pol_to = int(self.policy_offset[start]), int(self.policy_offset[stop])
+        return Generation(
+            generation=self.generation,
+            path=self.path,
+            games=0,
+            samples=stop - start,
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            obs_offset=self.obs_offset[start : stop + 1] - self.obs_offset[start],
+            obs_index=self.obs_index[obs_from:obs_to],
+            obs_value=self.obs_value[obs_from:obs_to],
+            policy_offset=self.policy_offset[start : stop + 1] - self.policy_offset[start],
+            policy_index=self.policy_index[pol_from:pol_to],
+            policy_prob=self.policy_prob[pol_from:pol_to],
+            value=self.value[start:stop],
+            root_value=self.root_value[start:stop],
+            header=self.header,
+        )
+
+    def batches(self, batch_size: int):
+        """Every sample once, in order, in batches of at most ``batch_size``.
+
+        The evaluation counterpart to :meth:`ReplayBuffer.sample_batch`: scoring a holdout
+        means covering it exactly once, not sampling it with replacement.
+        """
+        for start in range(0, self.samples, batch_size):
+            rows = np.arange(start, min(start + batch_size, self.samples), dtype=np.int64)
+            yield _batch_from([(self, rows)])
+
 
 def load_generation(path: str | Path, generation: int, *, stride: int = 1, threads: int = 0) -> Generation:
     """Replay a shard into arrays. Zero-copy over the buffers the engine hands back."""
@@ -112,6 +154,48 @@ def _ragged_gather(offset: np.ndarray, rows: np.ndarray) -> tuple[np.ndarray, np
     )
 
 
+def _batch_from(pieces: list[tuple[Generation, np.ndarray]]) -> dict[str, np.ndarray]:
+    """Assemble one batch out of ``(generation, row indices)`` pairs.
+
+    One code path for both callers, because the invariant they share is the one the whole
+    trainer rests on: row *i* of the batch is one position's observation *and that same
+    position's* policy target. Rows are laid out piece by piece, so a batch drawn across
+    several generations is grouped by generation rather than in draw order — which no
+    caller may depend on, and none does.
+    """
+    obs_rows, obs_cols, obs_vals = [], [], []
+    pol_rows, pol_cols, pol_vals = [], [], []
+    values = []
+    base = 0
+    for gen, local in pieces:
+        if local.size == 0:
+            continue
+        pos, row = _ragged_gather(gen.obs_offset, local)
+        obs_rows.append(row + base)
+        obs_cols.append(gen.obs_index[pos].astype(np.int64))
+        obs_vals.append(gen.obs_value[pos])
+
+        pos, row = _ragged_gather(gen.policy_offset, local)
+        pol_rows.append(row + base)
+        pol_cols.append(gen.policy_index[pos].astype(np.int64))
+        pol_vals.append(gen.policy_prob[pos])
+
+        values.append(gen.value[local])
+        base += local.size
+
+    empty_i, empty_f = np.empty(0, np.int64), np.empty(0, np.float32)
+    join = lambda parts, empty: np.concatenate(parts) if parts else empty  # noqa: E731
+    return {
+        "obs_rows": join(obs_rows, empty_i),
+        "obs_cols": join(obs_cols, empty_i),
+        "obs_vals": join(obs_vals, empty_f),
+        "policy_rows": join(pol_rows, empty_i),
+        "policy_cols": join(pol_cols, empty_i),
+        "policy_vals": join(pol_vals, empty_f),
+        "value": join(values, empty_f),
+    }
+
+
 class ReplayBuffer:
     """A sliding window over replayed generations."""
 
@@ -133,7 +217,15 @@ class ReplayBuffer:
         return sum(g.nbytes for g in self.generations)
 
     def add(self, path: str | Path, generation: int) -> Generation:
-        gen = load_generation(path, generation, stride=self.stride, threads=self.threads)
+        return self.append(load_generation(path, generation, stride=self.stride, threads=self.threads))
+
+    def append(self, gen: Generation) -> Generation:
+        """Put an already-replayed generation into the window.
+
+        Split out from :meth:`add` so a caller that has to look at a shard before it is
+        trained on — carving the fixed holdout off the front of it — does not have to
+        replay it twice.
+        """
         if self.generations:
             first = self.generations[0]
             if (gen.obs_dim, gen.action_dim) != (first.obs_dim, first.action_dim):
@@ -166,37 +258,12 @@ class ReplayBuffer:
         picks = rng.integers(0, bounds[-1], size=batch_size)
         which = np.searchsorted(bounds, picks, side="right") - 1
 
-        obs_rows, obs_cols, obs_vals = [], [], []
-        pol_rows, pol_cols, pol_vals = [], [], []
-        values = np.empty(batch_size, np.float32)
-        base = 0
-        for g_index, gen in enumerate(self.generations):
-            local = (picks[which == g_index] - bounds[g_index]).astype(np.int64)
-            if local.size == 0:
-                continue
-            n = local.size
-            pos, row = _ragged_gather(gen.obs_offset, local)
-            obs_rows.append(row + base)
-            obs_cols.append(gen.obs_index[pos].astype(np.int64))
-            obs_vals.append(gen.obs_value[pos])
-
-            pos, row = _ragged_gather(gen.policy_offset, local)
-            pol_rows.append(row + base)
-            pol_cols.append(gen.policy_index[pos].astype(np.int64))
-            pol_vals.append(gen.policy_prob[pos])
-
-            values[base : base + n] = gen.value[local]
-            base += n
-
-        return {
-            "obs_rows": np.concatenate(obs_rows),
-            "obs_cols": np.concatenate(obs_cols),
-            "obs_vals": np.concatenate(obs_vals),
-            "policy_rows": np.concatenate(pol_rows),
-            "policy_cols": np.concatenate(pol_cols),
-            "policy_vals": np.concatenate(pol_vals),
-            "value": values,
-        }
+        return _batch_from(
+            [
+                (gen, (picks[which == g_index] - bounds[g_index]).astype(np.int64))
+                for g_index, gen in enumerate(self.generations)
+            ]
+        )
 
     # ------------------------------------------------------------- diagnostics --
 

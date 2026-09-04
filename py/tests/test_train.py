@@ -105,6 +105,33 @@ def test_the_shipped_training_config_loads_and_uses_the_safe_slot_bound():
     assert config.gate.reference
 
 
+@pytest.mark.parametrize("name", ["train-2h", "train-big"])
+def test_the_phase4_configs_carry_the_scale_up(name):
+    """``PLAN.md`` §4.2, as an assertion. These are the changes the run is for, and a
+    config that quietly lost one of them would produce a result that means something else.
+    """
+    config = load_config(REPO / "configs" / f"{name}.toml")
+
+    # Change 3: the teacher was capped at 64 and this is the cap coming off.
+    assert config.selfplay.sims == 256
+    # Change 1: the threshold is the bug, and the sample size is what makes a lower one
+    # safe. Three refusals ended the first run; five is the new stopping rule.
+    assert config.gate.threshold == 0.52
+    assert config.gate.max_consecutive_refusals == 5
+    assert config.gate.min_decisive == config.gate.games // 10
+    # The gate measures the weights at the budget they are trained for.
+    assert config.gate.sims == config.selfplay.sims
+    # Change 2: a panel of `random` and `greedy` alone was saturated by generation 19.
+    assert any("gen016" in opponent for opponent in config.gate.reference)
+    # Changes 5 and 7.
+    assert config.train.lr_schedule
+    assert config.train.holdout_samples > 0
+    # A `buffer_samples` cap below the window silently truncates it, which is invisible in
+    # the readout. ~136 decisions a game, thinned by the stride.
+    window = config.train.buffer_generations * config.selfplay.games * 136 // config.train.sample_stride
+    assert config.train.buffer_samples >= window
+
+
 def test_the_gate_reads_decisive_games_not_half_points():
     """``FINDINGS.md`` F3.6, as an assertion.
 
@@ -127,6 +154,26 @@ def test_the_gate_reads_decisive_games_not_half_points():
     real = MatchResult(score=0.7, ci95=0.04, wins=120, losses=40, draws=40)
     assert real.decisive == 160
     assert real.decisive_score == 0.75
+
+
+def test_the_gate_reports_the_interval_around_its_decisive_score():
+    """``FINDINGS.md`` F3.7: the three refusals that ended the first run were every one of
+    them inside their own interval of even, and nothing in the readout said so while it was
+    happening. A gate whose interval straddles the threshold has not decided anything."""
+    from duel52.train.loop import MatchResult
+
+    # The first run's generation 17: 0.503 over 200 games, which is a coin.
+    undecided = MatchResult(score=0.503, ci95=0.069, wins=101, losses=99, draws=0)
+    assert 0.06 < undecided.decisive_ci95 < 0.08
+    assert undecided.decisive_score - undecided.decisive_ci95 < 0.5
+
+    # Four times the games is half the interval: the sample size is what buys a decision.
+    bigger = MatchResult(score=0.503, ci95=0.035, wins=404, losses=396, draws=0)
+    assert bigger.decisive_ci95 == pytest.approx(undecided.decisive_ci95 / 2, rel=0.02)
+
+    # Nothing decided is not a tight interval around 0.5; it is no interval at all.
+    assert MatchResult(score=0.5, ci95=0.0, wins=0, losses=0, draws=200).decisive_ci95 == 0.0
+    assert "±" in str(undecided)
 
 
 def test_the_gate_refuses_a_regression_against_the_reference_panel():
@@ -180,6 +227,88 @@ def test_the_gate_refuses_a_regression_against_the_reference_panel():
 def test_the_device_string_is_the_whole_handoff():
     assert resolve_device("cpu").type == "cpu"
     assert resolve_device("auto").type in {"mps", "cuda", "cpu"}
+
+
+# ============================================================ the learning rate ==
+
+
+def test_the_lr_schedule_is_keyed_to_the_generation_index():
+    """``PLAN.md`` §4.2 change 5. Keyed to the generation index and not to an optimiser
+    step count, because ``--resume`` rebuilds the Trainer and the step count does not
+    survive it — a step-keyed schedule silently restarts at full rate after an
+    interruption, which on a preemptible box is every few hours."""
+    from dataclasses import replace
+
+    from duel52.train.config import TrainConfig
+    from duel52.train.trainer import Trainer
+
+    config = TrainConfig()
+    config = replace(
+        config, train=replace(config.train, lr=2e-3, lr_schedule=[[0, 1.0], [20, 0.25], [38, 0.0625]])
+    )
+    trainer = Trainer.__new__(Trainer)  # lr_for reads the config and nothing else
+    trainer.config = config
+
+    assert trainer.lr_for(1) == pytest.approx(2e-3)
+    assert trainer.lr_for(19) == pytest.approx(2e-3)
+    assert trainer.lr_for(20) == pytest.approx(5e-4)      # the boundary is inclusive
+    assert trainer.lr_for(37) == pytest.approx(5e-4)
+    assert trainer.lr_for(38) == pytest.approx(1.25e-4)
+    assert trainer.lr_for(999) == pytest.approx(1.25e-4)
+
+    # An empty schedule is a constant rate, so every Phase 3 run reproduces unchanged.
+    trainer.config = replace(config, train=replace(config.train, lr_schedule=[]))
+    assert trainer.lr_for(0) == trainer.lr_for(50) == pytest.approx(2e-3)
+
+
+def test_an_lr_schedule_that_does_not_ascend_is_rejected():
+    """Out of order, the last matching entry wins and the decay silently runs backwards."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[train]\nlr_schedule = [[20, 0.25], [4, 1.0]]\n")
+        path = f.name
+    with pytest.raises(ValueError, match="ascend"):
+        load_config(path)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[train]\nlr_schedule = [[0, 1.0], [20, 0.0]]\n")
+        path = f.name
+    with pytest.raises(ValueError, match="positive"):
+        load_config(path)
+
+
+# ================================================================== warm start ==
+
+
+def test_a_warm_start_refuses_a_checkpoint_the_config_disagrees_with(tmp_path_factory, tmp_path):
+    """``[net]`` is ignored when a checkpoint is loaded — the shape comes from the file,
+    which is the only thing that can be right about it. That is correct on ``--resume`` and
+    a trap on ``--init-from``: someone asking for 6 blocks while inheriting a 3-block
+    checkpoint gets 3 blocks and no error."""
+    from dataclasses import replace
+
+    from duel52.nn.model import spec_for
+    from duel52.train.config import TrainConfig
+    from duel52.train.loop import TrainingLoop
+
+    checkpoint = _tiny_checkpoint(tmp_path_factory)  # width 32, blocks 1, value_hidden 16
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.spec = spec_for("split", 21)
+    loop.best = tmp_path / "best.d52nn"
+    loop.config = TrainConfig()  # the default 128 × 3
+
+    with pytest.raises(ValueError, match="silently mean nothing"):
+        loop._warm_start(checkpoint)
+    assert not loop.best.exists(), "a refused warm start must not leave an incumbent behind"
+
+    with pytest.raises(FileNotFoundError):
+        loop._warm_start(tmp_path / "nope.d52nn")
+
+    config = TrainConfig()
+    loop.config = replace(config, net=replace(config.net, width=32, blocks=1, value_hidden=16))
+    loop._warm_start(checkpoint)
+    assert loop.best.read_bytes() == checkpoint.read_bytes()
 
 
 # ============================================================= end to end, small ==
@@ -307,3 +436,137 @@ def test_a_few_steps_of_training_run_and_move_the_loss(shard):
     # gets below that within a few steps.
     assert stats.policy_first < np.log(spec["action_dim"]) + 0.5
     assert stats.policy_last < stats.policy_first
+
+
+# ==================================================================== the holdout ==
+
+
+@needs_engine
+def test_a_sliced_generation_is_the_same_rows_with_the_csr_rebased(shard):
+    """The slice is what lets a fixed holdout cost 8,000 samples instead of a whole
+    generation of self-play. Getting the re-basing wrong would pair observations with the
+    wrong policy targets — the same failure the ragged gather is guarded against."""
+    gen = load_generation(shard, 1)
+    piece = gen.slice(5, 15)
+
+    assert piece.samples == 10
+    assert piece.obs_offset[0] == 0 and piece.obs_offset[-1] == len(piece.obs_index)
+    assert piece.policy_offset[0] == 0 and piece.policy_offset[-1] == len(piece.policy_index)
+    assert np.array_equal(piece.value, gen.value[5:15])
+
+    # Row 0 of the slice is row 5 of the original — observation *and* policy target.
+    assert np.array_equal(
+        piece.obs_index[piece.obs_offset[0] : piece.obs_offset[1]],
+        gen.obs_index[gen.obs_offset[5] : gen.obs_offset[6]],
+    )
+    assert np.array_equal(
+        piece.policy_prob[piece.policy_offset[0] : piece.policy_offset[1]],
+        gen.policy_prob[gen.policy_offset[5] : gen.policy_offset[6]],
+    )
+
+    # Scoring a holdout means covering it exactly once, not sampling it with replacement.
+    assert sum(len(b["value"]) for b in piece.batches(4)) == piece.samples
+
+    with pytest.raises(ValueError):
+        gen.slice(0, gen.samples + 1)
+
+
+@needs_engine
+def test_the_holdout_is_carved_off_the_front_and_never_reaches_the_buffer(shard):
+    """The whole value of the number is that it was never trained on, and "held out except
+    after a restart" is not a distinction anyone would notice in a log file. So the carve
+    happens on the way into the buffer, on every path in."""
+    from dataclasses import replace
+
+    from duel52.train.config import TrainConfig
+    from duel52.train.loop import HOLDOUT_GENERATION, TrainingLoop
+
+    keep = 8
+    config = TrainConfig()
+    config = replace(config, train=replace(config.train, holdout_samples=keep, sample_stride=1))
+    full = load_generation(shard, HOLDOUT_GENERATION, stride=1)
+
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.config = config
+    loop.holdout = None
+    loop.buffer = ReplayBuffer(max_generations=4, max_samples=10**6, stride=1)
+
+    trained_on = loop._replay_into_buffer(shard, HOLDOUT_GENERATION)
+    assert loop.holdout.samples == keep
+    assert trained_on.samples == full.samples - keep
+    # The two partition the shard, and the holdout is its front.
+    assert np.array_equal(loop.holdout.value, full.value[:keep])
+    assert np.array_equal(trained_on.value, full.value[keep:])
+    assert loop.buffer.samples == full.samples - keep
+
+    # Only the first generation is carved; every later one goes in whole.
+    loop._replay_into_buffer(shard, HOLDOUT_GENERATION + 1)
+    assert loop.buffer.generations[-1].samples == full.samples
+    assert loop.holdout.samples == keep
+
+
+@needs_engine
+def test_the_optimiser_moments_survive_a_round_trip(shard, tmp_path):
+    """``--resume`` rebuilds the Trainer from ``best.d52nn``, which carries weights and
+    nothing else. Without this, every interruption throws away AdamW's momentum."""
+    from dataclasses import replace
+
+    import torch
+
+    from duel52.nn.model import spec_for
+    from duel52.train.config import TrainConfig
+    from duel52.train.trainer import Trainer
+
+    spec = spec_for("split", 21)
+    config = TrainConfig()
+    config = replace(
+        config,
+        net=replace(config.net, width=32, blocks=1, value_hidden=16),
+        train=replace(config.train, device="cpu", batch_size=32),
+    )
+    buffer = ReplayBuffer(max_generations=1, max_samples=10**6)
+    buffer.add(shard, 1)
+
+    trainer = Trainer(config, spec)
+    assert not trainer.load_optimizer(tmp_path / "absent.pt"), "nothing to restore is not an error"
+    trainer.fit(buffer, np.random.default_rng(1), steps=3)
+    path = trainer.save_optimizer(tmp_path / "optimizer.pt")
+
+    fresh = Trainer(config, spec)
+    assert not fresh.optimizer.state_dict()["state"], "a cold AdamW has no moments at all"
+    assert fresh.load_optimizer(path)
+    warm, cold = trainer.optimizer.state_dict()["state"], fresh.optimizer.state_dict()["state"]
+    assert warm.keys() == cold.keys()
+    assert torch.allclose(warm[0]["exp_avg"], cold[0]["exp_avg"])
+    assert torch.allclose(warm[0]["exp_avg_sq"], cold[0]["exp_avg_sq"])
+
+
+@needs_engine
+def test_the_held_out_score_is_a_number_the_training_batches_cannot_produce(shard):
+    """``PLAN.md`` §4.2 change 7. Not a claim that the value head improves — a claim that
+    the holdout is scored end to end and reports one sample's worth of loss per sample."""
+    from dataclasses import replace
+
+    from duel52.nn.model import spec_for
+    from duel52.train.config import TrainConfig
+    from duel52.train.trainer import Trainer
+
+    spec = spec_for("split", 21)
+    config = TrainConfig()
+    config = replace(
+        config,
+        net=replace(config.net, width=32, blocks=1, value_hidden=16),
+        train=replace(config.train, device="cpu", batch_size=16),
+    )
+    holdout = load_generation(shard, 1).slice(0, 40)
+    trainer = Trainer(config, spec)
+
+    stats = trainer.evaluate(holdout)
+    assert stats.samples == 40
+    # A tanh head against a ±1 target cannot do worse than 4, and an untrained one sits
+    # near 1. The policy loss is a cross-entropy over `action_dim` logits.
+    assert 0.0 <= stats.value_mse <= 4.0
+    assert 0.0 < stats.policy_loss < np.log(spec["action_dim"]) + 0.5
+    # A short last batch must not get a full batch's weight: 40 samples in batches of 16 is
+    # 16 + 16 + 8, so an unweighted mean would be a different number.
+    assert trainer.evaluate(holdout.slice(0, 32)).samples == 32

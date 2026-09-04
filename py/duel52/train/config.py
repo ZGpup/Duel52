@@ -111,6 +111,43 @@ class TrainSettings:
     sample_stride: int = 2
     buffer_generations: int = 4
     buffer_samples: int = 900_000
+    #: Piecewise learning-rate decay, as ``[[from_generation, multiplier], ...]`` ascending.
+    #: The multiplier in force is the last entry whose ``from_generation`` the current
+    #: generation has reached, so ``[[0, 1.0], [20, 0.25], [38, 0.0625]]`` is
+    #: ``PLAN.md`` §4.2 change 5 for a 50-generation run. Empty means a constant ``lr``,
+    #: which is what every Phase 3 run used.
+    #:
+    #: **Keyed to the generation index, not to an optimiser step count**: ``--resume``
+    #: rebuilds the ``Trainer`` and the step count does not survive it, so a step-keyed
+    #: schedule silently restarts at full learning rate after every interruption. The
+    #: generation index is reconstructed from ``log.jsonl``, which does survive.
+    lr_schedule: list[list[float]] = field(default_factory=list)
+    #: Samples carved out of the run's **first** shard and never trained on, scored every
+    #: generation (``PLAN.md`` §4.2 change 7). 0 disables it.
+    #:
+    #: Fixed rather than rolling, deliberately. The per-generation value loss in
+    #: ``runs/third/log.jsonl`` is computed on batches drawn from a replay window that
+    #: slides underneath it, so a flat curve is ambiguous between "the value head learned
+    #: all it can" and "the positions got harder". A holdout that never changes removes the
+    #: second reading. The cost is that it drifts off-policy as the net improves — it
+    #: measures the same question getting answered better, not the current question.
+    holdout_samples: int = 0
+
+    def __post_init__(self) -> None:
+        previous = -1
+        for entry in self.lr_schedule:
+            if len(entry) != 2:
+                raise ValueError(
+                    f"[train] lr_schedule entries are [from_generation, multiplier]; got {entry!r}"
+                )
+            start, multiplier = int(entry[0]), float(entry[1])
+            if start <= previous:
+                raise ValueError(
+                    f"[train] lr_schedule must ascend by from_generation; {start} follows {previous}"
+                )
+            if multiplier <= 0:
+                raise ValueError(f"[train] lr_schedule multiplier must be positive; got {multiplier}")
+            previous = start
 
 
 @dataclass(frozen=True)

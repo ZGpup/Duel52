@@ -98,6 +98,16 @@ cargo test                               # 311 tests: rules, determinism, inform
 .venv/bin/python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first \
     --resume                                                      # continue after a stop
 
+# Phase 4 — the scale-up. `check` also prints the gate's statistical power, the LR schedule
+# and the held-out size, which is the five seconds that tells you whether the run can decide
+# anything. `--init-from` starts from a shipped checkpoint instead of a random init, and
+# refuses one whose trunk disagrees with [net].
+.venv/bin/python -m duel52.train check --config configs/train-2h.toml
+.venv/bin/python -m duel52.train run   --config configs/train-2h.toml --run-dir runs/fourth \
+    --init-from models/duel52-split-gen016.d52nn                  # 2 h on the laptop
+./target/release/duel52 match --a netmcts:runs/fourth/checkpoints/best.d52nn@256 \
+    --b netmcts:models/duel52-split-gen016.d52nn@256 --games 400 --encoding-slots 21
+
 # The pieces, runnable on their own when something looks wrong.
 ./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \
     --out /tmp/gen.d52sp --games 200 --sims 64 --encoding-slots 21
@@ -141,9 +151,13 @@ Add `--encoding-slots 21` to both the `init` and the `duel52` command if you hit
 must match, because `encoding_slots` is what fixes `obs_dim`.
 
 Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
-`split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml` is a *training*
-config rather than a game config — it carries the loop's knobs and sets
-`encoding_slots = 21`, which every command in that run must agree on.
+`split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml`, `train-2h.toml`
+and `train-big.toml` are *training* configs rather than game configs — they carry the loop's
+knobs and set `encoding_slots = 21`, which every command in that run must agree on.
+`train-fast` is Phase 3's shakedown and produced gen016; `train-2h` is Phase 4 on a laptop and
+**warm-starts from gen016**, which is why its trunk is pinned to `128 × 3`; `train-big` is the
+24-hour rented-box run and is the only one of the three that trains a `128 × 6` trunk from
+scratch. `PLAN.md` §4.5 is the order to run them in.
 
 ## Where things are
 

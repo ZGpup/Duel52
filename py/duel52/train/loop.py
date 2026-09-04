@@ -42,6 +42,7 @@ throughout. Two changes, both aimed at that:
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -53,11 +54,16 @@ from pathlib import Path
 import numpy as np
 
 from ..nn.model import spec_for
-from .buffer import ReplayBuffer
+from .buffer import Generation, ReplayBuffer, load_generation
 from .config import TrainConfig
 from .trainer import Trainer
 
 __all__ = ["MatchResult", "TrainingLoop", "run_loop"]
+
+#: Which generation's shard the fixed holdout is carved from. The first one, always: it is
+#: the only generation guaranteed to exist for the whole run, and ``--resume`` can rebuild
+#: the holdout from it without needing to remember anything. See ``TrainSettings``.
+HOLDOUT_GENERATION = 1
 
 #: `MatchStats::report` in `engine/src/ladder.rs`. Parsed rather than re-derived so the
 #: score the loop gates on is literally the score the CLI prints.
@@ -92,10 +98,30 @@ class MatchResult:
         """
         return 0.5 if self.decisive == 0 else self.wins / self.decisive
 
+    @property
+    def decisive_ci95(self) -> float:
+        """95% interval on :attr:`decisive_score`, from the decisive games alone.
+
+        Conservative — the mirror match is colour-paired on a fixed seed, so the real
+        interval is tighter than this — and reported anyway, because ``FINDINGS.md`` F3.7's
+        three run-ending refusals were every one of them inside their own interval of even
+        and nothing in the readout said so while the run was live. A gate whose interval
+        straddles the threshold is a gate that is not deciding anything.
+        """
+        if self.decisive == 0:
+            return 0.0
+        p = self.wins / self.decisive
+        return 1.96 * math.sqrt(max(p * (1.0 - p), 1e-12) / self.decisive)
+
     def __str__(self) -> str:
         return (
             f"{self.score:.3f} ± {self.ci95:.3f} (W{self.wins} L{self.losses} D{self.draws}"
-            + (f", decisive {self.decisive_score:.3f})" if self.decisive else ", none decisive)")
+            + (
+                f", decisive {self.decisive_score:.3f} ± {self.decisive_ci95:.3f} "
+                f"of {self.decisive})"
+                if self.decisive
+                else ", none decisive)"
+            )
         )
 
 
@@ -118,12 +144,20 @@ def _hms(seconds: float) -> str:
 
 
 class TrainingLoop:
-    def __init__(self, config: TrainConfig, run_dir: Path, *, resume: bool = False):
+    def __init__(
+        self,
+        config: TrainConfig,
+        run_dir: Path,
+        *,
+        resume: bool = False,
+        init_from: str | Path | None = None,
+    ):
         self.config = config
         self.run_dir = run_dir
         self.shards = run_dir / "shards"
         self.checkpoints = run_dir / "checkpoints"
         self.log_path = run_dir / "log.jsonl"
+        self.baseline_path = run_dir / "baseline.json"
         for d in (self.run_dir, self.shards, self.checkpoints):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -144,6 +178,10 @@ class TrainingLoop:
         self.history: list[dict] = []
         self.generation = 0
         self.best = self.checkpoints / "best.d52nn"
+        self.optimizer_state = self.checkpoints / "optimizer.pt"
+        #: Samples carved off generation 1's shard and never trained on. ``None`` when
+        #: ``train.holdout_samples`` is 0, or before generation 1 has been played.
+        self.holdout: Generation | None = None
         #: **High-water mark** per reference opponent — the best score any promoted
         #: checkpoint has managed, not the incumbent's current one.
         #:
@@ -166,9 +204,21 @@ class TrainingLoop:
             for h in recent:
                 shard = self.shards / f"gen{h['generation']:03d}.d52sp"
                 if shard.exists():
-                    self.buffer.add(shard, h["generation"])
+                    self._replay_into_buffer(shard, h["generation"])
             if self.buffer.generations:
                 say(f"  refilled the buffer with {self.buffer.samples:,} samples from disk")
+            # The holdout is derived from generation 1's shard, so it survives a resume
+            # without being stored — but only if that shard is still on disk, and after a
+            # few generations it is no longer in the window that was just refilled.
+            self._rebuild_holdout()
+            # A warm-started run's veto baseline is the checkpoint it started from, which
+            # is in `baseline.json` and in no history record.
+            if self.baseline_path.exists():
+                stored = json.loads(self.baseline_path.read_text()).get("reference", {})
+                for name, score in stored.items():
+                    self.reference_best[name] = max(
+                        self.reference_best.get(name, float(score)), float(score)
+                    )
             # The veto needs the incumbent's reference scores; the last promoted generation
             # is where they are. Without this a resumed run would promote its first
             # candidate unconditionally, which is the hole the veto exists to close.
@@ -179,12 +229,104 @@ class TrainingLoop:
                             self.reference_best.get(name, float(score)), float(score)
                         )
         if not resume:
-            (run_dir / "train.toml.used").write_text(json.dumps(config.as_dict(), indent=2))
+            if init_from is not None:
+                self._warm_start(Path(init_from))
+            used = dict(config.as_dict())
+            used["init_from"] = str(init_from) if init_from is not None else None
+            (run_dir / "train.toml.used").write_text(json.dumps(used, indent=2))
 
         self.trainer = Trainer(config, self.spec, self.best if self.best.exists() else None)
         if not self.best.exists():
             self.trainer.save(self.best)
             say(f"initialised {self.best} — {sum(p.numel() for p in self.trainer.model.parameters()):,} parameters")
+        if resume and self.trainer.load_optimizer(self.optimizer_state):
+            say(f"  restored the optimiser moments from {self.optimizer_state}")
+
+        # A warm start begins with an incumbent that has no history, so the reference panel
+        # has no high-water mark to veto against and the first candidate would be promoted
+        # on the mirror match alone. Measuring the incumbent once closes that, and it is
+        # also the row every later generation's reference column is read against.
+        if init_from is not None and not resume and self.config.gate.reference:
+            self._measure_baseline(Path(init_from))
+
+    # ---------------------------------------------------------------- warm start --
+
+    def _warm_start(self, checkpoint: Path) -> None:
+        """Begin the run from an existing checkpoint instead of from a random init.
+
+        The incumbent is a file, so this is a copy — but a checked one. A checkpoint whose
+        trunk does not match ``[net]`` would load anyway (the shape comes from the
+        checkpoint, which is the only thing that can be right about it) and the config's
+        ``blocks``/``width`` would silently mean nothing, which is precisely the class of
+        quiet mismatch the layout hashes exist to prevent elsewhere.
+        """
+        from ..nn.checkpoint import read_checkpoint
+
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"--init-from {checkpoint} does not exist")
+        ckpt = read_checkpoint(checkpoint)
+        ckpt.check_against(self.spec)  # variant, encoding_slots, both layout hashes
+        net = self.config.net
+        have = (ckpt.width, ckpt.blocks, ckpt.value_hidden)
+        want = (net.width, net.blocks, net.value_hidden)
+        if have != want:
+            raise ValueError(
+                f"--init-from {checkpoint} is width={ckpt.width} blocks={ckpt.blocks} "
+                f"value_hidden={ckpt.value_hidden}, but [net] asks for width={net.width} "
+                f"blocks={net.blocks} value_hidden={net.value_hidden}. The checkpoint would "
+                f"win and [net] would silently mean nothing — change one of them."
+            )
+        shutil.copyfile(checkpoint, self.best)
+        say(f"warm start from {checkpoint} — {ckpt.width}×{ckpt.blocks} trunk, kept as the incumbent")
+
+    def _measure_baseline(self, checkpoint: Path) -> None:
+        """Score the warm-start checkpoint on the reference panel, once, before generation 1."""
+        say(f"  scoring the starting checkpoint on the reference panel ({self.config.gate.reference_games} games each)")
+        scores = self.reference_scores(self.best)
+        for name, score in scores.items():
+            self.reference_best[name] = max(self.reference_best.get(name, score), score)
+        self.baseline_path.write_text(
+            json.dumps({"init_from": str(checkpoint), "reference": scores}, indent=2)
+        )
+        say("  baseline    " + " · ".join(f"vs {n} {s:.3f}" for n, s in scores.items()))
+
+    # ------------------------------------------------------------------- holdout --
+
+    def _replay_into_buffer(self, path: Path, generation: int) -> Generation:
+        """Replay a shard into the training buffer, carving the fixed holdout off the front
+        of generation 1's.
+
+        The carve happens on the way in, on every path into the buffer — the live one and
+        the refill after a ``--resume`` — so a holdout sample cannot reach a gradient step
+        by a back door. That is the whole value of the number: it is only a held-out score
+        if it was never trained on, and "it was held out except after a restart" is not a
+        distinction anyone would notice in a log file.
+        """
+        cfg = self.config.train
+        want = cfg.holdout_samples
+        if want <= 0 or generation != HOLDOUT_GENERATION:
+            return self.buffer.add(path, generation)
+
+        full = load_generation(path, generation, stride=cfg.sample_stride, threads=self.config.run.threads)
+        keep = min(want, full.samples // 2)  # never hold out more than half a generation
+        if keep < want:
+            say(f"  holdout     {full.samples:,} samples in the shard; holding out {keep:,} rather than {want:,}")
+        self.holdout = full.slice(0, keep)
+        return self.buffer.append(full.slice(keep, full.samples))
+
+    def _rebuild_holdout(self) -> None:
+        """Re-derive the holdout after a resume. Deterministic — it is a prefix of a shard
+        that is still on disk — so nothing about it needs storing."""
+        if self.config.train.holdout_samples <= 0 or self.holdout is not None:
+            return
+        shard = self.shards / f"gen{HOLDOUT_GENERATION:03d}.d52sp"
+        if not shard.exists():
+            say(f"  no {shard.name} on disk — the held-out score is unavailable for this run")
+            return
+        cfg = self.config.train
+        full = load_generation(shard, HOLDOUT_GENERATION, stride=cfg.sample_stride, threads=self.config.run.threads)
+        self.holdout = full.slice(0, min(cfg.holdout_samples, full.samples // 2))
+        say(f"  rebuilt the {self.holdout.samples:,}-sample holdout from {shard.name}")
 
     # ------------------------------------------------------------- engine calls --
 
@@ -298,7 +440,7 @@ class TrainingLoop:
             f"P0 {sp['p0']:.0f}% P1 {sp['p1']:.0f}% draw {sp['draw']:.0f}%"
         )
 
-        gen = self.buffer.add(shard, g)
+        gen = self._replay_into_buffer(shard, g)
         won, drew, lost = self.buffer.value_target_mix()
         say(
             f"  buffer      {self.buffer.samples:,} samples over {len(self.buffer.generations)} "
@@ -306,12 +448,25 @@ class TrainingLoop:
             f"value targets win {won:.0%} draw {drew:.0%} loss {lost:.0%}"
         )
 
-        stats = self.trainer.fit(self.buffer, self.rng, self.config.train.steps_per_generation)
+        stats = self.trainer.fit(
+            self.buffer, self.rng, self.config.train.steps_per_generation, generation=g
+        )
         say(
-            f"  train       {stats.steps} steps · policy {stats.policy_first:.3f} → {stats.policy_last:.3f} "
+            f"  train       {stats.steps} steps · lr {stats.lr:.2e} · "
+            f"policy {stats.policy_first:.3f} → {stats.policy_last:.3f} "
             f"(mean {stats.policy_mean:.3f}) · value {stats.value_first:.3f} → {stats.value_last:.3f} "
             f"(mean {stats.value_mean:.3f}) · {_hms(stats.seconds)}"
         )
+
+        # The value head is the half that plateaued in the first run (`PLAN.md` §4.2 change
+        # 7), and the training-batch number could not say so unambiguously because the
+        # window slides underneath it. This one is fixed and was never trained on.
+        held = self.trainer.evaluate(self.holdout) if self.holdout is not None else None
+        if held is not None:
+            say(
+                f"  held-out    {held.samples:,} samples · value MSE {held.value_mse:.4f} · "
+                f"policy {held.policy_loss:.3f}"
+            )
 
         candidate = self.checkpoints / f"gen{g:03d}.d52nn"
         self.trainer.save(candidate)
@@ -352,17 +507,26 @@ class TrainingLoop:
                 f"{gate.max_consecutive_refusals}"
             )
 
+        # The optimiser's moments are saved whether or not the candidate was promoted: a
+        # refusal rolls back the weights and deliberately keeps the momentum.
+        self.trainer.save_optimizer(self.optimizer_state)
+
         record = {
             "generation": g,
             "seconds": time.perf_counter() - started,
             "selfplay": sp,
             "buffer_samples": self.buffer.samples,
             "value_mix": {"win": won, "draw": drew, "loss": lost},
+            "lr": stats.lr,
             "policy_loss": stats.policy_mean,
             "value_loss": stats.value_mean,
+            "holdout_samples": held.samples if held else 0,
+            "holdout_policy_loss": held.policy_loss if held else None,
+            "holdout_value_mse": held.value_mse if held else None,
             "gate_score": mirror.score,
             "gate_decisive_score": mirror.decisive_score,
             "gate_decisive_games": mirror.decisive,
+            "gate_decisive_ci95": mirror.decisive_ci95,
             "gate_ci95": mirror.ci95,
             "gate_reason": why,
             "promoted": promoted,
@@ -423,18 +587,22 @@ class TrainingLoop:
         if not self.history:
             return
         say(
-            f"{'gen':>4} {'draw%':>6} {'decisive':>9} {'promo':>6} {'policy':>8} {'value':>7}"
-            "  reference"
+            f"{'gen':>4} {'draw%':>6} {'decisive':>16} {'promo':>6} {'policy':>8} {'value':>7} "
+            f"{'held-out':>9}  reference"
         )
         for h in self.history:
             marks = " ".join(f"{k}={v:.3f}" for k, v in h.get("benchmarks", {}).items())
             decisive = h.get("gate_decisive_games", 0)
             score = h.get("gate_decisive_score")
-            cell = f"{score:.3f}" if decisive else "—"
+            # Score and interval together: a gate whose interval straddles the threshold
+            # did not decide anything, and F3.7 is three of those in a row.
+            cell = f"{score:.3f}±{h.get('gate_decisive_ci95', 0.0):.3f}" if decisive else "—"
+            mse = h.get("holdout_value_mse")
             say(
                 f"{h['generation']:>4} {h['selfplay'].get('draw', 0):>5.0f}% "
-                f"{cell:>9} {'yes' if h['promoted'] else 'no':>6} "
-                f"{h['policy_loss']:>8.3f} {h['value_loss']:>7.3f}  {marks}"
+                f"{cell:>16} {'yes' if h['promoted'] else 'no':>6} "
+                f"{h['policy_loss']:>8.3f} {h['value_loss']:>7.3f} "
+                f"{(f'{mse:.4f}' if mse is not None else '—'):>9}  {marks}"
             )
         say(
             "\nNext: the real measurement is the frozen ladder —\n"
@@ -463,5 +631,11 @@ def _parse_selfplay(text: str) -> dict:
     return out
 
 
-def run_loop(config: TrainConfig, run_dir: Path, *, resume: bool = False) -> None:
-    TrainingLoop(config, run_dir, resume=resume).run()
+def run_loop(
+    config: TrainConfig,
+    run_dir: Path,
+    *,
+    resume: bool = False,
+    init_from: str | Path | None = None,
+) -> None:
+    TrainingLoop(config, run_dir, resume=resume, init_from=init_from).run()
