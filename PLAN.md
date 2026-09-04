@@ -318,18 +318,37 @@ each of its two branches ([duel52.rs:886](engine/src/bin/duel52.rs#L886) for the
 [duel52.rs:981](engine/src/bin/duel52.rs#L981) for the human), so `--record <file>` is a
 position lookup and an append.
 
-- [ ] **[code] `duel52 play --record <file>`** — append one line per game:
+- [x] **[code] `duel52 play --record <file>`** — append one line per game:
       config, seed, which seat the human took, the opponent spec, the chosen-index sequence,
       and the outcome. **Plain text (JSONL), not `.d52sp`.** A human decision has no visit
       distribution and no root value, and the shard format's invariant is that every row
       carries a policy target — a shard that can hold rows without one is a shard the trainer
       can silently train on. Keep the corpus format strict and let human games be a different,
       inspectable, git-committable few kilobytes.
-- [ ] **[code] `duel52 replay --record <file> --game N`** — walk a recorded game ply by ply,
+      **Measured: a 153-ply game is 918 bytes.** Only *finished* games are written — a
+      half-played game cannot be checked against an outcome, and that check is what makes a
+      record trustworthy later, so quitting prints the seed instead. `engine/src/record.rs`,
+      with its own hand-rolled JSON (the engine has no dependencies, deliberately).
+- [x] **[code] `duel52 replay --record <file> --game N`** — walk a recorded game ply by ply,
       and at each of the human's decisions print what the net thought: the value head's score
       for the side to move, the policy prior over the legal actions, and what `netmcts` would
       have played at a given budget. This is the instrument §4.0's analysis needs, and it is
       also a rules-checking tool: a disagreement you can point at, in a position you remember.
+      Bare `--record <file>` prints the index; `--game N` walks one; `--ply N` also prints
+      the board at that ply, from the view the player had when they chose it. The checkpoint
+      and budget default to **the agent that was actually played**, so `replay --game 1` says
+      what your opponent thought; `--checkpoint` overrides it, which is how an old game
+      becomes a fixed evaluation set for a new net. The run ends with the plies §4.0a asks
+      for: where the value head was confident (`|v| > 0.6`) in the side that went on to lose.
+      ⚠️ The search in a replay is a **fresh** one, not the one that played the game — an
+      agent's RNG stream depends on how often it has been called. That is right for analysing
+      the *human's* decisions, which is the point; the bot's own moves are in the record.
+- [x] **[code] The record is verified, not merely decoded.** `GameRecord::walk` replays
+      against a fresh engine and refuses the record unless every index was in range, the game
+      ended exactly when the moves ran out, and the outcome matches what was written down. So
+      a rules change turns the corpus into a loud failure rather than into games nobody
+      played — the same argument as the checkpoint header's layout hashes. Thirteen named
+      tests in `engine/tests/record.rs`.
 - [ ] **Then play six games**, three in each seat, seeds recorded. `@4096` is the strongest
       measured setting (F3.8) and costs well under a second a move:
 
@@ -667,7 +686,7 @@ fewer, larger generations is the wrong direction.
 Everything here is small, and all of it should be done and committed **on the Mac**, because
 debugging on a metered box is the expensive way to do it.
 
-- [ ] **`duel52 play --record` and `duel52 replay`** (§4.0). First, because they are the
+- [x] **`duel52 play --record` and `duel52 replay`** (§4.0). First, because they are the
       instrument for the exit criterion and they cost nothing to run.
 - [x] **Held-out value MSE, logged per generation** (§4.2 change 7). `train.holdout_samples`
       carves a fixed prefix off generation 1's shard, never trains on it, and scores it every
@@ -761,7 +780,7 @@ should be spent knowing that.
 
 ```bash
 # 1. Toolchain + build. The README has the rustup line.
-cargo build --release && cargo test          # 301 tests. This is the handoff proof:
+cargo build --release && cargo test          # 325 tests. This is the handoff proof:
                                              # the box computes the same game or it does not.
 python3 -m venv .venv && .venv/bin/pip install -q maturin pytest torch numpy
 .venv/bin/maturin develop --release

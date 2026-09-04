@@ -62,7 +62,7 @@ Read `game_rules.md` before touching engine code. These five trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 311 tests: rules, determinism, information hiding,
+cargo test                               # 325 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, and the training corpus
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
@@ -72,6 +72,16 @@ cargo test                               # 311 tests: rules, determinism, inform
 ./target/release/duel52 play --opponent human              # hotseat
 ./target/release/duel52 powers                             # card-power reference
 ./target/release/duel52 demo --seed 47                     # watch a random game, ply by ply
+
+# Record what you played, then ask the net about it (PLAN.md §4.0). A game is
+# (config, seed, chosen indices), so a 153-ply game is 918 bytes and replays exactly —
+# hidden information included. Only finished games are written.
+./target/release/duel52 play --encoding-slots 21 --seed 101 \
+    --record games/owner-vs-gen006.jsonl \
+    --opponent netmcts:runs/fourth/checkpoints/gen006.d52nn@4096
+./target/release/duel52 replay --record games/owner-vs-gen006.jsonl            # the index
+./target/release/duel52 replay --record games/owner-vs-gen006.jsonl --game 1   # walk it
+./target/release/duel52 replay --record games/owner-vs-gen006.jsonl --game 1 --ply 34
 
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
@@ -170,6 +180,7 @@ scratch. `PLAN.md` §4.5 is the order to run them in.
 | `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 5 probes |
 | `engine/src/display.rs` | Rendering a board and an action for one observer. The only place lanes and cards are numbered from 1, and the only definition of the order a lane's cards are drawn in (`column_slots`). `Focus` is the red highlight the CLI puts on a card while its number is being typed — decoration only, and it can never add a character to the board |
 | `engine/src/menu.rs` | Reshapes the flat legal-action list into the CLI's question tree — verb, then card, then lane only when the card is in more than one — with every verb and lane number fixed to the thing it picks. `Menu::focus` turns a number back into the cards it names, which is what the board highlights |
+| `engine/src/record.rs` | The JSONL game record: `(config, seed, chosen indices)` replays a game exactly. `walk` **verifies** rather than decodes — a record that no longer reproduces its own outcome is refused, which is what stops a rules change turning the corpus into games nobody played. Hand-rolled JSON, because the engine has no dependencies |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
 | `engine/src/encode.rs` | Observation and action tensors, and the layout hashes that pin them |
 | `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass |

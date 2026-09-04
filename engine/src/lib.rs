@@ -46,6 +46,7 @@
 //! | [`elo`] | Fitting ratings to a round-robin result table |
 //! | [`ladder`] | Running the round-robin, in parallel |
 //! | [`probe`] | Strategic measurement — the Phase 2 deliverable |
+//! | [`record`] | Recording a played game as JSONL, and replaying it exactly |
 //! | [`selfplay`] | Self-play generation, and the `.d52sp` trajectory shard |
 //! | [`stats`] | Random-vs-random measurement — the Phase 1 deliverable |
 //! | [`testkit`] | Building positions by hand, for the rules tests and Phase 5 probes |
@@ -85,6 +86,7 @@ pub mod outcome;
 pub mod player;
 pub mod probe;
 pub mod rank;
+pub mod record;
 pub mod rng;
 pub mod selfplay;
 pub mod state;
@@ -110,6 +112,7 @@ pub use encode::{
 };
 pub use outcome::{DrawReason, Outcome};
 pub use player::Player;
+pub use record::GameRecord;
 pub use rank::{rank_counts, Rank, RankCounts};
 pub use rng::Rng;
 pub use state::{GameState, Lane, Pending, Pile, ResolveKind};

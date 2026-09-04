@@ -12,6 +12,7 @@
 //! Run `duel52 help` for usage.
 
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::path::PathBuf;
 
 use duel52_engine::agents::Agent;
 use duel52_engine::display::{
@@ -19,8 +20,8 @@ use duel52_engine::display::{
 };
 use duel52_engine::nn::Evaluator;
 use duel52_engine::{
-    ladder, menu, stats, Action, AgentSpec, GameConfig, GameState, Outcome, Player, Rank,
-    RandomAgent, TwoPower, Variant, VERSION,
+    ladder, menu, record, stats, Action, AgentSpec, GameConfig, GameRecord, GameState, Outcome,
+    Player, Rank, RandomAgent, TwoPower, Variant, VERSION,
 };
 
 fn main() {
@@ -29,6 +30,7 @@ fn main() {
 
     let result = match command {
         "play" => cmd_play(&args[1..]),
+        "replay" => cmd_replay(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "demo" => cmd_demo(&args[1..]),
         "ladder" => cmd_ladder(&args[1..]),
@@ -65,6 +67,7 @@ fn usage() -> String {
 
 USAGE
   duel52 play    [options]        play against the engine in the terminal
+  duel52 replay  [options]        walk a recorded game and see what the net thought
   duel52 demo    [options]        watch one random-vs-random game, ply by ply
   duel52 stats   [options]        random-vs-random statistics (Phase 1 deliverable)
   duel52 ladder  [options]        round-robin Elo over the agent ladder (Phase 2)
@@ -110,6 +113,23 @@ OPTIONS
                                   scrollback, which is what you want when checking a rule.
                                   Turns off the live highlight, which is a redraw per
                                   keystroke. `NO_COLOR` turns off the colour alone.
+  --record <file>                 append this game to a JSONL record when it finishes.
+                                  A game is (config, seed, chosen indices), so the file
+                                  replays it exactly — hidden information included — in a
+                                  few hundred bytes. Only finished games are written.
+
+  replay only:
+  --record <file>                 the JSONL file written by `play --record` (required)
+  --game <n>                      which game in it, 1-based. Omit for the index.
+  --ply <n>                       also print the full board at that ply
+  --checkpoint <file>             score with this .d52nn instead of the one that was
+                                  played, which is how an old game becomes a fixed
+                                  evaluation set for a new net
+  --sims <n>                      search budget for the second opinion (default: the
+                                  recorded opponent's; 0 turns the search off)
+  --all-plies                     score the bot's decisions too, not only yours
+  --reveal                        describe moves from ground truth rather than from what
+                                  the player could see at the time
 
   stats only:
   --all                           run all three variants, and both settings of the 2
@@ -165,6 +185,13 @@ struct Options {
     reveal: bool,
     /// Keep the transcript instead of redrawing over it. `play` only.
     no_clear: bool,
+    /// JSONL file to append finished games to (`play`), or to read them from (`replay`).
+    /// `--sims`, `--checkpoint` and `--all-plies` are peeled off by `cmd_replay` itself,
+    /// the way `cmd_selfplay` handles its own, because those names already mean something
+    /// else under `selfplay` and `nn-dump`.
+    record: Option<PathBuf>,
+    /// Which game in a record to walk. 1-based, matching the file's line numbers.
+    game: Option<usize>,
     /// `None` means "the command's own default", which differs between `stats` (cheap) and
     /// the Phase 2 commands (expensive).
     games: Option<usize>,
@@ -186,6 +213,8 @@ impl Default for Options {
             opponent: Some(AgentSpec::Random),
             reveal: false,
             no_clear: false,
+            record: None,
+            game: None,
             games: None,
             all: false,
             markdown: false,
@@ -316,6 +345,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                     other => Some(AgentSpec::parse(other)?),
                 };
             }
+            "--record" => opts.record = Some(next_value(args, &mut i, "--record")?.into()),
+            "--game" => opts.game = Some(next_number(args, &mut i, "--game")?),
             "--reveal" => opts.reveal = true,
             "--no-clear" => opts.no_clear = true,
             "--all" => opts.all = true,
@@ -1107,6 +1138,11 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         log: Vec::new(),
     };
 
+    // The whole recording, as it accumulates: one index into `legal_actions()` per decision,
+    // both sides. `PLAN.md` §4.0 — the engine is deterministic, so this plus the config and
+    // the seed replays the game exactly, hidden information included.
+    let mut moves: Vec<usize> = Vec::new();
+
     while !state.outcome.is_over() {
         let acting = state.acting_player();
         let human_turn = bot.is_none() || acting == opts.human;
@@ -1114,6 +1150,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         if let (false, Some(bot)) = (human_turn, bot.as_mut()) {
             let legal = state.legal_actions();
             let action = bot.choose(&state, &legal);
+            record_choice(&mut moves, &legal, action);
             screen.note(&state, format!("-- {acting} (bot): "), action);
             state.apply_trusted(action);
             continue;
@@ -1160,6 +1197,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                 Err(e) => return Err(format!("cannot read input: {e}")),
                 Ok(Key::Eof) => {
                     println!("\n(end of input)");
+                    print_unrecorded(&opts, state.seed);
                     return Ok(());
                 }
                 // Still typing. Round the loop to redraw with the new highlight.
@@ -1176,6 +1214,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                 "" => continue,
                 "q" | "quit" | "exit" => {
                     println!("\nQuitting. Replay this game with --seed {}", state.seed);
+                    print_unrecorded(&opts, state.seed);
                     return Ok(());
                 }
                 "help" | "?" => {
@@ -1231,11 +1270,18 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         };
         screen.note(&state, prefix, action);
 
+        // Recorded before it is applied, and only if the engine accepts it below — an
+        // action the engine rejected was not part of the game and must not be replayed as
+        // though it were.
+        let chosen = legal.iter().position(|a| *a == action);
+
         // `apply` rather than `apply_trusted`: this input came from a human. The menu only
         // ever offers actions the engine listed, so a rejection here means the menu and the
         // engine disagree — worth hearing about rather than silently ignoring.
         if let Err(e) = state.apply(action) {
             println!("!! {e}");
+        } else if let Some(index) = chosen {
+            moves.push(index);
         }
     }
 
@@ -1253,7 +1299,429 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         state.config.lanes_to_win
     );
     println!("Replay this game with --seed {}", state.seed);
+
+    if let Some(path) = &opts.record {
+        let record = GameRecord::new(
+            opts.config,
+            opts.seed,
+            opts.human,
+            opts.opponent.as_ref().map(|spec| spec.name()),
+            moves,
+            state.outcome,
+        );
+        record.append_to(path)?;
+        println!(
+            "Recorded game {} of {} — {} plies, {}.",
+            record_count(path),
+            path.display(),
+            record.moves.len(),
+            record.human_result
+        );
+    }
     Ok(())
+}
+
+/// Say that a game was abandoned rather than lost, so nobody goes looking for it in the file.
+///
+/// Only complete games are recorded. A half-played game cannot be checked against an
+/// outcome, and the check is the thing that makes a record trustworthy years later — so the
+/// invariant is "every line in the file is a whole game that still reproduces", and the
+/// price is that quitting loses the game. The seed is printed either way, which is enough to
+/// deal the identical position again.
+fn print_unrecorded(opts: &Options, seed: u64) {
+    if let Some(path) = &opts.record {
+        println!(
+            "Not recorded to {}: only finished games are, and this one was abandoned. \
+             The deal is still reproducible with --seed {seed}.",
+            path.display()
+        );
+    }
+}
+
+/// Which game in the file this is, for the confirmation line. Cheap and best-effort: a file
+/// that will not read back reports 0 rather than failing a game that was played fine.
+fn record_count(path: &std::path::Path) -> usize {
+    record::read_all(path).map(|games| games.len()).unwrap_or(0)
+}
+
+/// Record which of the offered actions was taken.
+///
+/// The **index**, not the action: an index into `legal_actions()` is all a deterministic
+/// engine needs to replay a game exactly, and it costs four bytes rather than a serialised
+/// `Action`. It is also the thing `netmcts` and the encoder already agree on.
+fn record_choice(moves: &mut Vec<usize>, legal: &[Action], action: Action) {
+    match legal.iter().position(|a| *a == action) {
+        Some(index) => moves.push(index),
+        // An agent that returns something it was not offered is a bug, and the caller is
+        // about to `apply_trusted` it. Recording nothing would produce a file that replays
+        // a *different* game and passes every check, which is far worse than stopping.
+        None => panic!(
+            "agent chose `{action:?}`, which was not among the {} actions it was offered",
+            legal.len()
+        ),
+    }
+}
+
+// ================================================================== replay ==
+
+/// One decision, with whatever the net had to say about it.
+struct PlyRow {
+    ply: usize,
+    actor: Player,
+    human: bool,
+    played: String,
+    /// Value head for the player to move, `-1.0..=1.0`. `None` without a checkpoint.
+    value: Option<f32>,
+    /// The played action's share of the policy prior.
+    prior_played: Option<f32>,
+    /// The net's own pick, when it differs from what was played.
+    net_pick: Option<(String, f32)>,
+    /// What a search at `--sims` had to say, when one was run.
+    search: Option<SearchView>,
+}
+
+struct SearchView {
+    pick: String,
+    /// The pick's share of the visits. Low on a wide branching factor even when the search
+    /// is confident, so it is a spread rather than a probability.
+    share: f32,
+    /// The root value, converted to the value head's `-1.0..=1.0` scale so the two compare.
+    value: f32,
+    /// Whether the search would have played what was actually played.
+    agreed: bool,
+}
+
+/// Walk a recorded game and print what the net thought at each decision — `PLAN.md` §4.0.
+///
+/// The instrument for §4.0a's diagnosis: sorting the plies where the agent went wrong into
+/// *(i)* moves more search fixes, *(ii)* moves it plays the same way at any budget but
+/// scores wrongly — a value-function problem — and *(iii)* moves that look fine at every
+/// budget and are still wrong. The third bucket is the only one no amount of compute
+/// reaches, and it is why a human series is worth more than another self-play table.
+///
+/// The search here is a **fresh** one, not a reproduction of the search that played the
+/// game: an agent's RNG stream depends on how many times it has been called, and this
+/// rebuilds it. That is the right thing for analysing the *human's* decisions, which is what
+/// the tool is for; the bot's own moves are in the record already.
+fn cmd_replay(args: &[String]) -> Result<(), String> {
+    let mut sims: Option<usize> = None;
+    let mut checkpoint: Option<String> = None;
+    let mut all_plies = false;
+    let mut show_ply: Option<usize> = None;
+
+    // Only the flags this command owns; the rest falls through to `parse_options`, the same
+    // way `cmd_selfplay` does it. `--sims` and `--checkpoint` mean something else there,
+    // which is exactly why they are peeled here rather than made global.
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sims" => sims = Some(next_number(args, &mut i, "--sims")?),
+            "--checkpoint" => checkpoint = Some(next_value(args, &mut i, "--checkpoint")?),
+            "--ply" => show_ply = Some(next_number(args, &mut i, "--ply")?),
+            "--all-plies" => all_plies = true,
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let opts = parse_options(&rest)?;
+    let path = opts
+        .record
+        .clone()
+        .ok_or("replay needs --record <file> — the JSONL written by `play --record`")?;
+    let games = record::read_all(&path)?;
+    if games.is_empty() {
+        return Err(format!("{} has no games in it", path.display()));
+    }
+
+    // No --game is a request for the index, not an error. It is the first thing anyone
+    // wants from a file they have not opened in a month.
+    let Some(number) = opts.game else {
+        println!("{} — {} game(s)\n", path.display(), games.len());
+        println!("{:>4}  {:>12}  {:>6}  {:>6}  {:>7}  opponent", "game", "seed", "seat", "plies", "result");
+        for (i, g) in games.iter().enumerate() {
+            println!(
+                "{:>4}  {:>12}  {:>6}  {:>6}  {:>7}  {}",
+                i + 1,
+                g.seed,
+                g.human.to_string(),
+                g.moves.len(),
+                g.human_result,
+                g.opponent.as_deref().unwrap_or("hotseat"),
+            );
+        }
+        println!("\nWalk one with --game <n>.");
+        return Ok(());
+    };
+    let game = games
+        .get(number.wrapping_sub(1))
+        .ok_or_else(|| format!("--game {number} is out of range (1..={})", games.len()))?;
+
+    // The checkpoint and budget default to the agent that was actually played, so a bare
+    // `replay --game 1` says what the opponent thought. Overriding `--checkpoint` is what
+    // scores an old game with a *new* net, which is §4.0a's fixed evaluation set.
+    let recorded_agent = game
+        .opponent
+        .as_deref()
+        .and_then(|spec| AgentSpec::parse(spec).ok());
+    let (default_checkpoint, default_sims) = match &recorded_agent {
+        Some(AgentSpec::NetMcts { checkpoint, sims }) => (Some(checkpoint.clone()), *sims),
+        Some(AgentSpec::NetPolicy { checkpoint }) => (Some(checkpoint.clone()), 0),
+        _ => (None, 0),
+    };
+    let checkpoint = checkpoint.or(default_checkpoint);
+    let sims = sims.unwrap_or(default_sims);
+
+    let mut evaluator = None;
+    let mut searcher = None;
+    if let Some(path) = &checkpoint {
+        evaluator = Some(
+            duel52_engine::nn::evaluator_for(std::path::Path::new(path), &game.config)
+                .map_err(|e| format!("cannot load {path}: {e}"))?,
+        );
+        if sims > 0 {
+            searcher = Some(duel52_engine::NetMctsAgent::derived(
+                path.clone(),
+                game.seed ^ 0x5EA7,
+                7,
+                sims,
+            ));
+        }
+    }
+
+    println!("{} game {} of {}", path.display(), number, games.len());
+    println!(
+        "  seed {} · you were {} · opponent {} · {} plies · {}",
+        game.seed,
+        game.human,
+        game.opponent.as_deref().unwrap_or("hotseat"),
+        game.moves.len(),
+        game.outcome,
+    );
+    match (&checkpoint, sims) {
+        (None, _) => println!(
+            "  no checkpoint to score with — pass --checkpoint <file> for the net's view"
+        ),
+        (Some(c), 0) => println!("  scoring with {c} · policy and value only (--sims N to search)"),
+        (Some(c), n) => println!("  scoring with {c} · searching {n} simulations per decision"),
+    }
+    println!();
+
+    let mut obs = vec![0.0f32; duel52_engine::obs_dim(&game.config)];
+    let mut logits = vec![0.0f32; duel52_engine::action_dim(&game.config)];
+    let mut values = vec![0.0f32; 1];
+    let mut rows: Vec<PlyRow> = Vec::new();
+    let mut board: Option<String> = None;
+
+    let final_state = game.walk(|state, legal, chosen| {
+        let ply = rows.len() + 1;
+        let actor = state.acting_player();
+        let human = game.opponent.is_none() || actor == game.human;
+        // What the player could see when they chose, unless --reveal. A description built
+        // from ground truth would show a face-down card's rank, which is not the decision
+        // that was actually taken.
+        let observer = if opts.reveal { None } else { Some(actor) };
+        let action = legal[chosen];
+
+        if show_ply == Some(ply) {
+            board = Some(format!(
+                "{}\n  ply {ply} · {actor}{} · played: {}\n",
+                render(state, observer),
+                if human { " (you)" } else { " (bot)" },
+                describe_action(state, action, observer),
+            ));
+        }
+
+        let mut row = PlyRow {
+            ply,
+            actor,
+            human,
+            played: describe_move(state, action, observer),
+            value: None,
+            prior_played: None,
+            net_pick: None,
+            search: None,
+        };
+
+        // Only the decisions being analysed pay for a forward pass, so a 130-ply game with
+        // --sims 4096 costs the human's half of it rather than all of it.
+        if (human || all_plies) && evaluator.is_some() {
+            let evaluator = evaluator.as_ref().expect("checked");
+            duel52_engine::encode_observation(state, actor, &mut obs);
+            evaluator.eval_batch(&obs, 1, &mut logits, &mut values);
+            row.value = Some(values[0]);
+
+            let priors = masked_softmax(&logits, legal, state);
+            row.prior_played = Some(priors[chosen]);
+            let best = priors
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, p)| (i, *p))
+                .expect("a decision has at least one legal action");
+            if best.0 != chosen {
+                row.net_pick = Some((describe_move(state, legal[best.0], observer), best.1));
+            }
+
+            if let Some(searcher) = searcher.as_mut() {
+                // Only when someone is watching: piped, `\r` does not overwrite and the
+                // progress line becomes 53 lines of noise above the table.
+                if io::stderr().is_terminal() {
+                    eprint!("\r  searching ply {ply}…    ");
+                    let _ = io::stderr().flush();
+                }
+                let result = searcher.search(state, legal);
+                let total: u32 = result.visits.iter().sum();
+                let top = result
+                    .visits
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, v)| **v)
+                    .map(|(i, v)| (i, *v))
+                    .expect("a search visits at least one action");
+                row.search = Some(SearchView {
+                    pick: describe_move(state, legal[top.0], observer),
+                    share: top.1 as f32 / total.max(1) as f32,
+                    // `root_value` is a win probability in 0..=1; the value head is a tanh
+                    // in -1..=1. Put both on the head's scale so a row compares.
+                    value: result.root_value * 2.0 - 1.0,
+                    agreed: top.0 == chosen,
+                });
+            }
+        }
+        rows.push(row);
+    })?;
+    if searcher.is_some() && io::stderr().is_terminal() {
+        eprint!("\r                          \r");
+        let _ = io::stderr().flush();
+    }
+
+    if let Some(text) = board {
+        println!("{text}");
+    }
+
+    print_replay_table(&rows, all_plies);
+    print_replay_summary(&rows, &final_state, game);
+    Ok(())
+}
+
+/// Softmax over the legal actions only, in the order `legal` gives them — which is the order
+/// the record's indices refer to.
+fn masked_softmax(logits: &[f32], legal: &[Action], state: &GameState) -> Vec<f32> {
+    let picked: Vec<f32> = legal
+        .iter()
+        .map(|a| logits[duel52_engine::encode_action(a, state)])
+        .collect();
+    let max = picked.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = picked.iter().map(|l| (l - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    exps.iter().map(|e| e / sum.max(f32::MIN_POSITIVE)).collect()
+}
+
+fn print_replay_table(rows: &[PlyRow], all_plies: bool) {
+    println!(
+        "{:>4}  {:>9}  {:>6}  {:<34} {:>6}  {}",
+        "ply", "actor", "value", "played", "prior", "second opinion"
+    );
+    for row in rows {
+        if !row.human && !all_plies {
+            continue;
+        }
+        let value = match row.value {
+            Some(v) => format!("{v:+.2}"),
+            None => "—".to_string(),
+        };
+        let prior = match row.prior_played {
+            Some(p) => format!("{p:.3}"),
+            None => "—".to_string(),
+        };
+        // The search has the last word when it ran: it is the stronger of the two, and a
+        // policy disagreement it overturned is not the interesting fact about the ply.
+        let alternative = match (&row.net_pick, &row.search) {
+            (_, Some(s)) if s.agreed => format!(
+                "search agrees ({:.0}% of visits, v {:+.2})",
+                s.share * 100.0,
+                s.value
+            ),
+            (_, Some(s)) => format!(
+                "search: {} ({:.0}% of visits, v {:+.2})",
+                clip(&s.pick, 40),
+                s.share * 100.0,
+                s.value
+            ),
+            (Some((pick, prior)), None) => format!("policy: {} ({prior:.3})", clip(pick, 40)),
+            (None, None) => String::new(),
+        };
+        println!(
+            "{:>4}  {:>9}  {:>6}  {:<34} {:>6}  {}",
+            row.ply,
+            format!("{}{}", row.actor, if row.human { " you" } else { "" }),
+            value,
+            clip(&row.played, 34),
+            prior,
+            alternative,
+        );
+    }
+}
+
+/// The plies §4.0a asks for: where the value head was **confident and wrong**.
+///
+/// Confident means `|v| > 0.6` — better than 4:1 on a `-1..=1` scale — and wrong means it
+/// favoured the side that went on to lose. These are the positions to look at first, because
+/// a value head that is merely uncertain is behaving correctly and a value head that is
+/// confidently backing a loser is the failure everything past the search horizon inherits.
+fn print_replay_summary(rows: &[PlyRow], final_state: &GameState, game: &GameRecord) {
+    let winner = match final_state.outcome {
+        Outcome::Win(w) => Some(w),
+        _ => None,
+    };
+    let Some(winner) = winner else {
+        println!("\nThe game was drawn, so there is no confidently-wrong ply to point at.");
+        return;
+    };
+    let mut wrong: Vec<&PlyRow> = Vec::new();
+    for row in rows {
+        if let Some(v) = row.value {
+            let favours_actor = v > 0.0;
+            let actor_won = row.actor == winner;
+            if v.abs() > 0.6 && favours_actor != actor_won {
+                wrong.push(row);
+            }
+        }
+    }
+    println!(
+        "\n{} wins. Value head confident (|v| > 0.6) in the side that lost: {} of {} scored ply(s).",
+        winner,
+        wrong.len(),
+        rows.iter().filter(|r| r.value.is_some()).count(),
+    );
+    if wrong.is_empty() {
+        return;
+    }
+    println!("  plies: {}", join_plies(&wrong));
+    println!(
+        "  Sort these into: (i) the search fixes it at a higher --sims, (ii) it plays the\n  \
+         same at any budget but scores the position wrongly — a value-function problem, and\n  \
+         (iii) it looks fine at every budget and is still wrong. Only (iii) needs a human.",
+    );
+    let _ = game;
+}
+
+fn join_plies(rows: &[&PlyRow]) -> String {
+    rows.iter()
+        .map(|r| r.ply.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Truncate to `width`, with an ellipsis, counting characters rather than bytes.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn play_help() -> String {
