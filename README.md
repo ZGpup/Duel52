@@ -54,11 +54,17 @@ file is the point of the project, and the strategy results live there rather tha
 
 ## Try it
 
-A Rust toolchain is all you need to play. The trained agent ships with the repo —
-[models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn), 3.6 MB, an ordinary
-git blob with no LFS to install.
+A Rust toolchain is all you need to play — anything from 1.75 on. The engine has zero
+dependencies, so the build resolves nothing and takes about ten seconds. The trained agent
+ships with the repo — [models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn),
+3.6 MB, an ordinary git blob with no LFS to install.
 
 ```bash
+# No Rust yet? This is the whole install. On Windows, run the rustup-init.exe from
+# https://rustup.rs instead. Then restart the shell, or `source "$HOME/.cargo/env"`,
+# so that `cargo` is on PATH.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
 git clone https://github.com/ZGpup/Duel52.git && cd Duel52
 cargo build --release
 
