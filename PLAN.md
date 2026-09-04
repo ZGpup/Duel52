@@ -711,7 +711,22 @@ debugging on a metered box is the expensive way to do it.
 
 ### 4.5 The staged plan `[ ]`
 
-**Stage 0 — two hours locally, free, and it answers something.** `configs/train-2h.toml`:
+**Stage 0 — done, 2026-09-04, and it answers something.** `FINDINGS.md` F4.1: eight
+generations, and generation 6 beats gen016 by **0.615 ± 0.047 over 400 games at equal
+simulations, about +81 Elo**. Change 3 is real and it is not enormous. Two things for whoever
+starts Stage 2:
+
+- **`train.epochs_per_generation`, not `steps_per_generation`.** A constant step count is 4.1
+  epochs of the buffer a run holds at generation 1 and 0.9 of a full one, and four passes over
+  a quarter-full buffer destroyed the first candidate (0.349 against its own starting weights).
+  From-scratch runs are immune — an overfitted first generation still beats `random` — so this
+  bites warm starts only, and `train-big.toml` is a from-scratch run. Set it anyway.
+- **Set the LR schedule's tiers from the generations a run will finish, not from the
+  `generations` backstop.** This run's last tier arrived at generation 7 of 8 and froze it.
+
+The rest of this section is the original instructions, still current:
+
+`configs/train-2h.toml`:
 
 ```bash
 .venv/bin/python -m duel52.train run --config configs/train-2h.toml \

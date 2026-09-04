@@ -337,6 +337,82 @@ rare. But it is the only statistic in the table where the strongest agent looks 
 
 ---
 
+## Phase 4 — the scale-up
+
+### F4.1 — A deeper teacher is worth +81 Elo in two laptop hours, and the fitting rate is what nearly cost it
+
+`configs/train-2h.toml`, `runs/fourth`, 2026-09-04. Warm-started from
+`models/duel52-split-gen016.d52nn`, 8 generations, 9,600 self-play games at 256 simulations,
+seeds 3,000,000–3,009,600, `variant=split two_power=bottom encoding_slots=21
+stalemate_value=0.0`. Generation 1 ran under the config as first written; generations 2–8 under
+`train.toml.used.from-gen002`, which differs in the two fields discussed below.
+
+**The result.** Generation 6 against gen016, 400 games, equal simulations, `--seed 1`:
+
+| | score | W–L–D | Elo |
+|---|---:|---|---:|
+| `netmcts:runs/fourth/gen006@256` vs `netmcts:gen016@256` | **0.6150 ± 0.0474** | 244–152–4 | **+81** (95%: +48 to +117) |
+
+So `PLAN.md` §4.2 change 3 is real and it is not enormous: **uncapping the teacher from 64 to
+256 simulations bought about +81 Elo from 9,600 games**, against the 57,000 games at 64
+simulations that produced the opponent. It does **not** clear §4.4's exit criterion 1 of 0.70,
+which is the correct outcome for a run that is Stage 0 on a laptop rather than Stage 2 on 64
+cores, and it does mean a scaled-up run has something to scale.
+
+**The near-miss, which is the transferable part.** Generation 1 regressed to 0.349 ± 0.054
+against its own starting weights. The cause was not the teacher; it was that
+`steps_per_generation` is a constant and a buffer is not:
+
+| | third run, steady | `runs/fourth` gen 1 | gen 2–8, after the fix |
+|---|---:|---:|---:|
+| buffer | 590k | 74k | 156k → 505k |
+| epochs per generation | 1.04 | **4.14** | 0.90 |
+| held-out value MSE | — | **0.870** | 0.693 → 0.655 |
+
+Four passes over a quarter-full buffer, on weights that were already good, memorised the shard:
+training value MSE fell to 0.225 while the held-out set rose to 0.870, from the 0.774 gen016
+came in at. **The third run never met this because it started from a random init** — an
+overfitted first generation still beats `random`, and by generation 3 its buffer was full. A
+warm start has no such grace period. `train.epochs_per_generation` now scales the fitting to
+the data available; generation 2 promoted at 0.556 immediately after.
+
+**Change 7 is confirmed, and the value head is worse than the first run's curve suggested.**
+gen016 scores **0.774** on held-out self-play data — it explains ~23% of outcome variance on a
+±1 target, where `runs/third`'s training curve reported 0.49 (~51%). The training number was
+measured on a window it had partly memorised. Across this run the held-out figure fell
+monotonically, 0.870 → 0.693 → 0.738 → 0.685 → 0.676 → 0.674 → 0.663 → **0.655**, so the value
+head did learn — and it remains the weaker half.
+
+⚠️ **The held-out *policy* loss is not a progress measure, and should not be read as one.** It
+sat at 1.930–1.939 while the training policy loss fell 1.939 → 1.842. That is expected and not
+a plateau: the holdout's policy targets are *gen016's* visit distributions, so a net that has
+genuinely improved past gen016 must disagree with them. Only the value target — the game's
+actual outcome — is objective on a fixed holdout. Log both, read the value one.
+
+**Where the run ended.** Generations 7 and 8 scored 0.493 and 0.488, both at `lr = 1.25e-4`
+after the schedule's last step-down. The schedule was sized in fractions of an 8-generation run
+and its final tier is too low to move the net at all: the run effectively finished at generation
+6. On a longer run this matters less, but the tier boundaries should be set from the generations
+a run will actually complete, not from its `generations` backstop.
+
+**Behaviour**, from the same 400 games. The new net hoards slightly more and wastes fewer turns:
+
+| | gen006 | gen016 |
+|---|---:|---:|
+| cards in hand when lanes unlock | **6.87** | 6.41 |
+| …in games won vs lost | 7.25 vs 6.30, gap **+0.94 ± 0.23** | 7.07 vs 5.98, gap +1.09 ± 0.25 |
+| turns with nothing useful to do | **0.43** | 0.70 |
+| flip rate | 0.91 | 0.88 |
+
+Both agents show the H2 hoard-predicts-win gap clearing its own interval, which is now two
+independent nets rather than one. Self-play draws stayed at 1% throughout — no sign of F3.6's
+stalling equilibrium.
+
+Reproduce: `duel52 match --a netmcts:runs/fourth/checkpoints/gen006.d52nn@256 --b
+netmcts:models/duel52-split-gen016.d52nn@256 --games 400 --seed 1 --encoding-slots 21`.
+
+---
+
 ## Phase 3 — the trained agent
 
 ### F3.10 — The net learned flip timing keyed to power *type*
