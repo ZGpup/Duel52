@@ -6,11 +6,11 @@ card deck.
 
 The goal is to answer a question nobody has published an answer to: what does optimal play
 actually look like? As far as I can tell there is no existing engine, bot, or strategy
-analysis for this game. The agent is the instrument. The insight is the deliverable.
+analysis for this game.
 
 ## Try it
 
-A Rust toolchain is all you need to play — anything from 1.75 on. The engine has zero
+A Rust toolchain is all you need to play. The engine has zero
 dependencies, so the build resolves nothing and takes about ten seconds. The trained agent
 ships with the repo — [models/duel52-split-gen022.d52nn](models/duel52-split-gen022.d52nn),
 3.6 MB, an ordinary git blob with no LFS to install.
