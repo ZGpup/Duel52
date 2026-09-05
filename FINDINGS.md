@@ -339,6 +339,97 @@ rare. But it is the only statistic in the table where the strongest agent looks 
 
 ## Phase 4 — the scale-up
 
+### F4.2 — The frozen ladder puts gen006 at +1788, and that is the last number it can usefully give
+
+`duel52 ladder --agents random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:runs/fourth/checkpoints/gen006.d52nn@256
+--games 400 --markdown --variant split --encoding-slots 21 --stalemate-value 0.0`, 2026-09-04,
+seeds from 1, engine 0.1.0:
+
+| agent | Elo | ± | vs. anchor |
+|---|---:|---:|---:|
+| **netmcts:gen006@256** | **+1788** | 58 | 1.000 |
+| ismcts:800 | +1052 | 15 | 0.998 |
+| flatmc:600 | +900 | 13 | 0.994 |
+| greedy | +615 | 13 | 0.972 |
+| pimc:8x1 | +584 | 13 | 0.967 |
+| random | +0 | 0 | 0.500 |
+
+**Read against F3.7's +1476 this looks like +312, and that reading is wrong twice over.**
+
+*First, the two fits are on different scales.* Bradley–Terry pins `random` at 0 and fits
+everything else to the whole comparison graph, so pulling the top agent further away stretches
+the rest: every hand-written rung moved up between the two tables — `ismcts:800` +981 → +1052,
+`flatmc:600` +835 → +900, `greedy` +581 → +615, `pimc:8x1` +547 → +584 — without any of them
+changing by a line of code. Ratings are comparable *within* one fit and not across two. F3.7
+carries the same warning about F2.1; this is the second time it has bitten.
+
+*Second, the budget changed.* F3.7 rated gen016 at `@64`; this rates gen006 at `@256`.
+
+Measuring the gap over a rung common to both fits, and reconciling it against two independent
+measurements:
+
+| common rung | gen016@64 was | gen006@256 is | moved |
+|---|---:|---:|---:|
+| `ismcts:800` | +495 | +736 | **+241** |
+| `flatmc:600` | +641 | +888 | **+247** |
+| `greedy` | +895 | +1173 | +278 |
+| `pimc:8x1` | +929 | +1204 | +275 |
+
+against a prediction of **+222**: `@64` → `@256` on the same weights is +141 (F3.8) and
+gen016@256 → gen006@256 is +81 (F4.1, 400 games). The two strongest rungs give +241 and +247,
+within 20–25 Elo of that and comfortably inside the ±58 on the top row. **The ladder, the
+search-scaling sweep and the head-to-head all agree** — and roughly **three fifths of the
+apparent gain is the larger search budget rather than better weights.**
+
+The weak rungs give +278 and +275 instead, and the reason is the finding: both nets beat
+`greedy` and `pimc:8x1` at essentially 1.000, so those pairings carry no information about
+either net and their contribution to the fit is scale-stretch. **As the top agent pulls away,
+only the top rung still carries signal, and the ladder's resolution collapses to whatever
+`ismcts:800` can still distinguish.**
+
+⚠️ **The ladder is saturated, and "a handful of losses" is literal.** Head to head against the
+top rung, 400 games at seed 1:
+
+```
+netmcts:gen006@256 vs ismcts:800 — 0.9925 ± 0.0085 (W397 L3 D0)
+```
+
+Three losses. The whole rating of the strongest agent this project has produced rests on three
+games, and the Elo transform is violently nonlinear there:
+
+| losses in 400 | score | implied Elo over `ismcts:800` |
+|---:|---:|---:|
+| 1 | 0.9975 | +1040 |
+| **3 — measured** | **0.9925** | **+849** |
+| 6 | 0.9850 | +727 |
+
+**Five games of luck spans 300 Elo.** So the +736 the fit assigns and the +849 the direct
+transform assigns are not in conflict — they are two unstable estimates of a quantity this
+opponent can no longer measure, and the fit's pooling across the whole graph is what pulls it
+to the lower, saner number. For contrast, F3.7 measured gen016@64 against the same opponent at
+0.9300 ± 0.0354 — 28 losses in 200 games, which is a real sample. **The top rung went from 28
+games of signal to 3 in one training run.**
+
+That is also why the +241 gap-over-`ismcts` reconciliation above should be trusted over the
++400 the two direct scores imply (0.9300 → +449, 0.9925 → +849): near 1.0 the Elo transform
+amplifies noise without bound, while the +222 prediction it agrees with is built from two
+measurements taken *away* from saturation — 0.6925 and 0.6150, where a game is worth about a
+tenth of what a game is worth at 0.9925.
+
+**The measurement that still works is a frozen trained net.** gen016@256 loses 38% of its games
+to gen006 and so is still capable of resolving a difference, which is exactly why exit
+criterion 1 is written against it. The roster above was also missing gen016 — so the two
+trained nets are not on one scale here — but the fix is not to add it as a seventh rung: a
+400-game head-to-head measures the same thing at ±0.047 in five minutes, where the ladder
+spends ~26 minutes to produce ±58. Keep the ladder for the hand-written rungs, which it still
+measures well; use a direct match for anything above `ismcts:800`.
+
+This is the same failure the reference panel hit at generation 7 of the first run
+(`PLAN.md` §4.8 tripwire 2), arriving now at the level of the project's headline table: **every
+fixed hand-written yardstick this project owns has now been passed.** What replaces them is a
+frozen *trained* net — which is what `gate.reference` already does per generation, and what
+exit criterion 1 does at the end.
+
 ### F4.1 — A deeper teacher is worth +81 Elo in two laptop hours, and the fitting rate is what nearly cost it
 
 `configs/train-2h.toml`, `runs/fourth`, 2026-09-04. Warm-started from

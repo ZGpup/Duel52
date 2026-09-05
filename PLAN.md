@@ -16,6 +16,13 @@ hand-written agents, and nothing in it says how far that is from good play. The 
 the only external yardstick this project has, and it says the agent is not close.
 **Phase 4's exit criterion is therefore a human one**, not a self-referential one.
 
+That argument has since got a second, sharper edge. Ladder Elo is not only internal, it is now
+**saturated**: F4.2 fits gen006 at +1788 ± 58 — four times the interval on any hand-written
+rung — while it beats four of the five at ~1.000. The table cannot resolve the agent it is
+measuring, and the scale itself shifts between fits, so the headline numbers of successive runs
+are not directly comparable. Every fixed hand-written opponent this project owns has now been
+passed. What is left that can still make a measurement is a frozen *trained* net and a human.
+
 ⚠️ **5–0 is qualitatively decisive and statistically thin, and the two should not be
 conflated.** Five wins in five bounds the owner's true rate only at *p* > 0.55 (95%, one-sided)
 — a coin that came up heads five times. What carries the weight is the *manner*: the owner
@@ -732,8 +739,10 @@ debugging on a metered box is the expensive way to do it.
 
 **Stage 0 — done, 2026-09-04, and it answers something.** `FINDINGS.md` F4.1: eight
 generations, and generation 6 beats gen016 by **0.615 ± 0.047 over 400 games at equal
-simulations, about +81 Elo**. Change 3 is real and it is not enormous. Two things for whoever
-starts Stage 2:
+simulations, about +81 Elo**. Change 3 is real and it is not enormous. On the frozen ladder it
+fits at +1788 ± 58 (F4.2) — a number that needs reading with care, because roughly three fifths
+of the apparent gain over gen016's +1476 is the larger search budget and a scale stretch rather
+than better weights. Three things for whoever starts Stage 2:
 
 - **`train.epochs_per_generation`, not `steps_per_generation`.** A constant step count is 4.1
   epochs of the buffer a run holds at generation 1 and 0.9 of a full one, and four passes over
@@ -742,6 +751,8 @@ starts Stage 2:
   bites warm starts only, and `train-big.toml` is a from-scratch run. Set it anyway.
 - **Set the LR schedule's tiers from the generations a run will finish, not from the
   `generations` backstop.** This run's last tier arrived at generation 7 of 8 and froze it.
+- **Measure with a direct head-to-head, not with the ladder.** F4.2: the ladder has saturated
+  and costs five times as much to say less. Its remaining job is rating the hand-written rungs.
 
 The rest of this section is the original instructions, still current:
 
@@ -841,9 +852,21 @@ and the rented cores make them minutes instead of hours; a ladder at 400 games i
 
 ### 4.7 What Phase 4 must measure `[ ]`
 
-- [ ] **The frozen ladder**, with gen016 as a sixth rung so the two trained nets are on one
-      scale. 400 games, `--markdown`, straight into `FINDINGS.md`.
-- [ ] **Head-to-head vs gen016** at equal sims, 400 games — exit criterion 1.
+- [x] **The frozen ladder** — run 2026-09-04 at 400 games, `FINDINGS.md` F4.2. **And it is the
+      last time this table is worth running as it stands.** gen006@256 fits at **+1788 ± 58**
+      against ±13–15 for every hand-written rung, and scores 1.000 against the anchor: a rating
+      driven by a handful of losses is an extrapolation, not a measurement.
+      This item asked for gen016 as an extra rung "so the two trained nets are on one scale",
+      and that was run without it — but **the fix is not to re-run with gen016 added.** A
+      400-game head-to-head puts them on one scale at ±0.047 for five minutes, where the ladder
+      costs ~26 minutes to produce ±58. Keep the ladder for the hand-written rungs, which it
+      still measures well; use a direct match for anything above `ismcts:800`.
+      ⚠️ Ladder Elo is **not comparable across two fits.** Every hand-written rung moved up
+      35–70 points between F3.7's table and this one without changing by a line of code,
+      because Bradley–Terry fits the whole graph and pulling the top agent away stretches the
+      scale. Compare gaps over a common rung, never row to row. F4.2 does the arithmetic.
+- [x] **Head-to-head vs gen016** at equal sims, 400 games — exit criterion 1. **0.6150 ±
+      0.0474** (W244 L152 D4), about +81 Elo. Real, and below the 0.70 bar; see F4.1.
 - [ ] **The search-scaling sweep repeated** (F3.8's shape: `netpolicy` → @64 → @256 → @1024 →
       @4096, ≥300 games a step). Whether the new net absorbs *more* search than gen016 did is
       the single most informative number the run produces, and it feeds §4.8 directly.
@@ -877,6 +900,12 @@ Switch to R-NaD (Phase 7) when **either** of these appears, and not before:
    falls.** That is the exploitability signature, and no amount of compute fixes it. §4.2's
    change 2 builds this detector into the loop, per generation, which the first run did not
    have — its external opponents were saturated by generation 7.
+   ⚠️ **Keep a detector that can still detect.** As of F4.2 the frozen ladder has saturated
+   too: `random`, `greedy`, `pimc:8x1` and `flatmc:600` are all beaten at ~1.000, and only
+   `ismcts:800` still carries any signal. Every fixed *hand-written* yardstick this project
+   owns has now been passed, so this tripwire only works against a frozen *trained* net —
+   promote the current best into `gate.reference` whenever the incumbent reference clears
+   0.95 for several generations, or the detector reads healthy because it reads nothing.
 
 Neither is present as of gen016. The P0 self-play drift (51.4% → 56.7% over the first run)
 looked like signature 2 and turned out not to be: it does not survive without exploration
