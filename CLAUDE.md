@@ -14,6 +14,7 @@ the instrument.
 | `PLAN.md` | Phased roadmap with status. Update as phases complete. |
 | `OPEN_QUESTIONS.md` | Unresolved rules and design questions. Resolve → move the ruling into `game_rules.md` and delete the entry. |
 | `FINDINGS.md` | Strategy insights as they emerge. This is the actual output of the project. |
+| `REPLAY.md` | How to read `duel52 replay`: the columns, the board notation, and the §4.0a buckets. |
 
 ## Facts that are easy to get wrong
 

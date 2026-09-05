@@ -156,6 +156,7 @@ gradient work, so the thing to rent is cores. A GPU changes about 1.5% of it.
 | [PLAN.md](PLAN.md) | Phased roadmap with status. |
 | [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) | Unresolved rules and design questions. |
 | [FINDINGS.md](FINDINGS.md) | Results, and hypotheses recorded before any data. |
+| [REPLAY.md](REPLAY.md) | How to read `duel52 replay` — the value, prior and second-opinion columns, and the board. |
 | [models/README.md](models/README.md) | The shipped checkpoints: how each was trained, and what it scores. |
 | [CLAUDE.md](CLAUDE.md) | Commands, repo layout, and the facts that are easy to get wrong. |
 
