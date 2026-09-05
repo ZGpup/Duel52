@@ -34,6 +34,12 @@
 //! nothing behind it keeps its place and shows `—` rather than closing the gap, because a
 //! menu that renumbers itself is a menu you have to read every time.
 //!
+//! A **locked base card** is the one thing that is left out, and it keeps its number even so:
+//! the row is skipped when the menu is drawn rather than dropped from it, so the cards around
+//! it still count off the board the way they always did. §3 puts a base card out of reach of
+//! every verb until the draw piles empty, so a `—` beside it is not news about the position —
+//! unlike a taunted card, which is a `—` this turn and a target the next. See [`card_menu`].
+//!
 //! The card question is the one list that holds only what is there: a rank is not a fixed
 //! coordinate the way a lane is, and thirteen rows of `—` to reach the two ranks you own is a
 //! worse trade than reading a short list. It is ordered by rank, with the cards the actor
@@ -92,6 +98,12 @@ pub struct Row {
     pub name: String,
     /// The card token and whatever is worth knowing before picking.
     pub note: String,
+    /// Kept in the list — so the rows after it keep their numbers — but not drawn.
+    ///
+    /// For a card that cannot be reached *and* cannot become reachable while the position
+    /// stands as it is: a base card before the unlock (`game_rules.md` §3). See
+    /// [`card_menu`].
+    pub hidden: bool,
 }
 
 /// What picking a row does.
@@ -185,6 +197,7 @@ impl Menu {
         let width = self
             .rows
             .iter()
+            .filter(|r| !r.hidden)
             .map(|r| r.name.chars().count())
             .max()
             .unwrap_or(0)
@@ -192,6 +205,11 @@ impl Menu {
 
         let mut current: Option<&str> = None;
         for (i, row) in self.rows.iter().enumerate() {
+            // A hidden row is skipped without disturbing `i`, so every row after it keeps
+            // the number it has on the board.
+            if row.hidden {
+                continue;
+            }
             if current != Some(row.heading.as_str()) {
                 out.push('\n');
                 if !row.heading.is_empty() {
@@ -250,10 +268,20 @@ impl Builder {
     }
 
     fn push(&mut self, name: impl Into<String>, note: impl Into<String>, pick: Pick) {
+        self.row(name, note, pick, false);
+    }
+
+    /// A row that holds its number but is not drawn — see [`Row::hidden`].
+    fn push_unlisted(&mut self, name: impl Into<String>, note: impl Into<String>, pick: Pick) {
+        self.row(name, note, pick, true);
+    }
+
+    fn row(&mut self, name: impl Into<String>, note: impl Into<String>, pick: Pick, hidden: bool) {
         self.rows.push(Row {
             heading: self.heading.clone(),
             name: name.into(),
             note: note.into(),
+            hidden,
         });
         self.picks.push(pick);
     }
@@ -440,9 +468,18 @@ fn lane_menu(
 
 /// A menu over one side of one lane.
 ///
-/// Lists **every** card in the column, in the order the board draws it, so a card's number is
+/// Every card in the column has a row, in the order the board draws it, so a card's number is
 /// where it sits on the board. `detail` returns what to say about a card and the action to
 /// take for it; returning `None` for the action leaves the row in place, showing `—`.
+///
+/// The one exception is a **locked base card** with nothing behind it, which keeps its number
+/// but is not drawn ([`Row::hidden`]). A `—` is worth printing when it is a fact about *this
+/// position* — a taunting Jack makes every other card in its lane a `—`, and a player wants
+/// to see that. A base card before the unlock is not that: §3 puts it out of reach of every
+/// verb for the whole draw phase, so the row repeats what `base locked` on the status line
+/// already says, once per lane, in every card list. It comes back the moment something can
+/// be done to it — the 4's Foresight reaches one even now and so gets a real row, and after
+/// the unlock a base card is a normal card.
 fn card_menu(
     state: &GameState,
     observer: Observer,
@@ -454,14 +491,20 @@ fn card_menu(
 ) -> Menu {
     let mut b = Builder::new(prompt);
     for slot in column_slots(state, lane, owner, observer) {
-        let token = card_token(&state.lanes[lane].side(owner)[slot], observer);
+        let card = &state.lanes[lane].side(owner)[slot];
+        let token = card_token(card, observer);
         let (text, pick) = detail(slot);
         let note = if text.is_empty() {
             token
         } else {
             format!("{token}   {text}")
         };
-        b.push(name, note, pick.unwrap_or(Pick::Unavailable));
+        let locked_base = card.is_base && !state.base_unlocked;
+        match pick {
+            Some(pick) => b.push(name, note, pick),
+            None if locked_base => b.push_unlisted(name, note, Pick::Unavailable),
+            None => b.push(name, note, Pick::Unavailable),
+        }
     }
     b.done()
 }
@@ -1227,6 +1270,120 @@ mod tests {
         assert!(matches!(targets.picks[1], Pick::Unavailable), "the 8, taunted\n{text}");
         assert!(matches!(targets.picks[2], Pick::Take(_)), "the Jack\n{text}");
         assert!(targets.rows[2].note.starts_with("[J "), "{text}");
+        // The taunted 8 is drawn as a `—`: it is out of reach because of the Jack beside it,
+        // which is a fact about this turn and goes when the Jack does. The base card is not
+        // drawn at all — §3 holds it out of reach of everything until the piles empty — and
+        // the 8 and the Jack keep #2 and #3 regardless.
+        assert!(targets.rows[0].hidden, "the locked base card\n{text}");
+        assert!(!targets.rows[1].hidden, "the taunted 8\n{text}");
+        assert_eq!(text.matches("OPPONENT CARD").count(), 2, "{text}");
+        assert!(text.contains("OPPONENT CARD  —"), "the taunted 8\n{text}");
+        assert!(text.contains("OPPONENT CARD #3"), "the Jack\n{text}");
+    }
+
+    /// §3: a base card cannot be attacked or flipped until the draw piles empty, so it is not
+    /// drawn in a list of things to attack or flip — and is drawn again the moment it can be.
+    ///
+    /// It keeps its number throughout. The opponent's base card is the *first* card in their
+    /// column, so hiding the row without holding its number would slide every enemy card up
+    /// one and stop the menu agreeing with the board and with the move log.
+    #[test]
+    fn rule_3_a_locked_base_card_is_not_offered_but_still_holds_its_number() {
+        let position = || {
+            let mut p = Position::new(GameConfig::split_deck());
+            p.face_up(0, Player::P0, Rank::TEN); // the attacker, and a card to flip beside
+            p.face_down(0, Player::P0, Rank::SEVEN);
+            p.base(0, Player::P0, Rank::QUEEN); // drawn last in P0's own column
+            p.base(0, Player::P1, Rank::ACE); // drawn first in P1's column
+            p.face_down(0, Player::P1, Rank::NINE);
+            p
+        };
+
+        // ATTACK — the enemy column, base card on top.
+        let locked = position().build();
+        let menu = build(&locked, &locked.legal_actions(), Some(Player::P0));
+        let targets = attack_targets(&menu);
+        let text = targets.render(false);
+        assert_eq!(targets.len(), 2, "both enemy cards still have rows\n{text}");
+        assert!(targets.rows[0].hidden, "the locked base card is not drawn\n{text}");
+        assert!(
+            !text.contains("CARD  —"),
+            "and leaves no `—` behind either\n{text}"
+        );
+        assert!(
+            text.contains("OPPONENT CARD #2"),
+            "the 9 is still #2 — the number it has on the board\n{text}"
+        );
+        assert_eq!(
+            card_number(&locked, 0, Player::P1, 1, Some(Player::P0)),
+            2,
+            "which is what the move log will call it"
+        );
+
+        // FLIP — your own column, base card at the bottom. One 7 and one base card, so the
+        // card question settles the 7 outright and the base card never reaches a list at all.
+        let Pick::Open(flip) = &menu.picks[1] else {
+            panic!("flipping must be on\n{}", menu.render(false));
+        };
+        let text = flip.render(false);
+        assert_eq!(flip.len(), 1, "only the 7\n{text}");
+        assert!(flip.rows[0].note.starts_with("7 "), "no `?` row beside it\n{text}");
+
+        // Unlocked, the same base card is a normal card in its lane and comes back — as a
+        // target, and as a `?` the actor may flip without being told what it is.
+        let mut p = position();
+        p.unlock();
+        let open = p.build();
+        let menu = build(&open, &open.legal_actions(), Some(Player::P0));
+        let targets = attack_targets(&menu);
+        let text = targets.render(false);
+        assert!(!targets.rows[0].hidden, "the base card is a target now\n{text}");
+        assert!(matches!(targets.picks[0], Pick::Take(_)), "{text}");
+        assert!(text.contains("OPPONENT CARD #1"), "{text}");
+
+        let Pick::Open(flip) = &menu.picks[1] else {
+            panic!("flipping must be on\n{}", menu.render(false));
+        };
+        let text = flip.render(false);
+        assert_eq!(flip.len(), 2, "the 7 and the base card\n{text}");
+        assert!(flip.rows[1].note.starts_with('?'), "the base card, unnamed\n{text}");
+    }
+
+    /// The 4 reaches a face-down card the rest of the game cannot, base cards included and
+    /// lock or no lock (`game_rules.md` §3), so Foresight is the list that still draws them.
+    #[test]
+    fn rule_4_foresight_still_lists_a_locked_base_card() {
+        let mut p = Position::new(GameConfig::split_deck());
+        p.base(0, Player::P0, Rank::QUEEN);
+        p.base(0, Player::P1, Rank::ACE);
+        p.state_mut().pending.push(Pending::Foresight { player: Player::P0 });
+        let state = p.build();
+
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+        let Pick::Open(sides) = &menu.picks[0] else {
+            panic!("lane 1 has the base cards in it\n{}", menu.render(false));
+        };
+        for (i, whose) in [(0, "OPPONENT CARD"), (1, "CARD")] {
+            let Pick::Open(cards) = &sides.picks[i] else {
+                panic!("{whose} must be lookable\n{}", sides.render(false));
+            };
+            let text = cards.render(false);
+            assert_eq!(cards.len(), 1, "one base card each\n{text}");
+            assert!(!cards.rows[0].hidden, "a row with a move behind it is drawn\n{text}");
+            assert!(matches!(cards.picks[0], Pick::Take(Action::Peek { .. })), "{text}");
+            assert!(text.contains(&format!("{whose} #1")), "{text}");
+        }
+    }
+
+    /// The ATTACK step's target list, for a menu with one attacker in one lane.
+    fn attack_targets(root: &Menu) -> &Menu {
+        let Pick::Open(attack) = &root.picks[2] else {
+            panic!("attacking must be on\n{}", root.render(false));
+        };
+        let Pick::Open(targets) = &attack.picks[0] else {
+            panic!("one attacker in one lane\n{}", attack.render(false));
+        };
+        targets
     }
 
     /// The case the highlight exists for: three enemy cards in a lane, all face-down, all
@@ -1538,8 +1695,9 @@ mod tests {
         assert!(matches!(cards.picks[1], Pick::Open(_)), "and so can the second");
         assert!(
             matches!(cards.picks[2], Pick::Unavailable),
-            "the base card cannot, but keeps its row"
+            "the base card cannot, but keeps its number"
         );
+        assert!(cards.rows[2].hidden, "and is not drawn while it is locked");
     }
 
     /// The menu is built from the acting player's own point of view, and no level of it may
