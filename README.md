@@ -92,51 +92,9 @@ cargo build --release
     --opponent netmcts:models/duel52-split-gen022.d52nn@4096
 ```
 
-`netmcts:<checkpoint>@<sims>` is net-guided information-set MCTS — the policy head supplies
-the prior, the value head stands in for rollouts. `@4096` is 64× the search the network was
-trained at and still answers in well under a second, which is the right trade when a human is
-the one waiting. Drop it to `@64` to see what the training loop itself was playing against.
-`netpolicy:<checkpoint>` takes the policy head's argmax with no search at all: instant, and
-much weaker. Both are agent names anywhere an agent is accepted, so the checkpoint also goes
-straight into `match`, `ladder` and `probe`.
-
-```bash
-# These need no checkpoint, and no --encoding-slots.
-./target/release/duel52 powers             # what every card does
-./target/release/duel52 demo --seed 47     # watch a whole game, ply by ply
-./target/release/duel52 play --seed 1      # a random bot, if @4096 is too much
-```
-
-Beat it, and you have a result worth keeping — so keep it. `--record` appends the finished
-game to a JSONL file, and because a game is `(config, seed, chosen indices)` against a
-deterministic engine, a 153-ply game is 918 bytes that replay it exactly, hidden information
-included. `replay` then walks it back and shows what the net thought at each of your
-decisions: the value head's score, your move's share of its policy prior, and what a deeper
-search would rather have played.
-
-```bash
-./target/release/duel52 play --encoding-slots 21 --seed 101 \
-    --record games/me-vs-gen022.jsonl \
-    --opponent netmcts:models/duel52-split-gen022.d52nn@4096
-
-./target/release/duel52 replay --record games/me-vs-gen022.jsonl --game 1
-```
-
-[models/duel52-split-gen016.d52nn](models/duel52-split-gen016.d52nn) also ships, and is the
-previous agent rather than a second option — it is kept because every Phase 3 finding is
-measured on it and because it is the fixed opponent the newer net is scored against.
-[models/README.md](models/README.md) records how each was produced, what each scores, and
-where each is weak — including the command that reproduces the ladder above. Training your
-own is a Python job; [CLAUDE.md](CLAUDE.md) has the full command set.
-
-Every prompt names the rule it is applying, so if the engine does something that looks
-wrong you can point at exactly which ruling it thinks it is following. `--seed N` makes a
-game exactly reproducible, so a rules complaint travels as a seed and a move number.
-
-Type a number and look up before you press Enter: that line, and the cards it names, turn
-red on the board. It is how you tell three identical `(? ²♥)` in an enemy lane apart —
-type 1, 2, 3 and watch which one lights up. Nothing is committed until Enter. (`--no-clear`
-turns the redraw off, and the highlight with it.)
+[models/README.md](models/README.md) records how the checkpoints were produced and what they
+score; [CLAUDE.md](CLAUDE.md) has the full command set, including recording a game and
+replaying it to see what the net thought at each of your decisions.
 
 ## The game, briefly
 
