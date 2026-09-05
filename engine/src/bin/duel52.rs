@@ -1088,6 +1088,12 @@ impl Screen {
 /// Interactive play.
 fn cmd_play(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
+    // Before a card is dealt, not after the game is won. A record path that cannot be
+    // written is otherwise discovered an hour later, with the game as the price — which is
+    // the one outcome this whole feature exists to prevent.
+    if let Some(path) = &opts.record {
+        record::prepare(path)?;
+    }
     let mut state = GameState::new(opts.config, opts.seed);
     let mut bot = opts
         .opponent
@@ -1309,7 +1315,16 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             moves,
             state.outcome,
         );
-        record.append_to(path)?;
+        // A finished game is never thrown away because of a filesystem problem. If the
+        // append fails anyway — the disk filled, the directory went away mid-game — the
+        // line goes to the terminal, where it can be pasted into the file by hand. It is
+        // one line, and it is the only copy of a game that took an hour to play.
+        if let Err(e) = record.append_to(path) {
+            println!("\n!! {e}");
+            println!("!! The game is NOT lost. Append this line to the file yourself:\n");
+            println!("{}", record.to_json_line().trim_end());
+            return Err(e);
+        }
         println!(
             "Recorded game {} of {} — {} plies, {}.",
             record_count(path),

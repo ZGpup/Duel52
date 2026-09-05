@@ -235,11 +235,12 @@ impl GameRecord {
         })
     }
 
-    /// Append to a JSONL file, creating it if needed.
+    /// Append to a JSONL file, creating it and its directory if needed.
     ///
     /// Opened, written and closed per game, so a series survives the terminal being closed
     /// between games — which is how a series is actually played.
     pub fn append_to(&self, path: &Path) -> Result<(), String> {
+        create_parent(path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -247,6 +248,35 @@ impl GameRecord {
             .map_err(|e| format!("cannot open {} for appending: {e}", path.display()))?;
         file.write_all(self.to_json_line().as_bytes())
             .map_err(|e| format!("cannot write to {}: {e}", path.display()))
+    }
+}
+
+/// Prove a record path is writable **before** a game is played.
+///
+/// The whole feature exists so that games are not lost, and a path that cannot be written is
+/// only discovered when the game ends — an hour after the mistake, with the game as the
+/// price. `--record games/x.jsonl` with no `games/` directory did exactly that. So the
+/// directory is created and the file is opened for append at start-up, which answers "can
+/// this be written" while it still costs nothing.
+///
+/// Creating an empty file for a game that is then abandoned is harmless: [`read_all`] skips
+/// blank lines, and an empty corpus reads as no games.
+pub fn prepare(path: &Path) -> Result<(), String> {
+    create_parent(path)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("cannot write to {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn create_parent(path: &Path) -> Result<(), String> {
+    match path.parent() {
+        // `Path::parent` of a bare filename is `""`, which `create_dir_all` would reject.
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display())),
+        _ => Ok(()),
     }
 }
 

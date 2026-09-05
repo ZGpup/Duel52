@@ -8,7 +8,7 @@
 //! The occasion: the owner beat `gen016` 5–0 and not one ply was written down. The human
 //! series is the only external measurement this project has, and it was not being kept.
 
-use duel52_engine::record::{read_all, GameRecord, FORMAT};
+use duel52_engine::record::{prepare, read_all, GameRecord, FORMAT};
 use duel52_engine::{
     Action, Agent, AgentSpec, GameConfig, GameState, Outcome, Player, RandomAgent,
 };
@@ -228,6 +228,36 @@ fn phase4_a_records_file_reads_back_in_the_order_it_was_written() {
     assert!(error.contains(":2:"), "{error}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn phase4_recording_into_a_directory_that_does_not_exist_yet_creates_it() {
+    // `--record games/owner-vs-gen006.jsonl` with no `games/` directory failed at the *end*
+    // of a played game, which is the one moment at which failing costs something. The
+    // directory is created, and `prepare` proves the path writable before a card is dealt.
+    let root = std::env::temp_dir().join(format!("duel52-mkdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let path = root.join("games").join("series.jsonl");
+
+    prepare(&path).expect("a missing directory is created, not an error an hour later");
+    assert!(path.exists(), "the file exists once the path has been prepared");
+    assert_eq!(read_all(&path).expect("an empty corpus reads").len(), 0);
+
+    let (record, _) = play_and_record(GameConfig::split_deck(), 3);
+    record.append_to(&path).expect("appends");
+    assert_eq!(read_all(&path).expect("reads").len(), 1);
+
+    // And `append_to` creates the directory on its own, for a caller that never prepared.
+    let fresh = root.join("deeper").join("still").join("series.jsonl");
+    record.append_to(&fresh).expect("appends into a new tree");
+    assert_eq!(read_all(&fresh).expect("reads").len(), 1);
+
+    // A bare filename has no parent to create, and must not be rejected for it.
+    let cwd_file = format!("duel52-bare-{}.jsonl", std::process::id());
+    prepare(std::path::Path::new(&cwd_file)).expect("a bare filename is a valid path");
+    let _ = std::fs::remove_file(&cwd_file);
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
