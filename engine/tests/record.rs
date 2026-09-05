@@ -117,10 +117,10 @@ fn phase4_every_variant_round_trips_including_its_config() {
 #[test]
 fn phase4_a_tampered_move_index_is_refused_rather_than_replayed() {
     let (mut record, _) = play_and_record(GameConfig::split_deck(), 5);
-    // An index past the end of the legal list at that ply.
+    // An index past the end of the legal list at that decision node.
     record.moves[3] = 9_999;
     let error = record.walk(|_, _, _| {}).expect_err("must not replay");
-    assert!(error.contains("ply 4"), "{error}");
+    assert!(error.contains("node 4"), "{error}");
     assert!(error.contains("9999"), "{error}");
 }
 

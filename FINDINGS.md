@@ -6,6 +6,12 @@ Newest first. Phase 3 produced the first strong agent and everything above the P
 section was measured on it; Phase 1 and Phase 2 are kept below as baselines and controls,
 not as results in their own right.
 
+> **Units.** Every game length in this file — "mean plies", "ply 25", "a 47-ply game" — is
+> counted in **player turns**: one player's turn of 3 actions. That is what `GameState::ply`
+> holds and what `game_rules.md` §7 means by "individual player turns (plies)". It is *not*
+> the `node` column of `duel52 replay`, which counts individual decisions and runs about 3.4×
+> higher. `REPLAY.md` §0 has the table.
+
 **Status: Phase 3 trained and measured.** `models/duel52-split-gen016.d52nn` is the first
 trained agent and the first strong Duel 52 player that exists — **+495 Elo clear** of the
 five hand-written rungs (F3.7). Six of the eight hypotheses have data, and the one the
@@ -916,9 +922,9 @@ comparable per simulation rather than the network being an order of magnitude de
 very close to **linear in simulations**, which means sims and games trade one for one and the
 choice is a modelling decision rather than a budget one.
 
-A self-play game at 64 simulations records **166 decisions** — far more than the ~65 "plies" a
-match reports, because a ply is a turn's worth of the three actions plus the free sub-decisions
-`DESIGN.md` §4 splits out, and every one of those is a policy target.
+A self-play game at 64 simulations records **166 decision nodes** — far more than the ~65
+turns a match reports, because a turn is three actions plus the free sub-decisions
+`DESIGN.md` §4 splits out, and every one of those nodes is a policy target.
 
 ### F3.3 — The observation is 4.8% dense and a position offers ~21 actions
 

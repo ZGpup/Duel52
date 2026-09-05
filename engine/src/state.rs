@@ -235,6 +235,25 @@ pub struct GameState {
 
     pub to_move: Player,
     /// Individual player turns since the start, from 0. P0 owns even plies.
+    ///
+    /// **This is the only counter called `ply`, and it means one player's turn** — the
+    /// standard sense, and the one `game_rules.md` §7 defines when it counts "individual
+    /// player turns (plies)". Three words, three things, and they must not be swapped:
+    ///
+    /// | term | is | counted by |
+    /// |---|---|---|
+    /// | **node** | one decision offered to one player | `Vec` length in `record::GameRecord::moves` |
+    /// | **ply** / turn | one player's turn: 3 actions, 2 on the opening turn, 4 after an Ace | this field |
+    /// | **round** | both players' turns | nothing; derive it as `ply / 2` |
+    ///
+    /// A turn is several nodes, because sub-decisions (`DESIGN.md` §4) are separate
+    /// zero-cost nodes. Renaming this would be a rules change, not a rename:
+    /// `Card::frozen_until_ply` is set to `ply + 1` on the strength of plies alternating,
+    /// and `config::stalemate_quiet_plies` and `config::max_plies` are thresholds in this
+    /// unit whose keys are written verbatim into every `.jsonl` game record.
+    ///
+    /// User-facing output says "turn" rather than "ply", because a reader who has just met
+    /// the replay tool's `node` column should not have to know which sense is meant.
     pub ply: u32,
     pub actions_remaining: u32,
 
@@ -686,7 +705,7 @@ impl GameState {
     /// Human-readable one-liner for logs.
     pub fn header(&self) -> String {
         format!(
-            "ply {} · {} to move · {} action(s) left · pile {} · base {} · quiet {}/{}",
+            "turn {} · {} to move · {} action(s) left · pile {} · base {} · quiet {}/{}",
             self.ply,
             self.to_move,
             self.actions_remaining,

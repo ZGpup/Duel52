@@ -8,7 +8,7 @@
 //! including both hands, both base cards and the order of the draw pile. That is the same
 //! insight the `.d52sp` trajectory format is built on.
 //!
-//! The occasion for it: the project owner beat `gen016` 5–0 and **not one ply was written
+//! The occasion for it: the project owner beat `gen016` 5–0 and **not one move was written
 //! down**. No seeds, no moves, no way to ask what the net was thinking when it played the
 //! moves that lost. The human series is the only external measurement this project has
 //! (everything else is scored against agents it wrote itself, on a ladder anchored at
@@ -69,7 +69,7 @@ pub struct GameRecord {
     pub human: Player,
     /// The opponent's [`crate::AgentSpec`] string, or `None` for hotseat.
     pub opponent: Option<String>,
-    /// Chosen indices into `legal_actions()`, in ply order, both sides.
+    /// Chosen indices into `legal_actions()`, one per decision node, in order, both sides.
     pub moves: Vec<usize>,
     /// The outcome as [`Outcome`] renders it. Checked on replay.
     pub outcome: String,
@@ -121,10 +121,10 @@ impl GameRecord {
         mut visit: impl FnMut(&GameState, &[Action], usize),
     ) -> Result<GameState, String> {
         let mut state = GameState::new(self.config, self.seed);
-        for (ply, &choice) in self.moves.iter().enumerate() {
+        for (node, &choice) in self.moves.iter().enumerate() {
             if state.outcome.is_over() {
                 return Err(format!(
-                    "the game was over after {ply} move(s) but the record has {}. The rules \
+                    "the game was over after {node} move(s) but the record has {}. The rules \
                      or the config have changed since it was played.",
                     self.moves.len()
                 ));
@@ -132,9 +132,9 @@ impl GameRecord {
             let legal = state.legal_actions();
             let action = *legal.get(choice).ok_or_else(|| {
                 format!(
-                    "ply {}: the record chose index {choice} of {} legal action(s). The \
+                    "node {}: the record chose index {choice} of {} legal action(s). The \
                      action list has changed shape since this game was played.",
-                    ply + 1,
+                    node + 1,
                     legal.len()
                 )
             })?;
@@ -173,7 +173,7 @@ impl GameRecord {
         }
         write_str_field(&mut out, "outcome", &self.outcome, false);
         write_str_field(&mut out, "human_result", &self.human_result, false);
-        let _ = write!(out, ",\"plies\":{}", self.moves.len());
+        let _ = write!(out, ",\"nodes\":{}", self.moves.len());
         out.push_str(",\"moves\":[");
         for (i, m) in self.moves.iter().enumerate() {
             if i > 0 {

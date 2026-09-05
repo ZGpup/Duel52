@@ -526,7 +526,7 @@ pub fn render_focus(state: &GameState, observer: Observer, focus: &Focus) -> Str
         // Base lock is the whole shape of the game — nothing can be won until it lifts
         // (§3, §7) — so it stays on screen even though everything else here is a counter.
         out.push_str(&format!(
-            " ply {} · base {} · quiet {}/{}{}\n",
+            " turn {} · base {} · quiet {}/{}{}\n",
             state.ply,
             if state.base_unlocked {
                 "UNLOCKED"

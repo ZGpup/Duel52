@@ -13,11 +13,35 @@ list; this file explains what the numbers mean.
 
 ---
 
+## 0. Three counters, three names
+
+A replay prints two different numbers that both used to be called "ply", which is why they
+now are not. Get these straight before reading anything else:
+
+| Term | Is | Where you see it | Game 2 of the corpus |
+| --- | --- | --- | --- |
+| **node** | One decision offered to one player. | The replay table's `node` column; `--node N`; the `nodes` column of the index. | 172 |
+| **turn** | One player's turn: **3 actions**, 2 on the opening turn, 4 after an Ace. | `turn N` in a board's status line; `demo`'s action log. | 51 |
+| **round** | Both players' turns. | Nothing counts it. Derive it as `turn / 2`. | ~25 |
+
+A turn is *several* nodes, because sub-decisions — `2ND`, `NEXT`, `MOVE`, `BACK`, `PEEK` —
+are separate zero-cost nodes (`DESIGN.md` §4). That is why the `node` column climbs about
+3.4 per turn.
+
+**"Ply" still exists, and it means a turn.** It is the standard sense — one player's
+half-move — and it is what `game_rules.md` §7 defines when it counts "individual player turns
+(plies)". It survives in three places where renaming it would be a change rather than a
+rename: the `GameState::ply` field, the config keys `stalemate_quiet_plies` and `max_plies`
+(written verbatim into every record, so old games would stop replaying), and the aggregate
+statistics in `stats`, `probe`, `ladder` and `FINDINGS.md`, which are all denominated in it.
+So when `FINDINGS.md` says "mean plies 45.2", read "45.2 turns". No user-facing line of the
+replay tool or the board says "ply" any more.
+
 ## 1. What a record is
 
 A game record is `(config, seed, chosen indices)` and nothing else. The engine is
 deterministic, so those three things replay the game *exactly* — including the hidden
-information, including the 10 cards removed unseen at setup. A 158-ply game is under a
+information, including the 10 cards removed unseen at setup. A 158-node game is under a
 kilobyte.
 
 ```bash
@@ -44,12 +68,12 @@ a file you have not opened in a month.
 ```
 games/owner-vs-gen006.jsonl — 1 game(s)
 
-game          seed    seat   plies   result  opponent
+game          seed    seat   nodes   result  opponent
    1           123      P0     158     loss  netmcts:runs/fourth/checkpoints/gen006.d52nn@4096
 ```
 
-`result` is always **from your seat**. `plies` is the number of decision nodes, which is not
-the number of turns — see §5.
+`result` is always **from your seat**. `nodes` is the number of decision nodes, which is not
+the number of turns — see §0.
 
 ## 3. The walk
 
@@ -58,10 +82,10 @@ the number of turns — see §5.
 ```
 
 ```
-  seed 123 · you were P0 · opponent netmcts:…/gen006.d52nn@4096 · 158 plies · P1 wins
+  seed 123 · you were P0 · opponent netmcts:…/gen006.d52nn@4096 · 158 nodes · P1 wins
   scoring with runs/fourth/checkpoints/gen006.d52nn · searching 4096 simulations per decision
 
- ply      actor   value  played                              prior  second opinion
+node      actor   value  played                              prior  second opinion
    6     P0 you   -0.00  PLAY  7 face-down into lane 1       0.076  search: PLAY  8 face-down into lane 1 (90% of visits, v +0.09)
    7     P0 you   -0.27  PLAY  8 face-down into lane 2       0.053  search: PLAY  8 face-down into lane 3 (82% of visits, v -0.06)
    8     P0 you   -0.35  FLIP  lane 2 #2 (8 ²♥) -> reveals…  0.190  search agrees (58% of visits, v -0.18)
@@ -72,18 +96,38 @@ so a bare `replay --game 1` says what your opponent thought at the time. Overrid
 `--checkpoint` scores the same game with a different net, which is how an old game becomes a
 fixed evaluation set for a new one.
 
-### `ply`
+### `node`
 
-An index into the decision nodes of the game, 1-based. Not a turn, and not an action —
-sub-decisions (`DESIGN.md` §4) are separate zero-cost nodes, so a 5 that flips a King that
-re-empowers a lane produces a run of `NEXT` nodes with their own ply numbers. **The number in
-this column and the `ply N` in a board's status line are different counters**: the board's is
-the rules' ply, i.e. one player's turn (`state.ply`, incremented by `end_turn`). 158 decision
-nodes in this game were 45 turns.
+An index into the decision nodes of the game, 1-based — §0's first row. **Not a turn, and
+not an action.** This column climbs about 3.4 per turn and skips numbers, for three separate
+reasons:
 
-Gaps in the column are the opponent's nodes, which are not scored unless you pass
-`--all-plies`. That is a cost decision, not a display one: only the rows being analysed pay
-for a forward pass, so a 158-ply game at `--sims 4096` costs your half of it.
+1. **A turn is three actions** (two on the first player's opening turn), and each is a node.
+2. **Sub-decisions are separate zero-cost nodes** (`DESIGN.md` §4) — `2ND`, `NEXT`, `MOVE`,
+   `BACK`, `PEEK`. A 10's twinstrike is one action but two nodes; a 5 that flips a King that
+   re-empowers a lane is one action and a run of `NEXT`s. They cost no action, so a turn can
+   be three actions and five nodes.
+3. **An Ace grants a fourth action** when flipped, so even the action count per turn varies.
+
+Here is one turn of game 2, with the bot's turn either side of it, at `--all-nodes`:
+
+```
+ 133  P0 you  FLIP lane 1 #3 (10) → 10   ┐ your turn: 3 actions, 4 nodes —
+ 134  P0 you  ATK  your #3 [10] → opp #1 │ the twinstrike's second target
+ 135  P0 you  2ND  second target: #3     │ is a free sub-decision
+ 136  P0 you  ATK  your #1 [9]  → opp #3 ┘
+ 137  P1      ATK  …                     ┐
+ 138  P1      FLIP lane 1 #3 (2) → 2     │ its turn: 3 actions, 3 nodes —
+ 139  P1      ATK  …                     ┘ your gap from 136 to 140
+ 140  P0 you  ATK  …
+```
+
+The **gaps** are the opponent's nodes, which are not scored unless you pass `--all-nodes`.
+That is a cost decision, not a display one: only the rows being analysed pay for a forward
+pass, so a 172-node game at `--sims 4096` costs your half of it.
+
+The footer prints both counters — `172 decision node(s) over 51 turn(s)` — so you never have
+to hold the conversion in your head.
 
 ### `actor`
 
@@ -97,11 +141,11 @@ The value head's reading of the position, **from the perspective of the player t
 `-1` a certain loss, `0` even.
 
 The perspective flip is the single easiest thing to misread here. On your rows the number is
-yours. On a `--all-plies` opponent row it is *theirs*, so to plot one curve for the whole
+yours. On a `--all-nodes` opponent row it is *theirs*, so to plot one curve for the whole
 game you have to negate the opponent's rows:
 
 ```bash
-duel52 replay --record <file> --game 1 --sims 0 --all-plies \
+duel52 replay --record <file> --game 1 --sims 0 --all-nodes \
   | grep -E "^ *[0-9]+ +P[01]" \
   | awk '{if($2=="P0"){v=$4+0}else{v=-($3+0)}; print $1, v}'
 ```
@@ -126,7 +170,7 @@ Three different things can appear here, and which one you get depends on `--sims
 | *(blank)* | No search, and the policy's argmax *was* your move. |
 
 **The search has the last word when it ran**, so a policy disagreement it overturned never
-appears — that is not the interesting fact about the ply.
+appears — that is not the interesting fact about the node.
 
 - **`% of visits`** is the winning action's share of the search tree's visits. It is a spread,
   not a probability: on a wide branching factor a confident search still reports 30%. Compare
@@ -145,10 +189,17 @@ opinion" on that move can differ without anything being wrong.
 ## 4. The footer
 
 ```
-P1 wins. Value head confident (|v| > 0.6) in the side that lost: 0 of 78 scored ply(s).
+158 decision node(s) over 45 turn(s) — a turn is 3 actions (2 on the opening turn,
+4 after an Ace), and sub-decisions are extra nodes that cost no action.
+
+P1 wins. Value head confident (|v| > 0.6) in the side that lost: 0 of 78 scored node(s).
 ```
 
-Plies where the value head was **confident and wrong** — `|v| > 0.6`, better than 4:1, and
+The first line is §0's conversion for this particular game, so the `node` column and the
+boards' `turn N` never have to be reconciled by hand.
+
+The second lists the nodes where the value head was **confident and wrong** — `|v| > 0.6`,
+better than 4:1, and
 backing the side that went on to lose. A value head that is merely uncertain is behaving
 correctly; one that confidently backs a loser is the failure everything past the search
 horizon inherits. `0 of 78` is a clean bill of health for the evaluation, and it means any
@@ -164,9 +215,9 @@ the whole point of the command:
 3. **It looks fine at every budget and is still wrong.** The only bucket no amount of compute
    reaches, and the reason a human series is worth more than another self-play table.
 
-## 5. The board (`--ply N`)
+## 5. The board (`--node N`)
 
-`--ply N` also prints the full position as it stood at that decision, drawn **from the acting
+`--node N` also prints the full position as it stood at that decision, drawn **from the acting
 player's point of view** — what they could actually see when they chose. `--reveal` draws
 from ground truth instead, which is how you check what a face-down card really was after the
 fact.
@@ -190,7 +241,7 @@ fact.
  P0   hand A 4 4 5 10 J   discard 2 3 5 6 6 7 10 J
  you know: P0's pile bottom-up: J
  ═════════════════════════════════
- ply 24 · base locked · quiet 0/20
+ turn 24 · base locked · quiet 0/20
 ```
 
 **Orientation.** The observer is always at the bottom. Lanes are columns; each side's base
@@ -216,8 +267,8 @@ Two symbol columns follow a token, per `card_status`:
 the bottom of a draw pile with a 2, and anything a 4's Foresight showed you. It appears only
 when there is something to say.
 
-**The status line.** `ply` here is the rules' ply — one player's turn — not the table's
-decision index. `quiet n/20` is §7's stalemate counter: player-turns with no damage and no
+**The status line.** `turn N` is §0's second row — one player's turn, `state.ply` — not the
+table's node index. `quiet n/20` is §7's stalemate counter: turns with no damage and no
 kill, reset by either. `base locked` / `base UNLOCKED` is the shape of the whole game: until
 every draw pile is empty, nothing can be won. Once it unlocks, the line gains
 `lanes won: you N · opp M`, **relative to the observer** — so the same position reads with the
@@ -260,16 +311,19 @@ duel52 replay --record games/g.jsonl --game 1 --sims 0
 duel52 replay --record games/g.jsonl --game 1 \
     --checkpoint runs/fifth/checkpoints/best.d52nn --sims 4096
 
-# Bucket (i): does a deeper search change its mind about the plies it flagged?
+# Bucket (i): does a deeper search change its mind about the nodes it flagged?
 duel52 replay --record games/g.jsonl --game 1 --sims 16384
 
 # Both sides scored, for a value curve over the whole game.
-duel52 replay --record games/g.jsonl --game 1 --sims 0 --all-plies
+duel52 replay --record games/g.jsonl --game 1 --sims 0 --all-nodes
 
 # The board at one decision, as the player saw it — then as it really was.
-duel52 replay --record games/g.jsonl --game 1 --ply 82
-duel52 replay --record games/g.jsonl --game 1 --ply 82 --reveal
+duel52 replay --record games/g.jsonl --game 1 --node 82
+duel52 replay --record games/g.jsonl --game 1 --node 82 --reveal
 ```
+
+`--ply` and `--all-plies` are still accepted as undocumented aliases for `--node` and
+`--all-nodes`, so a command line written before the rename keeps working.
 
 ⚠️ You never pass `--encoding-slots` to `replay`. The record carries the whole config,
 `encoding_slots` included, so a game played at 21 replays at 21 on its own. What you do have

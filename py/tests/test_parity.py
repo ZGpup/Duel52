@@ -217,7 +217,7 @@ def test_the_masked_policies_agree_on_every_row(parity):
 
 
 def test_the_dump_covers_more_than_the_opening_position(parity):
-    """Rows are sampled across the run, not taken from the first few plies.
+    """Rows are sampled across the run, not taken from the first few decision nodes.
 
     Twenty near-identical fresh deals would exercise almost none of the encoder, so a dump
     that had collapsed to the opening would make every assertion above nearly vacuous.

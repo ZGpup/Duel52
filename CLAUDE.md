@@ -18,7 +18,7 @@ the instrument.
 
 ## Facts that are easy to get wrong
 
-Read `game_rules.md` before touching engine code. These five trip people up:
+Read `game_rules.md` before touching engine code. These six trip people up:
 
 1. **Base cards are hidden from their owner too**, not just the opponent. That is why the
    4's Foresight can target your own base cards.
@@ -30,6 +30,14 @@ Read `game_rules.md` before touching engine code. These five trip people up:
    ownership in the split-deck variant; suit still never matters.)
 5. **The split-deck (red/black) variant is the default configuration**, not the
    rules-as-written game. See `game_rules.md` §9.
+6. **Node, turn and round are three different counters.** A **node** is one decision offered
+   to one player (`replay`'s `node` column, `--node N`); a **turn** is one player's turn —
+   3 actions, 2 on the opening turn, 4 after an Ace (`turn N` on every board, `GameState::ply`);
+   a **round** is both players' turns and nothing counts it. Game 2 of the corpus is 172 nodes
+   = 51 turns. `ply` survives *only* as the spec's synonym for a turn (`game_rules.md` §7,
+   `stalemate_quiet_plies`, `max_plies`, and every `FINDINGS.md` length), because those config
+   keys are written verbatim into each game record and renaming them would stop old games
+   replaying. No user-facing line of `replay` or the board says "ply". See `REPLAY.md` §0.
 
 ## Conventions
 
@@ -72,17 +80,18 @@ cargo test                               # 325 tests: rules, determinism, inform
 ./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
 ./target/release/duel52 play --opponent human              # hotseat
 ./target/release/duel52 powers                             # card-power reference
-./target/release/duel52 demo --seed 47                     # watch a random game, ply by ply
+./target/release/duel52 demo --seed 47                     # watch a random game, action by action
 
 # Record what you played, then ask the net about it (PLAN.md §4.0). A game is
-# (config, seed, chosen indices), so a 153-ply game is 918 bytes and replays exactly —
-# hidden information included. Only finished games are written.
+# (config, seed, chosen indices), so a 153-node game is 918 bytes and replays exactly —
+# hidden information included. Only finished games are written. `REPLAY.md` reads the output;
+# its §0 is the node / turn / round distinction, which is the thing to get straight first.
 ./target/release/duel52 play --encoding-slots 21 --seed 101 \
     --record games/owner-vs-gen022.jsonl \
     --opponent netmcts:models/duel52-split-gen022.d52nn@4096
 ./target/release/duel52 replay --record games/owner-vs-gen022.jsonl            # the index
 ./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1   # walk it
-./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1 --ply 34
+./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1 --node 34
 
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown

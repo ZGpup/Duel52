@@ -311,7 +311,7 @@ one that saves money; read it before booking anything.
 
 ### 4.0 Record the human games, then play six `[ ]`
 
-Right now "I beat it 5–0" is the most important fact about the project and **not one ply of it
+Right now "I beat it 5–0" is the most important fact about the project and **not one move of it
 was written down.** The games are gone: no seeds, no moves, no way to ask what the net was
 thinking when it played the moves that lost. That is the single cheapest thing to fix in this
 phase and it needs no rented hardware.
@@ -332,21 +332,24 @@ position lookup and an append.
       carries a policy target — a shard that can hold rows without one is a shard the trainer
       can silently train on. Keep the corpus format strict and let human games be a different,
       inspectable, git-committable few kilobytes.
-      **Measured: a 153-ply game is 918 bytes.** Only *finished* games are written — a
+      **Measured: a 153-node game is 918 bytes.** Only *finished* games are written — a
       half-played game cannot be checked against an outcome, and that check is what makes a
       record trustworthy later, so quitting prints the seed instead. `engine/src/record.rs`,
       with its own hand-rolled JSON (the engine has no dependencies, deliberately).
-- [x] **[code] `duel52 replay --record <file> --game N`** — walk a recorded game ply by ply,
+- [x] **[code] `duel52 replay --record <file> --game N`** — walk a recorded game node by node,
       and at each of the human's decisions print what the net thought: the value head's score
       for the side to move, the policy prior over the legal actions, and what `netmcts` would
       have played at a given budget. This is the instrument §4.0's analysis needs, and it is
       also a rules-checking tool: a disagreement you can point at, in a position you remember.
-      Bare `--record <file>` prints the index; `--game N` walks one; `--ply N` also prints
-      the board at that ply, from the view the player had when they chose it. The checkpoint
+      Bare `--record <file>` prints the index; `--game N` walks one; `--node N` also prints
+      the board at that node, from the view the player had when they chose it. The checkpoint
       and budget default to **the agent that was actually played**, so `replay --game 1` says
       what your opponent thought; `--checkpoint` overrides it, which is how an old game
-      becomes a fixed evaluation set for a new net. The run ends with the plies §4.0a asks
+      becomes a fixed evaluation set for a new net. The run ends with the nodes §4.0a asks
       for: where the value head was confident (`|v| > 0.6`) in the side that went on to lose.
+      ⚠️ A **node** is one decision, not a turn: a turn is three actions (two on the opening
+      turn, four after an Ace) and sub-decisions are extra free nodes, so the column climbs
+      ~3.4 per turn. `REPLAY.md` §0 is the node / turn / round table; boards say `turn N`.
       ⚠️ The search in a replay is a **fresh** one, not the one that played the game — an
       agent's RNG stream depends on how often it has been called. That is right for analysing
       the *human's* decisions, which is the point; the bot's own moves are in the record.
@@ -381,11 +384,11 @@ Worth being blunt about the tiers, because the intuitive answer is the wrong one
 |---|---|
 | **Training data** — fine-tune on the human's moves | **No.** Six games is ~800 decisions against a replay buffer of ~6M. Even weighted 100× it is noise, and imitating one player over six games is a good way to overfit to one player over six games. |
 | **Search roots** — replay the positions, run deep search on each, add the targets to the buffer | Legitimate technique, negligible at this volume. ~800 roots at 4096 sims is ~3 minutes of compute and 0.01% of the buffer. Revisit only if there are ever hundreds of human games. |
-| **Diagnosis** — find the plies where the net was confident and wrong | **Yes, and this is the point.** See below. |
+| **Diagnosis** — find the nodes where the net was confident and wrong | **Yes, and this is the point.** See below. |
 | **A fixed evaluation set** — score every future checkpoint on the same positions | **Yes.** Cheap, permanent, and the only non-self-referential test the project has. |
 
-- [ ] **Diagnosis.** For each of the human's winning games, find the plies where the value head
-      was confident (|v| > 0.6) in the side that went on to lose, and the plies where the
+- [ ] **Diagnosis.** For each of the human's winning games, find the nodes where the value head
+      was confident (|v| > 0.6) in the side that went on to lose, and the nodes where the
       owner would call the net's move obviously bad. Sort them into three buckets: *(i)* moves
       the net itself fixes given more search — a search-budget problem; *(ii)* moves it plays
       the same way at any budget but the value head scores wrongly — a value-function problem,
@@ -394,7 +397,7 @@ Worth being blunt about the tiers, because the intuitive answer is the wrong one
       **Bucket (iii) is why a human series is worth more than another self-play table:** errors
       invisible from inside the system are exactly the ones self-play cannot label.
 - [ ] **A fixed evaluation set.** Lift the positions into `testkit` form and score every
-      checkpoint on them: does the value head still think it is winning at the ply where it
+      checkpoint on them: does the value head still think it is winning at the node where it
       actually lost? Seconds to run, and it never goes stale.
 - [ ] **[code, optional] Disagreement mining — the automatic version, and it scales.** The
       human is a slow labeller. Run gen016 self-play and, at each decision, compute both the

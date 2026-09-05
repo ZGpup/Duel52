@@ -68,7 +68,7 @@ fn usage() -> String {
 USAGE
   duel52 play    [options]        play against the engine in the terminal
   duel52 replay  [options]        walk a recorded game and see what the net thought
-  duel52 demo    [options]        watch one random-vs-random game, ply by ply
+  duel52 demo    [options]        watch one random-vs-random game, action by action
   duel52 stats   [options]        random-vs-random statistics (Phase 1 deliverable)
   duel52 ladder  [options]        round-robin Elo over the agent ladder (Phase 2)
   duel52 match   [options]        one head-to-head, with behavioural statistics
@@ -121,13 +121,13 @@ OPTIONS
   replay only:
   --record <file>                 the JSONL file written by `play --record` (required)
   --game <n>                      which game in it, 1-based. Omit for the index.
-  --ply <n>                       also print the full board at that ply
+  --node <n>                      also print the full board at that decision node
   --checkpoint <file>             score with this .d52nn instead of the one that was
                                   played, which is how an old game becomes a fixed
                                   evaluation set for a new net
   --sims <n>                      search budget for the second opinion (default: the
                                   recorded opponent's; 0 turns the search off)
-  --all-plies                     score the bot's decisions too, not only yours
+  --all-nodes                     score the bot's decisions too, not only yours
   --reveal                        describe moves from ground truth rather than from what
                                   the player could see at the time
 
@@ -186,7 +186,7 @@ struct Options {
     /// Keep the transcript instead of redrawing over it. `play` only.
     no_clear: bool,
     /// JSONL file to append finished games to (`play`), or to read them from (`replay`).
-    /// `--sims`, `--checkpoint` and `--all-plies` are peeled off by `cmd_replay` itself,
+    /// `--sims`, `--checkpoint` and `--all-nodes` are peeled off by `cmd_replay` itself,
     /// the way `cmd_selfplay` handles its own, because those names already mean something
     /// else under `selfplay` and `nn-dump`.
     record: Option<PathBuf>,
@@ -614,7 +614,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
         };
         let who = state.to_move;
         println!(
-            "  ply {} {who}: {}",
+            "  turn {} {who}: {}",
             state.ply,
             describe_action(&state, action, None)
         );
@@ -639,7 +639,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
 /// this dump is Rust's answer, and the Python test recomputes the same function from the
 /// same checkpoint and the same inputs. Neither side re-derives the other's half.
 ///
-/// Rows are sampled evenly across the whole run rather than taken from the opening plies: a
+/// Rows are sampled evenly across the whole run rather than taken from the opening nodes: a
 /// dump of the first `max_rows` decisions would be twenty near-identical fresh deals, which
 /// would exercise almost none of the encoder. Two passes make that possible without holding
 /// every observation in memory — the engine is deterministic, so the second pass replays the
@@ -1326,7 +1326,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             return Err(e);
         }
         println!(
-            "Recorded game {} of {} — {} plies, {}.",
+            "Recorded game {} of {} — {} nodes, {}.",
             record_count(path),
             path.display(),
             record.moves.len(),
@@ -1379,9 +1379,14 @@ fn record_choice(moves: &mut Vec<usize>, legal: &[Action], action: Action) {
 
 // ================================================================== replay ==
 
-/// One decision, with whatever the net had to say about it.
-struct PlyRow {
-    ply: usize,
+/// One decision node, with whatever the net had to say about it.
+///
+/// A **node** is one decision offered to one player, which is not a turn: a turn is three
+/// actions (two on the opening turn, four after an Ace), and sub-decisions — `2ND`, `NEXT`,
+/// `MOVE`, `BACK`, `PEEK` — are separate zero-cost nodes on top of that. See
+/// `GameState::ply` for the three counters and why they are named the way they are.
+struct NodeRow {
+    node: usize,
     actor: Player,
     human: bool,
     played: String,
@@ -1408,7 +1413,7 @@ struct SearchView {
 
 /// Walk a recorded game and print what the net thought at each decision — `PLAN.md` §4.0.
 ///
-/// The instrument for §4.0a's diagnosis: sorting the plies where the agent went wrong into
+/// The instrument for §4.0a's diagnosis: sorting the nodes where the agent went wrong into
 /// *(i)* moves more search fixes, *(ii)* moves it plays the same way at any budget but
 /// scores wrongly — a value-function problem — and *(iii)* moves that look fine at every
 /// budget and are still wrong. The third bucket is the only one no amount of compute
@@ -1421,20 +1426,27 @@ struct SearchView {
 fn cmd_replay(args: &[String]) -> Result<(), String> {
     let mut sims: Option<usize> = None;
     let mut checkpoint: Option<String> = None;
-    let mut all_plies = false;
-    let mut show_ply: Option<usize> = None;
+    let mut all_nodes = false;
+    let mut show_node: Option<usize> = None;
 
     // Only the flags this command owns; the rest falls through to `parse_options`, the same
     // way `cmd_selfplay` does it. `--sims` and `--checkpoint` mean something else there,
     // which is exactly why they are peeled here rather than made global.
+    //
+    // `--ply` and `--all-plies` are the names these carried before the node/turn/round split
+    // and are still accepted, undocumented: the muscle memory and the command lines already
+    // written down in `CLAUDE.md` history are worth more than the tidiness of dropping them.
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--sims" => sims = Some(next_number(args, &mut i, "--sims")?),
             "--checkpoint" => checkpoint = Some(next_value(args, &mut i, "--checkpoint")?),
-            "--ply" => show_ply = Some(next_number(args, &mut i, "--ply")?),
-            "--all-plies" => all_plies = true,
+            "--node" | "--ply" => {
+                let flag = args[i].clone();
+                show_node = Some(next_number(args, &mut i, &flag)?);
+            }
+            "--all-nodes" | "--all-plies" => all_nodes = true,
             other => rest.push(other.to_string()),
         }
         i += 1;
@@ -1453,7 +1465,7 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
     // wants from a file they have not opened in a month.
     let Some(number) = opts.game else {
         println!("{} — {} game(s)\n", path.display(), games.len());
-        println!("{:>4}  {:>12}  {:>6}  {:>6}  {:>7}  opponent", "game", "seed", "seat", "plies", "result");
+        println!("{:>4}  {:>12}  {:>6}  {:>6}  {:>7}  opponent", "game", "seed", "seat", "nodes", "result");
         for (i, g) in games.iter().enumerate() {
             println!(
                 "{:>4}  {:>12}  {:>6}  {:>6}  {:>7}  {}",
@@ -1506,7 +1518,7 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
 
     println!("{} game {} of {}", path.display(), number, games.len());
     println!(
-        "  seed {} · you were {} · opponent {} · {} plies · {}",
+        "  seed {} · you were {} · opponent {} · {} nodes · {}",
         game.seed,
         game.human,
         game.opponent.as_deref().unwrap_or("hotseat"),
@@ -1525,11 +1537,11 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
     let mut obs = vec![0.0f32; duel52_engine::obs_dim(&game.config)];
     let mut logits = vec![0.0f32; duel52_engine::action_dim(&game.config)];
     let mut values = vec![0.0f32; 1];
-    let mut rows: Vec<PlyRow> = Vec::new();
+    let mut rows: Vec<NodeRow> = Vec::new();
     let mut board: Option<String> = None;
 
     let final_state = game.walk(|state, legal, chosen| {
-        let ply = rows.len() + 1;
+        let node = rows.len() + 1;
         let actor = state.acting_player();
         let human = game.opponent.is_none() || actor == game.human;
         // What the player could see when they chose, unless --reveal. A description built
@@ -1538,17 +1550,17 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
         let observer = if opts.reveal { None } else { Some(actor) };
         let action = legal[chosen];
 
-        if show_ply == Some(ply) {
+        if show_node == Some(node) {
             board = Some(format!(
-                "{}\n  ply {ply} · {actor}{} · played: {}\n",
+                "{}\n  node {node} · {actor}{} · played: {}\n",
                 render(state, observer),
                 if human { " (you)" } else { " (bot)" },
                 describe_action(state, action, observer),
             ));
         }
 
-        let mut row = PlyRow {
-            ply,
+        let mut row = NodeRow {
+            node,
             actor,
             human,
             played: describe_move(state, action, observer),
@@ -1558,9 +1570,9 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
             search: None,
         };
 
-        // Only the decisions being analysed pay for a forward pass, so a 130-ply game with
+        // Only the decisions being analysed pay for a forward pass, so a 172-node game with
         // --sims 4096 costs the human's half of it rather than all of it.
-        if (human || all_plies) && evaluator.is_some() {
+        if (human || all_nodes) && evaluator.is_some() {
             let evaluator = evaluator.as_ref().expect("checked");
             duel52_engine::encode_observation(state, actor, &mut obs);
             evaluator.eval_batch(&obs, 1, &mut logits, &mut values);
@@ -1582,7 +1594,7 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 // Only when someone is watching: piped, `\r` does not overwrite and the
                 // progress line becomes 53 lines of noise above the table.
                 if io::stderr().is_terminal() {
-                    eprint!("\r  searching ply {ply}…    ");
+                    eprint!("\r  searching node {node}…    ");
                     let _ = io::stderr().flush();
                 }
                 let result = searcher.search(state, legal);
@@ -1615,7 +1627,7 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
         println!("{text}");
     }
 
-    print_replay_table(&rows, all_plies);
+    print_replay_table(&rows, all_nodes);
     print_replay_summary(&rows, &final_state, game);
     Ok(())
 }
@@ -1633,13 +1645,13 @@ fn masked_softmax(logits: &[f32], legal: &[Action], state: &GameState) -> Vec<f3
     exps.iter().map(|e| e / sum.max(f32::MIN_POSITIVE)).collect()
 }
 
-fn print_replay_table(rows: &[PlyRow], all_plies: bool) {
+fn print_replay_table(rows: &[NodeRow], all_nodes: bool) {
     println!(
         "{:>4}  {:>9}  {:>6}  {:<34} {:>6}  {}",
-        "ply", "actor", "value", "played", "prior", "second opinion"
+        "node", "actor", "value", "played", "prior", "second opinion"
     );
     for row in rows {
-        if !row.human && !all_plies {
+        if !row.human && !all_nodes {
             continue;
         }
         let value = match row.value {
@@ -1651,7 +1663,7 @@ fn print_replay_table(rows: &[PlyRow], all_plies: bool) {
             None => "—".to_string(),
         };
         // The search has the last word when it ran: it is the stronger of the two, and a
-        // policy disagreement it overturned is not the interesting fact about the ply.
+        // policy disagreement it overturned is not the interesting fact about the node.
         let alternative = match (&row.net_pick, &row.search) {
             (_, Some(s)) if s.agreed => format!(
                 "search agrees ({:.0}% of visits, v {:+.2})",
@@ -1669,7 +1681,7 @@ fn print_replay_table(rows: &[PlyRow], all_plies: bool) {
         };
         println!(
             "{:>4}  {:>9}  {:>6}  {:<34} {:>6}  {}",
-            row.ply,
+            row.node,
             format!("{}{}", row.actor, if row.human { " you" } else { "" }),
             value,
             clip(&row.played, 34),
@@ -1679,22 +1691,32 @@ fn print_replay_table(rows: &[PlyRow], all_plies: bool) {
     }
 }
 
-/// The plies §4.0a asks for: where the value head was **confident and wrong**.
+/// The nodes §4.0a asks for: where the value head was **confident and wrong**.
 ///
 /// Confident means `|v| > 0.6` — better than 4:1 on a `-1..=1` scale — and wrong means it
 /// favoured the side that went on to lose. These are the positions to look at first, because
 /// a value head that is merely uncertain is behaving correctly and a value head that is
 /// confidently backing a loser is the failure everything past the search horizon inherits.
-fn print_replay_summary(rows: &[PlyRow], final_state: &GameState, game: &GameRecord) {
+fn print_replay_summary(rows: &[NodeRow], final_state: &GameState, game: &GameRecord) {
+    // Both counters, once, at the bottom: the table is indexed by node and every board it
+    // prints is stamped with a turn, and the two numbers are far enough apart that seeing
+    // them side by side is the shortest possible answer to "why does this skip?".
+    println!(
+        "\n{} decision node(s) over {} turn(s) — a turn is 3 actions (2 on the opening turn,\n\
+         4 after an Ace), and sub-decisions are extra nodes that cost no action.",
+        rows.len(),
+        final_state.ply,
+    );
+
     let winner = match final_state.outcome {
         Outcome::Win(w) => Some(w),
         _ => None,
     };
     let Some(winner) = winner else {
-        println!("\nThe game was drawn, so there is no confidently-wrong ply to point at.");
+        println!("\nThe game was drawn, so there is no confidently-wrong node to point at.");
         return;
     };
-    let mut wrong: Vec<&PlyRow> = Vec::new();
+    let mut wrong: Vec<&NodeRow> = Vec::new();
     for row in rows {
         if let Some(v) = row.value {
             let favours_actor = v > 0.0;
@@ -1705,7 +1727,7 @@ fn print_replay_summary(rows: &[PlyRow], final_state: &GameState, game: &GameRec
         }
     }
     println!(
-        "\n{} wins. Value head confident (|v| > 0.6) in the side that lost: {} of {} scored ply(s).",
+        "\n{} wins. Value head confident (|v| > 0.6) in the side that lost: {} of {} scored node(s).",
         winner,
         wrong.len(),
         rows.iter().filter(|r| r.value.is_some()).count(),
@@ -1713,7 +1735,7 @@ fn print_replay_summary(rows: &[PlyRow], final_state: &GameState, game: &GameRec
     if wrong.is_empty() {
         return;
     }
-    println!("  plies: {}", join_plies(&wrong));
+    println!("  nodes: {}", join_nodes(&wrong));
     println!(
         "  Sort these into: (i) the search fixes it at a higher --sims, (ii) it plays the\n  \
          same at any budget but scores the position wrongly — a value-function problem, and\n  \
@@ -1722,9 +1744,9 @@ fn print_replay_summary(rows: &[PlyRow], final_state: &GameState, game: &GameRec
     let _ = game;
 }
 
-fn join_plies(rows: &[&PlyRow]) -> String {
+fn join_nodes(rows: &[&NodeRow]) -> String {
     rows.iter()
-        .map(|r| r.ply.to_string())
+        .map(|r| r.node.to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
