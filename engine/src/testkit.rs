@@ -28,11 +28,12 @@
 //!    immediately a won lane (§7). Give a player a card in hand if a test needs the game to
 //!    stay alive.
 
+use crate::action::Action;
 use crate::card::{Card, CardId};
 use crate::config::GameConfig;
 use crate::player::Player;
 use crate::rank::Rank;
-use crate::state::{empty_state, GameState, Pile};
+use crate::state::{empty_state, GameState, Pending, Pile};
 
 /// Filler rank for the piles that keep base cards locked. Arbitrary; a test that cares
 /// what gets drawn should set the pile itself with [`Position::pile`].
@@ -241,6 +242,56 @@ impl Position {
 pub fn end_turn(state: &mut GameState) {
     state.end_turn();
     state.skip_turns_with_nothing_to_do();
+}
+
+// =========================================================== lane relabelling ==
+
+/// The same position with its lanes relabelled: lane `l` becomes lane `sigma[l]`.
+///
+/// `PLAN.md` §4.2a: no rule names a lane, so this is an **exact** symmetry of the game —
+/// the relabelled position has the same value, and its legal actions are the relabelled
+/// ones. It exists to check [`crate::encode::lane_permutations`]'s tables against the
+/// encoder itself rather than against a second reading of the feature layout, which is the
+/// only check worth having (a wrong table is otherwise silent).
+///
+/// Lane indices live in exactly two places: the lane list, and the `lane` field of a
+/// pending sub-decision. Everything else — card ids, slots, hands, piles, discards — is
+/// lane-agnostic, and `lanes_won_by` is computed from the lanes rather than stored.
+pub fn permute_lanes(state: &GameState, sigma: &[usize]) -> GameState {
+    assert_eq!(sigma.len(), state.config.lanes, "sigma must cover every lane");
+    let mut out = state.clone();
+    for (lane, &to) in sigma.iter().enumerate() {
+        out.lanes[to] = state.lanes[lane].clone();
+    }
+    for pending in &mut out.pending {
+        match pending {
+            Pending::ResolveOrder { lane, .. }
+            | Pending::QueenSource { lane, .. }
+            | Pending::SplitTarget { lane, .. } => *lane = sigma[*lane as usize] as u8,
+            // A Foresight names a card only once it is chosen, and a give-back names a rank.
+            Pending::Foresight { .. } | Pending::GiveBack { .. } => {}
+        }
+    }
+    out
+}
+
+/// The same action in the relabelled position — see [`permute_lanes`].
+///
+/// [`Action::SplitTarget`] and [`Action::GiveBack`] name no lane: a split target's lane
+/// comes from the twinstrike in flight, which [`permute_lanes`] has already moved.
+pub fn permute_action(action: &Action, sigma: &[usize]) -> Action {
+    let mut out = *action;
+    match &mut out {
+        Action::Play { lane, .. }
+        | Action::Flip { lane, .. }
+        | Action::Attack { lane, .. }
+        | Action::DeclarePair { lane, .. }
+        | Action::Peek { lane, .. }
+        | Action::ResolveNext { lane, .. }
+        | Action::MoveHere { lane, .. } => *lane = sigma[*lane as usize] as u8,
+        Action::SplitTarget { .. } | Action::GiveBack { .. } => {}
+    }
+    out
 }
 
 // ============================================================== query helpers ==

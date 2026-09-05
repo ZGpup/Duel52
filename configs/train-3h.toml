@@ -1,0 +1,177 @@
+# Phase 4, Stage 0b — three hours on the laptop, one experimental change. PLAN.md §4.2a.
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-3h.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-3h.toml \
+#       --run-dir runs/fifth --init-from models/duel52-split-gen022.d52nn
+#
+# This is `configs/train-2h.toml` with **one thing changed on purpose**: lane-permutation
+# augmentation. Everything else that moves — the budget, the seed range, the LR tiers, the
+# reference opponent — moves because the run is longer or because the incumbent is now
+# gen022, and none of it is an experiment. That is the whole design: twelve generations of
+# a reference column, and one change for it to be attributed to.
+#
+# The change. Duel 52 is invariant under any permutation of its three lanes — no rule in
+# `game_rules.md` names a lane, orders them, or tells one from another — so every training
+# sample has six exact relabellings with the same value and the same optimal policy.
+# FINDINGS.md F4.3 measures gen022 not knowing that: its opening prior splits
+# .320 / .277 / .403 where it must be .333 each, lane 3 outranks lane 1 in 24 of 24 seeds,
+# and in 46 of 128 probes the top second action changes with the lane the first card went
+# into — 38 of those to a different *verb*. Every parameter spent on that preference is a
+# parameter not spent on the game.
+#
+# What it costs: an index remap on two short arrays at batch-draw time. No extra RAM, no
+# extra gradient steps, no change to the shard format or the checkpoint, and the engine
+# plays exactly the game it played yesterday.
+#
+# ⚠️ The mechanism check comes first, and it comes early. F4.3's last row — does the top
+# second action agree across all three lanes — is 28/43 for gen022 and costs two minutes
+# with no opponent and no ladder. Run it on generation 1's checkpoint. **If it has not
+# moved, the augmentation is not wired up and this run is a bug report, not a result.**
+#
+# Sizing, measured on the machine this is for (M-series, 8 cores) from runs/fourth's own
+# log: 13.0, 13.0, 13.0, 13.6, 14.2, 13.7, 13.2, 13.5 minutes — call it 13.5. Three hours
+# is therefore 12–13 generations, plus about two minutes before the clock starts for the
+# one-off baseline measurement of gen022 on the panel.
+
+[game]
+variant = "split"
+# Must match gen022, which is what fixes obs_dim; a mismatch is a refused checkpoint rather
+# than a silent misread. FINDINGS.md F3.1 for why 21 and not the default 16.
+encoding_slots = 21
+# FINDINGS.md F3.6. Near a no-op since the §4 mandatory-action ruling, and kept because an
+# engine-defined terminal condition should never be worth having.
+stalemate_value = 0.0
+
+[net]
+# **Pinned to gen022's trunk by the warm start**, not chosen — `--init-from` refuses a
+# checkpoint whose shape disagrees with this block. Depth is `train-big.toml`'s change to
+# make, on the rented box, from scratch.
+width = 128
+blocks = 3
+value_hidden = 128
+
+[selfplay]
+games = 1200
+
+# **Unchanged at 256, and this is a decision rather than an oversight.** PLAN.md §4.2a:
+# `sims` improves the policy target and *games* improve the value target — one outcome per
+# game however many decisions it has — and the value head is the half that plateaued
+# (PLAN.md §4.2 change 7). At a fixed three hours a 4× teacher costs 4× the games, taking
+# 1200 a generation down to 300, and augmentation raises the effective sample count without
+# adding a single new outcome, so it does not pay for that.
+#
+# And the run *after* this one keeps 256 as well, on evidence rather than on caution:
+# FINDINGS.md F4.4 repeated the search-scaling sweep on gen022 and it does not absorb more
+# search than gen016 did — +222 / +144 / +139 / +104 against F3.8's +252 / +141 / +156 / +69,
+# the same +610 Elo end to end. At F4.1's measured 56% teacher discount, 256 → 1024 buys about
+# +78 Elo of teacher quality for three quarters of the games.
+sims = 256
+c_puct = 1.25
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+device = "auto"
+batch_size = 512
+
+# **The experimental change.** Six exact lane relabellings, one drawn per sample per draw.
+# The buffer holds 6 generations, so a sample is drawn ~5–6 times over its life and the net
+# sees essentially all six views of every position. The tables come from the Rust encoder
+# (`duel52._engine.lane_permutations`) — CLAUDE.md's encoder rule, and not a new one: a
+# permutation table derived in Python would be a second copy of the feature layout, free to
+# drift with nothing crashing to say so. `engine/tests/encoding.rs`'s
+# `phase4_lane_permutation_commutes_with_the_encoder` checks the tables against the encoder
+# itself; `check` builds them before the run so a mis-shaped table costs five seconds
+# rather than three hours.
+#
+# The holdout below stays unaugmented, deliberately: a yardstick that moves is not one.
+lane_augment = true
+
+# Passes over the buffer rather than a step count — the correction generation 1 of
+# runs/fourth paid for. A fixed 600 steps is 0.9 epochs of a full buffer and 4.1 of the
+# quarter-full one a warm start meets at generation 1, and four passes over 74k samples on
+# weights that were already good memorised the shard: training value MSE 0.225 against a
+# held-out 0.870, from the 0.774 it started at.
+epochs_per_generation = 0.9
+steps_per_generation = 600
+
+# The rate that produced gen016 and gen022, applied to gen022. Not moved, for the same
+# reason train-2h did not move it: this run already changes one thing.
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# PLAN.md §4.2 change 5, and Stage 0's own note on it: **key the tiers to the generations
+# the run will finish, not to the `generations` backstop.** Stage 0 set its last tier at 7
+# of a 12-generation backstop, reached it at generation 7 of the 8 it actually ran, and
+# froze the run's last generation for nothing. Twelve is the honest expectation here, so
+# full rate through 4, a quarter through 8, a sixteenth from 9.
+lr_schedule = [[0, 1.0], [5, 0.25], [9, 0.0625]]
+
+sample_stride = 2
+
+# 6 × ~81,600 ≈ 490k samples ≈ 620 MB. Six generations rather than four because this run is
+# data-starved in a way the third was not — 82k new samples a generation against
+# train-fast's 205k. `buffer_samples` is headroom; a cap below the window would silently
+# truncate it, which is invisible in the readout.
+buffer_generations = 6
+buffer_samples = 700000
+
+# PLAN.md §4.2 change 7, and the diagnostic this run is judged on besides the head-to-head:
+# if six views per sample buy anything for the plateaued half, it shows up here. runs/fourth
+# ran 0.870 → 0.655 over its eight generations, which is the curve to beat.
+#
+# Note it is carved off **this run's** generation 1, so it is not comparable float-for-float
+# with runs/fourth's — a different shard, a different set of positions. Read the shape.
+holdout_samples = 8000
+
+[gate]
+# PLAN.md §4.2 change 1, unchanged from train-2h. The threshold, not the sample size, was
+# the bug: more games makes a true-0.54 candidate clear a 0.55 bar *less* often. `check`
+# prints the power — at 300 decisive games and 0.52, a true-0.500 candidate passes 24% (a
+# wasted promotion, which costs approximately nothing) and a true-0.540 one passes 76% (a
+# refused improvement, and five in a row ends the run).
+games = 300
+threshold = 0.52
+min_decisive = 30
+
+# Matches selfplay.sims: the gate measures the weights at the budget they are trained for.
+sims = 256
+
+# **gen022, not gen016.** The third entry is the run's headline measured every generation
+# instead of once at the end, and it has to be the *shipped* incumbent — gen022 already
+# beats gen016 by 0.615 ± 0.047 (F4.1), so a gen016 column would spend twelve generations
+# re-measuring a fight that is over. At @256 both sides, so the column reads "does the new
+# net beat the old one" rather than "…given 4× the search".
+#
+# This is also the run's warm start, so the pre-run baseline is gen022 against itself: the
+# high-water mark starts at even and every later candidate is measured against the best any
+# promoted checkpoint has managed, not against the incumbent's current score. `random` and
+# `greedy` stay as catastrophe detectors — saturated, cheap, and their saturation is itself
+# information. A veto, never a target.
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen022.d52nn@256"]
+reference_games = 120
+reference_tolerance = 0.05
+
+# Five. A refusal is not a wasted generation: self-play continues from the incumbent, so the
+# buffer grows and the next candidate trains on more data.
+max_consecutive_refusals = 5
+
+[run]
+# `hours` binds; `generations` is a backstop, and the loop stops *before* a generation that
+# would overrun. Expect 12–13 at the measured 13.5 minutes.
+generations = 16
+hours = 3.0
+
+# The seed advances by `selfplay.games` a generation, so this run spans 4,000,000–4,019,200.
+# The third run holds 1,000,000+, Stage 0 holds 3,000,000+, and PLAN.md §4.3 reserves
+# 2,000,000 for the rented box. A collision would silently re-deal games the net has already
+# trained on.
+seed = 4000000
+
+threads = 0                       # 0 = every core
+engine = "./target/release/duel52"

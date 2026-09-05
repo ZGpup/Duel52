@@ -105,7 +105,7 @@ def test_the_shipped_training_config_loads_and_uses_the_safe_slot_bound():
     assert config.gate.reference
 
 
-@pytest.mark.parametrize("name", ["train-2h", "train-big"])
+@pytest.mark.parametrize("name", ["train-2h", "train-3h", "train-big"])
 def test_the_phase4_configs_carry_the_scale_up(name):
     """``PLAN.md`` §4.2, as an assertion. These are the changes the run is for, and a
     config that quietly lost one of them would produce a result that means something else.
@@ -121,8 +121,11 @@ def test_the_phase4_configs_carry_the_scale_up(name):
     assert config.gate.min_decisive == config.gate.games // 10
     # The gate measures the weights at the budget they are trained for.
     assert config.gate.sims == config.selfplay.sims
-    # Change 2: a panel of `random` and `greedy` alone was saturated by generation 19.
-    assert any("gen016" in opponent for opponent in config.gate.reference)
+    # Change 2: a panel of `random` and `greedy` alone was saturated by generation 19, so a
+    # shipped net is the third rung. *Which* one is the run's own business — `train-3h`
+    # measures against gen022, the incumbent it warm-starts from, because gen022 already
+    # beats gen016 and a gen016 column would re-measure a fight that is over.
+    assert any(opponent.startswith("netmcts:models/") for opponent in config.gate.reference)
     # Changes 5 and 7.
     assert config.train.lr_schedule
     assert config.train.holdout_samples > 0
@@ -130,6 +133,8 @@ def test_the_phase4_configs_carry_the_scale_up(name):
     # the readout. ~136 decisions a game, thinned by the stride.
     window = config.train.buffer_generations * config.selfplay.games * 136 // config.train.sample_stride
     assert config.train.buffer_samples >= window
+    # §4.2a is Stage 0b's one experimental change, and it is the only config that carries it.
+    assert config.train.lane_augment == (name == "train-3h")
 
 
 def test_the_gate_reads_decisive_games_not_half_points():
@@ -608,3 +613,92 @@ def test_the_held_out_score_is_a_number_the_training_batches_cannot_produce(shar
     # A short last batch must not get a full batch's weight: 40 samples in batches of 16 is
     # 16 + 16 + 8, so an unweighted mean would be a different number.
     assert trainer.evaluate(holdout.slice(0, 32)).samples == 32
+
+
+# ========================================================= lane augmentation ==
+#
+# ``PLAN.md`` §4.2a. The tables themselves are checked against the encoder in Rust
+# (``engine/tests/encoding.rs::phase4_lane_permutation_commutes_with_the_encoder``), which
+# is the only place that check is worth making. What is Python's to get wrong is the
+# gather: whether a drawn row's observation and its policy target are relabelled by the
+# *same* permutation, and whether the holdout is left alone.
+
+
+def test_the_lane_permutation_tables_arrive_intact():
+    from duel52.train.buffer import LaneAugmenter
+
+    from duel52.nn.model import spec_for
+
+    spec = spec_for("split", 21)
+    aug = LaneAugmenter.from_engine("split", 21)
+    assert aug.count == 6, "|S₃| = 6"
+    aug.check(spec["obs_dim"], spec["action_dim"])
+    for table in (aug.obs, aug.action):
+        assert np.array_equal(table[0], np.arange(table.shape[1])), "the identity comes first"
+        for row in table:
+            assert len(np.unique(row)) == table.shape[1], "a table that collides is not a relabelling"
+    # And a table built for a different board is refused rather than gathering garbage.
+    with pytest.raises(ValueError, match="different encoding_slots"):
+        LaneAugmenter.from_engine("split", 16).check(spec["obs_dim"], spec["action_dim"])
+
+
+@needs_engine
+def test_augmentation_relabels_a_row_and_its_target_by_the_same_permutation(shard):
+    """The invariant the whole transform rests on.
+
+    A relabelling that hit the observation and the policy target differently would train
+    the network on one position's board against another's move — and nothing would crash,
+    which is why this is a test rather than a comment. The two buffers draw from the same
+    seed, so their picks are identical row for row and the comparison is exact.
+    """
+    from duel52.train.buffer import LaneAugmenter
+
+    aug = LaneAugmenter.from_engine("split", 21)
+    plain = ReplayBuffer(max_generations=1, max_samples=10**6)
+    moved = ReplayBuffer(max_generations=1, max_samples=10**6, augment=aug)
+    plain.add(shard, 1)
+    moved.add(shard, 1)
+
+    a = plain.sample_batch(np.random.default_rng(7), batch_size=64)
+    b = moved.sample_batch(np.random.default_rng(7), batch_size=64)
+
+    # A relabelling moves indices and nothing else: same rows, same values, same outcome.
+    assert np.array_equal(a["obs_rows"], b["obs_rows"])
+    assert np.array_equal(a["obs_vals"], b["obs_vals"])
+    assert np.array_equal(a["policy_rows"], b["policy_rows"])
+    assert np.array_equal(a["policy_vals"], b["policy_vals"])
+    assert np.array_equal(a["value"], b["value"])
+
+    used = set()
+    for row in range(64):
+        obs_before = a["obs_cols"][a["obs_rows"] == row]
+        obs_after = b["obs_cols"][b["obs_rows"] == row]
+        pol_before = a["policy_cols"][a["policy_rows"] == row]
+        pol_after = b["policy_cols"][b["policy_rows"] == row]
+        sigma = [
+            k
+            for k in range(aug.count)
+            if np.array_equal(aug.obs[k][obs_before], obs_after)
+            and np.array_equal(aug.action[k][pol_before], pol_after)
+        ]
+        assert sigma, f"row {row} is not any single lane relabelling of the sample it came from"
+        used.update(sigma)
+    # One σ per sample per draw, so 64 rows must not all share one. (Six permutations of
+    # 64 rows: the chance of this failing by luck is 6 · (5/6)^64, about 1 in 10⁴.)
+    assert len(used) > 1, "every row got the same permutation — the draw is not per sample"
+
+
+@needs_engine
+def test_the_holdout_is_never_augmented(shard):
+    """A yardstick that moves is not a yardstick. ``Generation.batches`` is the holdout's
+    only path to the trainer, and it must hand over the samples as they were recorded."""
+    from duel52.train.buffer import LaneAugmenter
+
+    gen = load_generation(shard, 1)
+    aug = LaneAugmenter.from_engine("split", 21)
+    ReplayBuffer(max_generations=1, max_samples=10**6, augment=aug).append(gen)
+
+    first = next(iter(gen.slice(0, 8).batches(8)))
+    for row in range(8):
+        recorded = gen.obs_index[gen.obs_offset[row] : gen.obs_offset[row + 1]]
+        assert np.array_equal(first["obs_cols"][first["obs_rows"] == row], recorded)

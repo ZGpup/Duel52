@@ -29,7 +29,57 @@ from typing import Any
 
 import numpy as np
 
-__all__ = ["Generation", "ReplayBuffer"]
+__all__ = ["Generation", "LaneAugmenter", "ReplayBuffer"]
+
+
+@dataclass(frozen=True)
+class LaneAugmenter:
+    """The six lane relabellings, as index maps over a sample's sparse indices.
+
+    ``PLAN.md`` §4.2a: no rule in ``game_rules.md`` names a lane, orders them, or tells one
+    from another, so for every position there are six exactly equivalent relabellings — same
+    value, same optimal policy, legal actions carried across by the same permutation. Drawing
+    a fresh one per sample per batch shows the network all six views of every position at
+    zero extra compute and zero extra RAM, and makes the lane bias ``FINDINGS.md`` F4.3
+    measures impossible rather than merely unlikely.
+
+    ``obs`` and ``action`` are ``(6, dim)``, **old index → new index**, and they come from
+    :func:`duel52._engine.lane_permutations` — Rust computes the tables, Python only gathers.
+    ``CLAUDE.md``: a permutation table derived here would be a second copy of the feature
+    layout, and it would drift silently.
+
+    The value target is untouched: a relabelling cannot move a game's result.
+    """
+
+    obs: np.ndarray
+    action: np.ndarray
+
+    @staticmethod
+    def from_engine(variant: str = "split", encoding_slots: int | None = None) -> LaneAugmenter:
+        from .._engine import lane_permutations
+
+        perms = lane_permutations(variant=variant, encoding_slots=encoding_slots)
+        as_rows = lambda key: np.stack(  # noqa: E731
+            [np.frombuffer(p[key], dtype="<u4").astype(np.int64) for p in perms]
+        )
+        return LaneAugmenter(obs=as_rows("obs"), action=as_rows("action"))
+
+    @property
+    def count(self) -> int:
+        return int(self.obs.shape[0])
+
+    def check(self, obs_dim: int, action_dim: int) -> None:
+        """Refuse tables that are not the right shape for the data being trained on.
+
+        Cheap, and the failure it catches is otherwise silent: a table built at a different
+        ``encoding_slots`` would gather garbage indices rather than raise.
+        """
+        if (self.obs.shape[1], self.action.shape[1]) != (obs_dim, action_dim):
+            raise ValueError(
+                f"lane augmentation tables are {self.obs.shape[1]}/{self.action.shape[1]} wide "
+                f"but the data is {obs_dim}/{action_dim} — the augmenter was built for a "
+                f"different encoding_slots"
+            )
 
 
 @dataclass
@@ -154,7 +204,12 @@ def _ragged_gather(offset: np.ndarray, rows: np.ndarray) -> tuple[np.ndarray, np
     )
 
 
-def _batch_from(pieces: list[tuple[Generation, np.ndarray]]) -> dict[str, np.ndarray]:
+def _batch_from(
+    pieces: list[tuple[Generation, np.ndarray]],
+    *,
+    augment: LaneAugmenter | None = None,
+    rng: np.random.Generator | None = None,
+) -> dict[str, np.ndarray]:
     """Assemble one batch out of ``(generation, row indices)`` pairs.
 
     One code path for both callers, because the invariant they share is the one the whole
@@ -162,6 +217,10 @@ def _batch_from(pieces: list[tuple[Generation, np.ndarray]]) -> dict[str, np.nda
     position's* policy target. Rows are laid out piece by piece, so a batch drawn across
     several generations is grouped by generation rather than in draw order — which no
     caller may depend on, and none does.
+
+    With ``augment`` set, each row is relabelled by one lane permutation drawn from ``rng``
+    — **the same one for its observation and its policy target**, which is that invariant
+    again and the one thing here that must not go wrong.
     """
     obs_rows, obs_cols, obs_vals = [], [], []
     pol_rows, pol_cols, pol_vals = [], [], []
@@ -170,14 +229,21 @@ def _batch_from(pieces: list[tuple[Generation, np.ndarray]]) -> dict[str, np.nda
     for gen, local in pieces:
         if local.size == 0:
             continue
+        if augment is not None:
+            if rng is None:
+                raise ValueError("augmenting a batch needs a random generator")
+            sigma = rng.integers(0, augment.count, size=local.size)
+
         pos, row = _ragged_gather(gen.obs_offset, local)
         obs_rows.append(row + base)
-        obs_cols.append(gen.obs_index[pos].astype(np.int64))
+        cols = gen.obs_index[pos].astype(np.int64)
+        obs_cols.append(cols if augment is None else augment.obs[sigma[row], cols])
         obs_vals.append(gen.obs_value[pos])
 
         pos, row = _ragged_gather(gen.policy_offset, local)
         pol_rows.append(row + base)
-        pol_cols.append(gen.policy_index[pos].astype(np.int64))
+        cols = gen.policy_index[pos].astype(np.int64)
+        pol_cols.append(cols if augment is None else augment.action[sigma[row], cols])
         pol_vals.append(gen.policy_prob[pos])
 
         values.append(gen.value[local])
@@ -199,11 +265,23 @@ def _batch_from(pieces: list[tuple[Generation, np.ndarray]]) -> dict[str, np.nda
 class ReplayBuffer:
     """A sliding window over replayed generations."""
 
-    def __init__(self, *, max_generations: int, max_samples: int, stride: int = 1, threads: int = 0):
+    def __init__(
+        self,
+        *,
+        max_generations: int,
+        max_samples: int,
+        stride: int = 1,
+        threads: int = 0,
+        augment: LaneAugmenter | None = None,
+    ):
         self.max_generations = max_generations
         self.max_samples = max_samples
         self.stride = stride
         self.threads = threads
+        #: Lane-permutation augmentation, or ``None``. Applies to :meth:`sample_batch` only:
+        #: a holdout scored through :meth:`Generation.batches` stays unaugmented, because a
+        #: yardstick that moves is not a yardstick.
+        self.augment = augment
         self.generations: list[Generation] = []
 
     # ------------------------------------------------------------------ contents --
@@ -226,6 +304,8 @@ class ReplayBuffer:
         trained on — carving the fixed holdout off the front of it — does not have to
         replay it twice.
         """
+        if self.augment is not None:
+            self.augment.check(gen.obs_dim, gen.action_dim)
         if self.generations:
             first = self.generations[0]
             if (gen.obs_dim, gen.action_dim) != (first.obs_dim, first.action_dim):
@@ -262,7 +342,9 @@ class ReplayBuffer:
             [
                 (gen, (picks[which == g_index] - bounds[g_index]).astype(np.int64))
                 for g_index, gen in enumerate(self.generations)
-            ]
+            ],
+            augment=self.augment,
+            rng=rng,
         )
 
     # ------------------------------------------------------------- diagnostics --

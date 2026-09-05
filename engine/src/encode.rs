@@ -155,8 +155,31 @@ pub fn scalar_fields(config: &GameConfig) -> Vec<(&'static str, usize)> {
         ("their_pile_bottom_rank", r),
         // Lane aggregates. Cheap, and it saves a dense MLP from rediscovering that slot
         // indices within one lane belong together.
-        ("lane_counts", config.lanes * 4),
+        ("lane_counts", config.lanes * LANE_COUNT_FEATURES),
     ]
+}
+
+/// Floats per lane in the `lane_counts` aggregate: `(mine total, mine face-up, theirs
+/// total, theirs face-up)`, lane-major.
+///
+/// Named rather than written as a literal because [`lane_permutations`] has to know the
+/// stride, and a permutation table that disagreed with the encoder about it would be
+/// silent — see that function's warning.
+pub const LANE_COUNT_FEATURES: usize = 4;
+
+/// First float of the named scalar field, as an offset into the **scalar block**.
+///
+/// Derived from [`scalar_fields`] rather than written down a second time, so a field that
+/// moves takes its offset with it.
+fn scalar_offset(config: &GameConfig, name: &str) -> usize {
+    let mut offset = 0;
+    for (field, width) in scalar_fields(config) {
+        if field == name {
+            return offset;
+        }
+        offset += width;
+    }
+    panic!("the scalar block has no field named {name:?}");
 }
 
 /// Floats in the scalar block.
@@ -782,6 +805,129 @@ pub fn legal_mask(state: &GameState, out: &mut [bool]) {
     }
 }
 
+// =================================================================== lane permutations ==
+
+/// One element of S(`lanes`), as index maps on the observation and on the policy head.
+///
+/// `PLAN.md` §4.2a: Duel 52 is invariant under any permutation of its three lanes. No rule
+/// in `game_rules.md` names a lane, orders them or tells one from another, so for every
+/// position `s` and every `σ` there is a position `σ(s)` with the same value, whose legal
+/// actions are `σ` applied to `s`'s and whose optimal policy is `σ` applied to `s`'s. That
+/// makes these tables an **exact** relabelling rather than an approximation, and it holds at
+/// every position in the game rather than only on the symmetric opening.
+///
+/// Both maps run **old index → new index**, which is the direction a sparse sample is
+/// augmented in: a training row holds indices into `s`'s tensors and wants indices into
+/// `σ(s)`'s.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanePermutation {
+    /// `lanes[l]` is the lane that lane `l` becomes. The identity is first in
+    /// [`lane_permutations`]'s list.
+    pub lanes: Vec<usize>,
+    /// `encode_observation(σ(s))[obs[i]] == encode_observation(s)[i]`, for every `i`.
+    /// [`obs_dim`] long.
+    pub obs: Vec<u32>,
+    /// `encode_action(σ(a), σ(s)) == action[encode_action(a, s)]`. [`action_dim`] long.
+    pub action: Vec<u32>,
+}
+
+/// Every permutation of the lanes, with its observation and policy index maps. Six of them
+/// at `lanes = 3`, the identity first.
+///
+/// # Why this is in Rust
+///
+/// `CLAUDE.md`: there is exactly one encoder and it owns the feature layout. A permutation
+/// table is a *reading* of that layout, so a copy of it derived in Python would be a second
+/// encoder in the only sense that matters — it would drift silently. ⚠️ **A wrong table
+/// does not crash anything.** The network trains on observations paired with somebody
+/// else's targets and comes out merely bad, with the training run as the natural suspect.
+/// `engine/tests/encoding.rs::phase4_lane_permutation_commutes_with_the_encoder` is the
+/// guard: it checks these tables against [`encode_observation`] and [`encode_action`]
+/// themselves, not against a second reading of the layout.
+///
+/// # What moves
+///
+/// Everything lane-indexed, and nothing else:
+///
+/// - **The board**, `((lane * 2 + side) * slots + slot) * features`, is lane-outermost, so
+///   it is three contiguous `2 × slots × features` chunks changing places.
+/// - **`lane_counts`**, the only lane-indexed scalar, [`LANE_COUNT_FEATURES`] per lane,
+///   lane-major.
+/// - **`FLIP`, `ATTACK`, `PAIR` and `CHOOSE_SLOT`** are lane-major blocks (`CHOOSE_SLOT`
+///   twice over, once per side); the index *within* a lane is built from slots, which a
+///   relabelling does not touch.
+/// - **`PLAY`** is `rank * lanes + lane` and so strided rather than blocked.
+/// - **`CHOOSE_RANK`** and every other scalar are fixed points.
+pub fn lane_permutations(config: &GameConfig) -> Vec<LanePermutation> {
+    permutations(config.lanes)
+        .into_iter()
+        .map(|sigma| LanePermutation {
+            obs: obs_permutation(config, &sigma),
+            action: action_permutation(config, &sigma),
+            lanes: sigma,
+        })
+        .collect()
+}
+
+/// Every permutation of `0..n`, in lexicographic order — so the identity is first.
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut current: Vec<usize> = (0..n).collect();
+    loop {
+        out.push(current.clone());
+        // Narayana's next-permutation: the standard in-place lexicographic successor.
+        let Some(i) = (0..current.len().saturating_sub(1)).rev().find(|&i| current[i] < current[i + 1])
+        else {
+            return out;
+        };
+        let j = (i + 1..current.len()).rev().find(|&j| current[j] > current[i]).expect("i qualifies");
+        current.swap(i, j);
+        current[i + 1..].reverse();
+    }
+}
+
+/// Relabel a run of `lanes` contiguous, equal-sized, lane-major blocks.
+fn relabel_lane_major(map: &mut [u32], base: usize, stride: usize, lanes: usize, sigma: &[usize]) {
+    for lane in 0..lanes {
+        for k in 0..stride {
+            map[base + lane * stride + k] = (base + sigma[lane] * stride + k) as u32;
+        }
+    }
+}
+
+fn obs_permutation(config: &GameConfig, sigma: &[usize]) -> Vec<u32> {
+    // Identity everywhere, then overwrite the lane-indexed parts: a feature nobody names
+    // below is a feature a relabelling cannot move.
+    let mut map: Vec<u32> = (0..obs_dim(config) as u32).collect();
+    let per_lane = 2 * config.encoding_slots * slot_features(config);
+    relabel_lane_major(&mut map, 0, per_lane, config.lanes, sigma);
+    let lane_counts = board_len(config) + scalar_offset(config, "lane_counts");
+    relabel_lane_major(&mut map, lane_counts, LANE_COUNT_FEATURES, config.lanes, sigma);
+    map
+}
+
+fn action_permutation(config: &GameConfig, sigma: &[usize]) -> Vec<u32> {
+    let mut map: Vec<u32> = (0..action_dim(config) as u32).collect();
+    let o = Offsets::new(config);
+    let (l, s) = (o.lanes, o.slots);
+
+    // PLAY is the one strided block: `rank * lanes + lane`.
+    for rank in 0..config.rank_count() {
+        for lane in 0..l {
+            map[o.play + rank * l + lane] = (o.play + rank * l + sigma[lane]) as u32;
+        }
+    }
+    relabel_lane_major(&mut map, o.flip, s, l, sigma);
+    relabel_lane_major(&mut map, o.attack, s * s, l, sigma);
+    relabel_lane_major(&mut map, o.pair, pairs_per_lane(s), l, sigma);
+    // `CHOOSE_SLOT` is `(side * lanes + lane) * slots + slot`: lane-major within each side.
+    for side in 0..2 {
+        relabel_lane_major(&mut map, o.choose_slot + side * l * s, s, l, sigma);
+    }
+    // `CHOOSE_RANK` names no lane.
+    map
+}
+
 // ======================================================================= layout hashes ==
 
 /// FNV-1a, 64-bit (Fowler–Noll–Vo, 1991). Chosen for the same reason [`crate::rng`] carries
@@ -911,6 +1057,54 @@ mod tests {
             }
         }
         assert!(seen.into_iter().all(|s| s));
+    }
+
+    /// Six permutations, the identity first, and each map a bijection of its whole block.
+    ///
+    /// A table that dropped an index — or wrote two features onto one — would train the
+    /// network on a mangled observation with nothing to say so.
+    #[test]
+    fn lane_permutations_are_bijections_with_the_identity_first() {
+        let cfg = GameConfig::default();
+        let perms = lane_permutations(&cfg);
+        assert_eq!(perms.len(), 6, "|S₃| = 6");
+        assert_eq!(perms[0].lanes, vec![0, 1, 2], "the identity comes first");
+        assert!(perms[0].obs.iter().copied().eq(0..obs_dim(&cfg) as u32));
+        assert!(perms[0].action.iter().copied().eq(0..action_dim(&cfg) as u32));
+        for p in &perms {
+            for (map, len) in [(&p.obs, obs_dim(&cfg)), (&p.action, action_dim(&cfg))] {
+                assert_eq!(map.len(), len);
+                let mut hit = vec![false; len];
+                for &to in map.iter() {
+                    assert!(!hit[to as usize], "{:?} maps two indices onto {to}", p.lanes);
+                    hit[to as usize] = true;
+                }
+            }
+        }
+    }
+
+    /// The tables compose the way the permutations do: applying `σ` then `τ` has to be the
+    /// table of `τ∘σ`. This is what says the six are one group rather than six unrelated
+    /// relabellings that happen to be bijections.
+    #[test]
+    fn lane_permutation_tables_compose_as_s3() {
+        let cfg = GameConfig::default();
+        let perms = lane_permutations(&cfg);
+        for sigma in &perms {
+            for tau in &perms {
+                let lanes: Vec<usize> = (0..cfg.lanes).map(|l| tau.lanes[sigma.lanes[l]]).collect();
+                let rho = perms
+                    .iter()
+                    .find(|p| p.lanes == lanes)
+                    .expect("S₃ is closed, so the composition is in the list");
+                assert!(sigma.obs.iter().enumerate().all(|(i, &j)| rho.obs[i] == tau.obs[j as usize]));
+                assert!(sigma
+                    .action
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &j)| rho.action[i] == tau.action[j as usize]));
+            }
+        }
     }
 
     /// The hash has to move when the layout does, or it is not protecting anything.

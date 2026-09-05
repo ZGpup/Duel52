@@ -54,7 +54,7 @@ from pathlib import Path
 import numpy as np
 
 from ..nn.model import spec_for
-from .buffer import Generation, ReplayBuffer, load_generation
+from .buffer import Generation, LaneAugmenter, ReplayBuffer, load_generation
 from .config import TrainConfig
 from .trainer import Trainer
 
@@ -169,11 +169,19 @@ class TrainingLoop:
 
         self.spec = spec_for(config.game.variant, config.game.encoding_slots)
         self.rng = np.random.default_rng(config.run.seed)
+        #: The six lane relabellings, or ``None``. Built once from the engine — never in
+        #: Python (``CLAUDE.md``: one encoder, and a permutation table is a reading of it).
+        self.augment = (
+            LaneAugmenter.from_engine(config.game.variant, config.game.encoding_slots)
+            if config.train.lane_augment
+            else None
+        )
         self.buffer = ReplayBuffer(
             max_generations=config.train.buffer_generations,
             max_samples=config.train.buffer_samples,
             stride=config.train.sample_stride,
             threads=config.run.threads,
+            augment=self.augment,
         )
         self.history: list[dict] = []
         self.generation = 0
@@ -476,8 +484,9 @@ class TrainingLoop:
         steps = self.config.train.steps_for(self.buffer.samples)
         epochs = steps * self.config.train.batch_size / max(self.buffer.samples, 1)
         stats = self.trainer.fit(self.buffer, self.rng, steps, generation=g)
+        views = f" ×{self.augment.count} lane views" if self.augment is not None else ""
         say(
-            f"  train       {stats.steps} steps · {epochs:.2f} epochs · lr {stats.lr:.2e} · "
+            f"  train       {stats.steps} steps · {epochs:.2f} epochs{views} · lr {stats.lr:.2e} · "
             f"policy {stats.policy_first:.3f} → {stats.policy_last:.3f} "
             f"(mean {stats.policy_mean:.3f}) · value {stats.value_first:.3f} → {stats.value_last:.3f} "
             f"(mean {stats.value_mean:.3f}) · {_hms(stats.seconds)}"

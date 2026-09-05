@@ -238,13 +238,19 @@ impl PyGame {
     /// `variant` is `"base"`, `"split"` (the project default), or `"mirrored"`.
     /// `two_power` is `"bottom"` (the house rule, default) or `"discard"`
     /// (rules-as-written). The same `seed` and settings always produce the same game.
+    ///
+    /// `encoding_slots` changes nothing about the game — it is the tensor bound, and it is
+    /// here because it is what fixes `obs_dim`: analysing a checkpoint trained at 21
+    /// (`FINDINGS.md` F3.1, and every Phase 4 run) through a `Game` built at the default 16
+    /// would hand the network an observation of the wrong width.
     #[new]
-    #[pyo3(signature = (variant="split", seed=0, two_power=None, stalemate_quiet_plies=None))]
+    #[pyo3(signature = (variant="split", seed=0, two_power=None, stalemate_quiet_plies=None, encoding_slots=None))]
     fn new(
         variant: &str,
         seed: u64,
         two_power: Option<&str>,
         stalemate_quiet_plies: Option<u32>,
+        encoding_slots: Option<usize>,
     ) -> PyResult<PyGame> {
         let v = Variant::parse(variant).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -261,6 +267,9 @@ impl PyGame {
         }
         if let Some(n) = stalemate_quiet_plies {
             config.stalemate_quiet_plies = n;
+        }
+        if let Some(n) = encoding_slots {
+            config.encoding_slots = n;
         }
         config
             .validate()
@@ -838,6 +847,57 @@ fn encoding_spec<'py>(
     Ok(d)
 }
 
+/// The lane relabellings, as index maps the trainer can gather with.
+///
+/// `PLAN.md` §4.2a: the game is invariant under any permutation of its three lanes, so every
+/// training sample has six exact views. Returns one dict per permutation — six of them,
+/// **the identity first** — each carrying:
+///
+/// - ``lanes``: the permutation itself, as a list; ``lanes[l]`` is what lane ``l`` becomes.
+/// - ``obs`` / ``action``: flat little-endian ``u32`` buffers to wrap with
+///   ``numpy.frombuffer``, mapping **old index → new index**. An observation feature at
+///   index ``i`` in a sample belongs at ``obs[i]`` in the relabelled one, and a policy
+///   target at logit ``a`` belongs at ``action[a]``.
+///
+/// **Rust computes the table, Python applies the gather.** `CLAUDE.md`'s encoder rule: a
+/// permutation table derived in Python would be a second copy of the feature layout, free to
+/// drift from the real one without anything crashing. See
+/// `engine/tests/encoding.rs::phase4_lane_permutation_commutes_with_the_encoder`.
+#[pyfunction]
+#[pyo3(signature = (variant="split", encoding_slots=None))]
+fn lane_permutations<'py>(
+    py: Python<'py>,
+    variant: &str,
+    encoding_slots: Option<usize>,
+) -> PyResult<Bound<'py, PyList>> {
+    use pyo3::types::PyBytes;
+
+    let v = Variant::parse(variant)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
+    let mut config = GameConfig::preset(v);
+    if let Some(n) = encoding_slots {
+        config.encoding_slots = n;
+    }
+    config
+        .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+
+    let out = PyList::empty(py);
+    for p in encode::lane_permutations(&config) {
+        let bytes = |v: &[u32]| {
+            let raw =
+                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+            PyBytes::new(py, raw)
+        };
+        let d = PyDict::new(py);
+        d.set_item("lanes", p.lanes.clone())?;
+        d.set_item("obs", bytes(&p.obs))?;
+        d.set_item("action", bytes(&p.action))?;
+        out.append(d)?;
+    }
+    Ok(out)
+}
+
 // ================================================= Phase 3 step 3: the training corpus ==
 
 /// Read a `.d52sp` self-play shard and replay it into training tensors.
@@ -932,6 +992,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(power_reference, m)?)?;
     m.add_function(wrap_pyfunction!(ladder_agents, m)?)?;
     m.add_function(wrap_pyfunction!(encoding_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(lane_permutations, m)?)?;
     m.add_function(wrap_pyfunction!(replay_shard, m)?)?;
     Ok(())
 }

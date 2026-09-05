@@ -12,6 +12,9 @@ trained function would stop matching the evaluated function with nothing crashin
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
 import pytest
 
 from duel52 import VARIANTS, Game
@@ -163,6 +166,41 @@ def test_the_observation_dict_and_the_tensor_agree_about_belief():
         # `game_rules.md` §2: outside the mirrored variant belief never fully resolves, so
         # something is always unseen.
         assert sum(counts) > 0
+
+
+def test_a_game_can_be_built_at_the_slot_bound_its_checkpoint_was_trained_at():
+    """``encoding_slots`` changes no rule — it is what fixes ``obs_dim``, and a Phase 4
+    checkpoint trained at 21 cannot be fed by a ``Game`` built at the default 16."""
+    assert len(Game(seed=1).encode_observation("p0")) == encoding_spec()["obs_dim"]
+    wide = Game(seed=1, encoding_slots=21)
+    assert len(wide.encode_observation("p0")) == encoding_spec(encoding_slots=21)["obs_dim"]
+    # Same game, wider tensor: the deal does not depend on the encoder's bound.
+    assert wide.legal_actions() == Game(seed=1).legal_actions()
+
+
+def test_the_lane_metric_reproduces_the_published_measurement():
+    """``FINDINGS.md`` F4.3 measured gen022 over seeds 1–8 and got 28/43 agreements and an
+    opening prior of .335 / .262 / .403. ``duel52.lanes`` recomputes it by a different route
+    — the engine's permutation tables rather than hand-fixed replay records — so this is a
+    regression test on the whole stack at once: the encoder, the tables, the checkpoint
+    reader and the PyTorch forward pass.
+
+    It is also the run-time check ``PLAN.md`` §4.2a asks for on generation 1, so an error in
+    it would be an error in the thing that says whether the augmentation is wired up.
+    """
+    pytest.importorskip("torch")
+    checkpoint = Path(__file__).resolve().parents[2] / "models" / "duel52-split-gen022.d52nn"
+    if not checkpoint.exists():
+        pytest.skip("the shipped gen022 checkpoint is not in this clone")
+
+    from duel52.lanes import measure
+
+    report = measure(checkpoint, seeds=8)
+    assert report.unmatched == 0, "the three post-opening positions must be exact relabellings"
+    assert report.pairs == 43
+    assert sum(report.argmax_agrees) == 28
+    prior = np.array(report.opening).mean(axis=0)
+    assert np.allclose(prior, [0.335, 0.262, 0.403], atol=5e-4)
 
 
 def test_encoding_an_action_the_engine_did_not_offer_is_still_an_index():

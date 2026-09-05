@@ -89,6 +89,22 @@ def _check(args: argparse.Namespace) -> int:
         )
     )
 
+    # Building the tables here rather than only describing them is deliberate: a wrong or
+    # mis-shaped permutation table does not crash a run, it just trains the net on somebody
+    # else's targets (`PLAN.md` §4.2a). Five seconds is the right place to find that out.
+    if not config.train.lane_augment:
+        print("augmentation:   off — every sample is seen in one lane labelling only")
+    else:
+        from .buffer import LaneAugmenter
+
+        aug = LaneAugmenter.from_engine(config.game.variant, config.game.encoding_slots)
+        aug.check(int(spec["obs_dim"]), int(spec["action_dim"]))
+        print(
+            f"augmentation:   lane permutations on — {aug.count} exact relabellings per sample, "
+            f"one drawn per draw\n"
+            f"                (PLAN.md §4.2a; the holdout stays unaugmented)"
+        )
+
     # `PLAN.md` §4.2 change 1: the first run ended on three refusals that were every one of
     # them inside their own confidence interval of even. What a gate can and cannot resolve
     # is arithmetic, and it belongs here rather than in a table in a plan that drifts.

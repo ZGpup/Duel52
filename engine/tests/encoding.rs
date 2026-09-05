@@ -19,10 +19,10 @@ mod common;
 use common::{sample_positions, sub_decision_positions};
 use duel52_engine::encode::{
     action_blocks, action_dim, action_layout_hash, decode_action, encode_action,
-    encode_observation, legal_mask, obs_dim, obs_layout_hash, slot_features,
+    encode_observation, lane_permutations, legal_mask, obs_dim, obs_layout_hash, slot_features,
 };
 use duel52_engine::nn::{Arch, Evaluator, MlpEvaluator, Weights};
-use duel52_engine::testkit::Position;
+use duel52_engine::testkit::{permute_action, permute_lanes, Position};
 use duel52_engine::{
     Action, AgentSpec, GameConfig, GameState, Player, Rank, Rng, Variant,
 };
@@ -387,6 +387,113 @@ fn phase3_action_blocks_tile_the_policy_head() {
         }
         assert_eq!(at, action_dim(&config));
     }
+}
+
+// =================================================================== lane permutations ==
+
+/// **The guard on `PLAN.md` §4.2a.** The six lane relabellings are an exact symmetry of the
+/// game, and `encode::lane_permutations` publishes them as index maps so the trainer can
+/// show the network all six views of every sample. ⚠️ A wrong map is *silent*: the network
+/// would train on observations paired with somebody else's targets and come out merely bad,
+/// with the training run as the natural suspect — the same failure mode `CLAUDE.md`
+/// describes for a second encoder in Python.
+///
+/// So this checks the tables against [`encode_observation`] and [`encode_action`]
+/// themselves. It relabels the *state's* lanes with `testkit::permute_lanes` and asserts
+/// the encoder's own output moves exactly where the table says, for every `σ`, at positions
+/// from all three variants and every sub-decision phase.
+#[test]
+fn phase4_lane_permutation_commutes_with_the_encoder() {
+    let mut checked = 0;
+    let mut actions_checked = 0;
+    for state in sample_positions().into_iter().chain(sub_decision_positions()) {
+        let config = state.config;
+        for sigma in lane_permutations(&config) {
+            let moved = permute_lanes(&state, &sigma.lanes);
+
+            for observer in Player::BOTH {
+                let before = encode(&state, observer);
+                let after = encode(&moved, observer);
+                for (i, value) in before.iter().enumerate() {
+                    let to = sigma.obs[i] as usize;
+                    assert_eq!(
+                        after[to], *value,
+                        "σ={:?}: observation float {i} should land at {to} for {observer}, \
+                         but {} is there and {value} was expected. {}",
+                        sigma.lanes,
+                        after[to],
+                        state.header()
+                    );
+                }
+                checked += 1;
+            }
+
+            // The relabelled position offers the relabelled actions — the claim that makes
+            // the policy target permutable in the first place — and each one lands on the
+            // logit the table names.
+            let mut expected: Vec<Action> = state
+                .legal_actions()
+                .iter()
+                .map(|a| permute_action(a, &sigma.lanes))
+                .collect();
+            let mut actual = moved.legal_actions().to_vec();
+            let key = |a: &Action| format!("{a:?}");
+            expected.sort_by_key(key);
+            actual.sort_by_key(key);
+            assert_eq!(
+                expected,
+                actual,
+                "σ={:?} changed which actions are legal. {}",
+                sigma.lanes,
+                state.header()
+            );
+
+            for action in state.legal_actions().iter() {
+                let from = encode_action(action, &state);
+                let to = encode_action(&permute_action(action, &sigma.lanes), &moved);
+                assert_eq!(
+                    sigma.action[from] as usize, to,
+                    "σ={:?}: {action:?} moves from logit {from} to {to}, but the table says {}. {}",
+                    sigma.lanes,
+                    sigma.action[from],
+                    state.header()
+                );
+                actions_checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1000, "only {checked} observations were actually checked");
+    assert!(actions_checked > 1000, "only {actions_checked} actions were actually checked");
+}
+
+/// The identity is the only permutation that leaves the tables alone. Stated as its own
+/// test because a table built from the wrong axis — slots instead of lanes, say — could
+/// still be a bijection that composes correctly, and would show up here as an observation
+/// the relabelling never touched.
+#[test]
+fn phase4_a_lane_relabelling_actually_moves_the_observation() {
+    let config = GameConfig::default();
+    let state = sample_positions()
+        .into_iter()
+        .find(|s| {
+            // A position whose lanes are not all identical, or there is nothing to move.
+            let occupied: Vec<usize> = (0..s.config.lanes)
+                .map(|l| s.lanes[l].side(Player::P0).len() + s.lanes[l].side(Player::P1).len())
+                .collect();
+            occupied.iter().any(|n| *n != occupied[0])
+        })
+        .expect("some sampled position has uneven lanes");
+    let before = encode(&state, Player::P0);
+    let perms = lane_permutations(&config);
+    let moved: Vec<bool> = perms
+        .iter()
+        .map(|p| encode(&permute_lanes(&state, &p.lanes), Player::P0) != before)
+        .collect();
+    assert_eq!(moved[0], false, "the identity must not move the observation");
+    assert!(
+        moved[1..].iter().filter(|m| **m).count() >= 3,
+        "a lane relabelling barely changed the tensor: {moved:?}"
+    );
 }
 
 // ================================================================= the reference network ==

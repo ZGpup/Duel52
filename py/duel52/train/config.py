@@ -139,6 +139,19 @@ class TrainSettings:
     #: its buffer was full and it settled at 1.04 epochs for the rest of the run. A
     #: warm-started run has no such grace period, and this is what gives it one.
     epochs_per_generation: float = 0.0
+    #: Relabel each drawn sample by one of the six lane permutations (``PLAN.md`` §4.2a).
+    #:
+    #: Duel 52 is invariant under any permutation of its three lanes — no rule names one —
+    #: so this is an **exact** relabelling, not a noise transform: same value, same optimal
+    #: policy, legal actions carried across by the same permutation. It costs nothing in
+    #: compute or RAM (an index remap on two short arrays at batch-draw time) and it is the
+    #: fix for ``FINDINGS.md`` F4.3, where gen022 spends real capacity on an arbitrary
+    #: preference for lane 3.
+    #:
+    #: Off by default, so every earlier run reproduces unchanged. The tables come from the
+    #: Rust encoder; nothing about the checkpoint or the shard format changes, so a net
+    #: trained with this on is interchangeable with one trained without it.
+    lane_augment: bool = False
     #: Samples carved out of the run's **first** shard and never trained on, scored every
     #: generation (``PLAN.md`` §4.2 change 7). 0 disables it.
     #:

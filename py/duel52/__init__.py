@@ -37,7 +37,14 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable
 
 from ._engine import VERSION as ENGINE_VERSION
-from ._engine import Agent, Game, ladder_agents, power_reference, random_play_stats
+from ._engine import (
+    Agent,
+    Game,
+    ladder_agents,
+    lane_permutations,
+    power_reference,
+    random_play_stats,
+)
 
 __all__ = [
     "ENGINE_VERSION",
@@ -46,6 +53,7 @@ __all__ = [
     "VARIANTS",
     "TWO_POWERS",
     "ladder_agents",
+    "lane_permutations",
     "power_reference",
     "random_play_stats",
     "play_agent_game",
