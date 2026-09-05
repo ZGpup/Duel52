@@ -140,6 +140,10 @@ OPTIONS
   --threads <n>                   worker threads (default: all cores). Results are
                                   identical whatever this is set to.
   --agents <a,b,...>              roster for ladder/probe (default: the frozen ladder)
+  --anchor <agent>                which rung `ladder` pins to 0 Elo, named exactly as it
+                                  appears in --agents (default: random). Elo is only
+                                  defined up to a constant, so this is what the table is
+                                  measured against.
   --a <agent> --b <agent>         the two sides of a `match`
   --markdown                      emit Markdown, for pasting into FINDINGS.md
 
@@ -200,6 +204,13 @@ struct Options {
     threads: usize,
     /// `None` means [`AgentSpec::LADDER`], the frozen benchmark.
     roster: Option<Vec<AgentSpec>>,
+    /// Which rung `ladder` pins to 0 Elo. `None` means `random`, the original floor.
+    ///
+    /// Elo is only defined up to an additive constant, so the anchor is a choice about what
+    /// the table is measuring rather than a detail. It became worth naming when the
+    /// hand-written rungs saturated: a roster with no `random` in it used to anchor on
+    /// whichever agent was listed first, which made the scale depend on argument order.
+    anchor: Option<String>,
     agent_a: Option<AgentSpec>,
     agent_b: Option<AgentSpec>,
 }
@@ -220,6 +231,7 @@ impl Default for Options {
             markdown: false,
             threads: default_threads(),
             roster: None,
+            anchor: None,
             agent_a: None,
             agent_b: None,
         }
@@ -320,6 +332,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 }
                 opts.roster = Some(roster);
             }
+            "--anchor" => opts.anchor = Some(next_value(args, &mut i, "--anchor")?),
             "--a" => opts.agent_a = Some(AgentSpec::parse(&next_value(args, &mut i, "--a")?)?),
             "--b" => opts.agent_b = Some(AgentSpec::parse(&next_value(args, &mut i, "--b")?)?),
             "--config" => {
@@ -433,6 +446,20 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
     let roster = opts.roster();
     let games = opts.games_or(400);
 
+    // An anchor that is not in the roster would silently fall back to whichever agent was
+    // listed first, and the whole table would be measured against something nobody named.
+    let anchor = opts.anchor.as_deref().unwrap_or("random");
+    if !roster.iter().any(|a| a.name() == anchor) {
+        return Err(format!(
+            "--anchor {anchor} is not in the roster: {}",
+            roster
+                .iter()
+                .map(|a| a.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     if !opts.markdown {
         eprintln!(
             "Round robin: {} agents, {} games per pairing, {} thread(s).",
@@ -447,7 +474,7 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
         opts.seed,
         games,
         opts.threads,
-        "random",
+        anchor,
         !opts.markdown,
     );
 

@@ -5,9 +5,10 @@ transcript of the official rules page — it is a disambiguated, engine-ready ve
 them, incorporating rulings from the project owner (a regular player) where the published
 rules are silent or ambiguous.
 
-**Precedence:** If the code and this document disagree, this document wins — unless the
-point is listed in `OPEN_QUESTIONS.md`, in which case the code's current choice is a
-placeholder pending resolution.
+**Precedence:** If the code and this document disagree, this document wins. Every rules
+question raised for this project has been answered and ported into here, so there is no longer
+a list of pending ones; `archive/OPEN_QUESTIONS.md` records the rulings that reversed an
+earlier answer.
 
 Source: <https://www.juddmadden.com/duel52/index.html> (Judd Madden & Nina Riddell, 2017).
 
@@ -31,7 +32,8 @@ Markers used below:
   own side of a lane and attack across into the opposing side of the *same* lane. Lanes
   are otherwise independent.
 - No limit on cards per lane per side. **[RULING]** (Never a practical constraint; the
-  engine caps slots at 8/side/lane purely as an encoding bound — see `DESIGN.md`.)
+  engine caps slots at `encoding_slots` per side per lane purely as an encoding bound — see
+  `CLAUDE.md`, Architecture.)
 - **Suits are mechanically irrelevant.** Only rank matters. The one exception is the
   split-deck variant (§9), where *color* denotes deck ownership, and even there suit
   within a color never matters.
@@ -335,7 +337,7 @@ for. It is no longer a strategy either player can adopt.
 - Flipping a card and resolving its power is a single action, but the power may open
   **sub-decisions that cost no action** (a 4's peek target, a 5's activation order, a 2's
   discard, a Queen's move source, a 10's second target, a King's reactivation order).
-  These are modeled as separate decision nodes. See `DESIGN.md`.
+  These are modeled as separate decision nodes. See `CLAUDE.md`, Architecture.
 - **Resolution order is always the acting player's choice**, and always **adaptive**: when
   one action queues several resolutions (a 5's flips, a King's reactivations, a 5 that flips
   a King which then re-empowers the lane), the player picks the next one to resolve *after*

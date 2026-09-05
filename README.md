@@ -4,16 +4,19 @@ An engine and self-play agent for [Duel 52](https://www.juddmadden.com/duel52/in
 the two-player combat card game by Judd Madden and Nina Riddell that uses a standard 52
 card deck.
 
-The goal is to answer a question nobody has published an answer to: what does optimal play
-actually look like? As far as I can tell there is no existing engine, bot, or strategy
-analysis for this game.
+It exists to answer two questions nobody has published an answer to. **What does optimal play
+actually look like**, and **is the game balanced**? As far as I can tell there is no existing
+engine, bot, or strategy analysis for this game, so there is nothing to read and the only way
+to find out is to build a player strong enough to ask.
+
+The insight is the deliverable. The bot is the instrument.
 
 ## Try it
 
-A Rust toolchain is all you need to play. The engine has zero
-dependencies, so the build resolves nothing and takes about ten seconds. The trained agent
-ships with the repo — [models/duel52-split-gen031.d52nn](models/duel52-split-gen031.d52nn),
-3.6 MB, an ordinary git blob with no LFS to install.
+A Rust toolchain is all you need to play. The engine has zero dependencies, so the build
+resolves nothing and takes about ten seconds. The trained agent ships with the repo,
+[models/duel52-split-gen031.d52nn](models/duel52-split-gen031.d52nn), 3.6 MB, an ordinary git
+blob with no LFS to install.
 
 ```bash
 # No Rust yet? This is the whole install. On Windows, run the rustup-init.exe from
@@ -30,142 +33,142 @@ cargo build --release
     --opponent netmcts:models/duel52-split-gen031.d52nn@4096
 ```
 
-[models/README.md](models/README.md) records how the checkpoints were produced and what they
-score; [CLAUDE.md](CLAUDE.md) has the full command set, including recording a game and
-replaying it to see what the net thought at each of your decisions.
-
-## Status
-
-**There is a trained agent in the repo, and you can play it.** The engine plays the full game
-to spec, with 330 Rust tests named after the rule sections they check, 94 Python tests, PyO3
-bindings, and a text CLI. On top of it sits a frozen five-rung Elo ladder — random, greedy,
-flat Monte Carlo, PIMC and SO-ISMCTS — built on determinization, so every search agent
-reasons from its own information set rather than from the engine's ground truth.
-
-The AlphaZero loop now runs end to end. There is exactly one encoder and it lives in Rust; a
-network is defined and trained in PyTorch, evaluated in Rust, and a test asserts the two
-forward passes compute the same function. Self-play writes trajectory shards, the trainer
-replays and fits them, and a gate promotes a candidate only when it beats the incumbent over
-200 games.
-
-Three runs have gone through it, each on the same laptop and each changing one thing.
-
-1. **[gen016](models/duel52-split-gen016.d52nn)** — 57,000 self-play games in 1.94 hours, then
-   stopped, not because it had converged but because a 200-game promotion gate at a 0.55
-   threshold passes a genuinely-improving candidate only 39% of the time.
-2. **[gen022](models/duel52-split-gen022.d52nn)** — fixed that gate and, more importantly,
-   **uncapped the teacher**: self-play generates its policy targets at 256 simulations instead
-   of 64. The policy target *is* the visit distribution, so training at 64 had been teaching
-   the network to imitate a search hundreds of Elo weaker than the same weights already
-   produced.
-3. **[gen031](models/duel52-split-gen031.d52nn)**, the current default — showed every training
-   sample under a **random relabelling of the three lanes**. Duel 52 is invariant under all six
-   permutations of its lanes: no rule names a lane, orders them, or tells one from another. So
-   this is five extra exactly-correct views of every position for 0.29 ms a batch, and it
-   fixes a measured defect — the previous net had learned an arbitrary preference for lane 3.
-
-Each step is measured against the checkpoint it was trained from, **at equal simulations**,
-over 400 games:
-
-| | score (95% CI) | W–L–D | Elo |
-| --- | --- | --- | ---: |
-| `netmcts:gen031@256` vs `netmcts:gen022@256` | **0.6162 ± 0.0475** | 245–152–3 | **+82** |
-| `netmcts:gen022@256` vs `netmcts:gen016@256` | **0.6150 ± 0.0474** | 244–152–4 | **+81** |
-| `netmcts:gen031@256` vs `netmcts:gen016@256` | **0.7475 ± 0.0426** | 299–101–0 | **+189** |
-
-The third row is the first two composed and it checks out: +81 and +82 predict +163, and the
-direct measurement's interval runs +151 to +230.
-
-**The lane symmetry moved too, which is the mechanism rather than the score.** On 128
-positions that are exact relabellings of one another, the share of the opening prior going to
-each lane went .320 / .277 / **.403** to **.328 / .331 / .341**, and the number of them where
-the net picks the same next action regardless of which of three identical lanes it opened into
-went **82/128 to 114/128**. It is not simply a flatter policy — gen031 is marginally the
-sharper net. [FINDINGS.md](FINDINGS.md) F4.5 has the rest.
-
-**The ladder has stopped being useful and was not re-run.** gen022 already beat `greedy` and
-`pimc:8x1` at essentially 1.000; gen031 beats `ismcts:800`, the top hand-written rung,
-**200–0**. A rung that loses every game measures nothing about the winner. The last full fit,
-400 games a pairing, put gen022 at +1788 ± 58 against ±13–15 for every hand-written rung —
-a rating driven by a handful of losses is an extrapolation, and [PLAN.md](PLAN.md) §4.7
-retired the table there. ⚠️ Note also that Elo is **not comparable across two fits**:
-Bradley–Terry pins `random` at 0 and fits the rest to the whole graph, so pulling the top
-agent away stretches every rung beneath it. `FINDINGS.md` F4.2 does that arithmetic, and it is
-the second time the trap has caught this project.
-
-Every number above is scored against agents written for this project. The one external check
-that exists says something different: **the project owner beat gen016 five games out of
-five**, and no series has been played against either of the two agents since. That is the
-measurement Phase 4 turns on, and `duel52 play --record` now exists so that the next one is
-written down.
-
-**What the agent actually taught us about the game is in [FINDINGS.md](FINDINGS.md)** — that
-file is the point of the project, and the strategy results live there rather than here.
+Every prompt names the rule it is applying, so if you think the engine is wrong you can point
+at the line. `duel52 powers` prints the card-power reference, and `duel52 demo --seed 47`
+watches a game play out action by action.
 
 ## The game, briefly
 
-Three lanes, three actions per turn, every card has a power tied to its rank. Cards are
+Three lanes, three actions per turn, and every card has a power tied to its rank. Cards are
 played face down and flipped to activate. You win a lane by clearing it once neither player
 can play more cards, and you win the game by taking two lanes.
 
-Two properties make it interesting as an AI problem:
+Three properties make it interesting, and all three shape everything below:
 
-1. Ten cards are removed unseen at setup, so uncertainty about hidden cards never fully
+1. **Ten cards are removed unseen at setup**, so uncertainty about hidden cards never fully
    resolves, even at the end of the game.
-2. Lane wins require an empty draw pile and an empty opposing hand, so the entire draw
+2. **Lane wins require an empty draw pile and an empty opposing hand**, so the entire draw
    phase is positional. Nothing is decided until the deck runs dry.
+3. **Suits do not matter.** Rank is the whole of a card's identity.
 
-## Plan
+## Status
 
-**Phase 1: Engine.** ✅ Rust core with exact rules, PyO3 bindings, one test per ruling, and a
-text CLI to play against. Ends with random vs random statistics.
+There is a trained agent in the repo and you can play it. The engine plays the full game to
+spec, with 332 Rust tests named after the rule sections they check, 94 Python tests, PyO3
+bindings, and a text CLI.
 
-**Phase 2: Baselines.** ✅ Random, greedy, flat Monte Carlo, PIMC, and ISMCTS with random
-rollouts, on determinized worlds. Frozen as a permanent Elo ladder, plus instrumented
-self-play for the first strategic measurements.
+The AlphaZero style training loop runs end to end. There is exactly one encoder and it lives
+in Rust; a network is defined and trained in PyTorch, evaluated in Rust, and a test asserts
+the two forward passes compute the same function.
 
-**Phase 3: Neural self-play.** ✅ AlphaZero style loop using information set MCTS: encoders,
-network and inference path, then net-guided search, then self-play, replay, fitting and a
-promotion gate around them. The first trained checkpoint is in [models/](models/) — two hours
-on a laptop, and +495 Elo clear of the hand-written ladder.
+Three runs have gone through it, each on the same laptop, each warm started from the one
+before, and each changing exactly one thing:
 
-**Phase 4: Scale up.** 🚧 The gate is fixed, the teacher is uncapped, the games are recorded,
-and two further laptop runs have banked **+189 Elo at equal simulations** over the first
-agent — +81 from uncapping the teacher, +82 from lane-permutation augmentation. What is left
-is the part that needs rented cores: one long from-scratch run at a deeper trunk, which a warm
-start cannot do because it cannot change the shape of the network it inherits. The exit
-criterion is not an Elo number — the ladder is anchored at `random`, every rung was written
-here, and it has stopped resolving anything at the top. It is that the agent takes a game off
-the project owner, who beat the first one 5–0.
+| Agent | The one change |
+|---|---|
+| [gen016](models/duel52-split-gen016.d52nn) | The loop itself, from a random init. 57,000 self-play games in 1.94 hours |
+| [gen022](models/duel52-split-gen022.d52nn) | Teacher search raised from 64 simulations to 256 |
+| [gen031](models/duel52-split-gen031.d52nn) | Every training sample relabelled by a random permutation of the three lanes |
 
-**Phase 5: Extract the insight.** Learned card values, opening frequencies, flip timing,
-lane commitment, and first player advantage with error bars. Hand size and flip timing are
-already in — instrumenting the trained agent answered them early, because it is the first
-player here *capable* of the behaviour the hypotheses are about.
+Rated against each other at equal simulations, 400 games per pairing, with the first trained
+agent pinned at zero:
 
-**Phase 6: Verification.** How strong is it *really* — local best-response as an
-exploitability proxy, and a cross-check against exact CFR on a scaled down variant small
-enough to solve.
+| agent | Elo | +/- | expected vs. gen016 |
+|---|---:|---:|---:|
+| `netmcts:gen031@256` | **+157** | 13 | 0.711 |
+| `netmcts:gen022@256` | +91 | 13 | 0.628 |
+| `netmcts:gen016@256` | 0 | 0 | 0.500 |
 
-**Phase 7:** R-NaD for an approximate Nash policy rather than a merely strong one, if and only
-if Phase 4 trips one of the two tripwires in [PLAN.md](PLAN.md) §4.8.
+**gen016 is the floor because the hand-written ladder is saturated.** Five hand-written agents
+(random, greedy, flat Monte Carlo, PIMC, information set MCTS) were the benchmark for two
+phases. gen031 beats the strongest of them 200 games to 0, and a rung that loses every game
+measures nothing about the winner.
 
-Everything runs locally on an M series Mac and scales to rented hardware through config alone.
-Note which hardware: 87% of the training loop is Rust self-play on CPU cores and 4% is
-gradient work, so the thing to rent is cores. A GPU changes about 1.5% of it.
+**Every number above is scored against agents written for this project.** The one external
+check that exists says something different: the project owner beat gen016 five games out of
+five, and no series has been played against the two agents since. That is the measurement the
+project turns on, which is why [PLAN.md](PLAN.md) puts it first.
+
+What the agents have taught us about the game is in [FINDINGS.md](FINDINGS.md). That file is
+the point of the project.
+
+## Recording a game and replaying it
+
+A self-play table tells you an agent is strong. A replay tells you where a human and the agent
+disagree, which is the only place a strategy insight can come from.
+
+```bash
+# Play, and append the finished game to a file.
+./target/release/duel52 play --encoding-slots 21 --seed 123 \
+    --record games/mine.jsonl \
+    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+
+./target/release/duel52 replay --record games/mine.jsonl            # what is in the file
+./target/release/duel52 replay --record games/mine.jsonl --game 1   # walk it
+./target/release/duel52 replay --record games/mine.jsonl --game 1 --node 34   # and the board
+```
+
+A record is `(config, seed, chosen indices)` and nothing else. The engine is deterministic, so
+those three things replay the game exactly, including the hidden information and the ten cards
+removed unseen. A 158-node game is under a kilobyte, which is why the games are committed to
+the repo. Only finished games are written: a half-played game cannot be checked against an
+outcome, and that check is what makes an old record trustworthy.
+
+The walk prints one row per decision you made:
+
+```
+node      actor   value  played                              prior  second opinion
+   6     P0 you   -0.00  PLAY  7 face-down into lane 1       0.076  search: PLAY  8 face-down into lane 1 (90% of visits, v +0.09)
+   8     P0 you   -0.35  FLIP  lane 2 #2 (8 2H) -> reveals   0.190  search agrees (58% of visits, v -0.18)
+```
+
+- **`value`** is the net's score for the position from your seat, on -1 to +1.
+- **`prior`** is the probability its policy head put on the move you actually chose.
+- **`second opinion`** is what a full search would have played instead, with its share of
+  visits.
+
+The checkpoint and search budget default to the agent that actually played the game, so a bare
+`replay --game 1` says what your opponent was thinking at the time. Passing `--checkpoint`
+scores the same game with a different net, which is how an old game becomes a permanent
+evaluation set for a new one.
+
+The footer counts the nodes where the value head was **confident and wrong**: `|v| > 0.6`,
+better than four to one, backing the side that went on to lose. A value head that is uncertain
+is behaving correctly. One that confidently backs a loser is the failure everything past the
+search horizon inherits.
+
+**`node`, `turn` and `round` are three different counters** and the replay prints two of them.
+A node is one decision offered to one player. A turn is one player's turn of three actions
+(two on the opening turn, four after an Ace). A round is both players' turns and nothing counts
+it. Sub-decisions are separate nodes that cost no action, so the node column climbs about 3.4
+per turn.
+
+## Where the project is going
+
+[PLAN.md](PLAN.md) has the detail. In short, the next work is not a bigger training run:
+
+1. **Play and record a human series against gen031.** The only external measurement there is.
+2. **Turn the hand-size result from a correlation into a cause.** The agents hoard cards
+   through the whole draw phase and the side holding more at the seam is the side that wins.
+   If that is causal, the published win condition rewards stalling, which is a balance finding.
+3. **Measure lane commitment after the seam** rather than across the whole game.
+4. **Build a card value table.** Whether the thirteen powers are worth comparable amounts is
+   the balance question, and nothing answers it yet.
+5. **First-player advantage across all three variants**, which costs a training run per
+   variant because the observation layout is per-variant.
+6. **Exploitability**, so that "optimal" is a word the project is allowed to use.
+7. **The long from-scratch run on rented cores**, last, because it answers none of the above.
 
 ## Docs
 
 | File | Contents |
 | --- | --- |
-| [game_rules.md](game_rules.md) | The spec. Disambiguated ruleset the engine implements. |
-| [DESIGN.md](DESIGN.md) | Engine and model architecture. |
-| [PLAN.md](PLAN.md) | Phased roadmap with status. |
-| [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) | Unresolved rules and design questions. |
-| [FINDINGS.md](FINDINGS.md) | Results, and hypotheses recorded before any data. |
-| [REPLAY.md](REPLAY.md) | How to read `duel52 replay` — the value, prior and second-opinion columns, and the board. |
+| [game_rules.md](game_rules.md) | The spec. The disambiguated ruleset the engine implements. |
+| [PLAN.md](PLAN.md) | What is done, and in detail what is next and why. |
+| [FINDINGS.md](FINDINGS.md) | What the trained agents have shown about the game. |
 | [models/README.md](models/README.md) | The shipped checkpoints: how each was trained, and what it scores. |
-| [CLAUDE.md](CLAUDE.md) | Commands, repo layout, and the facts that are easy to get wrong. |
+| [CLAUDE.md](CLAUDE.md) | Commands, repo layout, architecture, and the facts that are easy to get wrong. |
+| [archive/](archive/) | The superseded working documents, frozen for provenance. |
 
 ## Layout
 
@@ -173,22 +176,27 @@ gradient work, so the thing to rent is cores. A GPU changes about 1.5% of it.
 engine/      the rules engine (zero dependencies) and the `duel52` CLI
   tests/     one named test per ruling, named for its rule section
 bindings/    PyO3 wrapper, kept separate so the engine never depends on Python
-py/duel52/   the Python package
-configs/     variant configs: split (default), base, mirrored, split-raw-two
+py/duel52/   the Python package: training loop and analysis, never an encoder
+configs/     variant configs (split is the default) and training configs
 models/      trained checkpoints, tracked in git, with their provenance
+games/       recorded human games, a few hundred bytes each
+archive/     superseded working documents
 ```
 
-Training output — `runs/` and `checkpoints/` — is deliberately not tracked. A run is
-reproducible from its config and seed, and the one checkpoint worth keeping is copied into
-`models/` by hand.
+Training output, `runs/` and `checkpoints/`, is deliberately not tracked. A run is reproducible
+from its config and seed, and the one checkpoint worth keeping is copied into `models/` by
+hand.
 
 ## A note on rules
 
-`game_rules.md` is not a copy of the official rules. It is an engine ready version, with
-every claim tagged as either published, resolved by a player, or inferred and pending
-confirmation. It also specifies the red and black split deck variant common among regular
-players, which is the default configuration here because symmetric material makes results
-much cleaner to measure.
+`game_rules.md` is not a copy of the official rules. It is an engine ready version, with every
+claim tagged as either published, resolved by a player, or inferred and pending confirmation.
+It also specifies the red and black split deck variant common among regular players, which is
+the default configuration here because symmetric material makes results much cleaner to
+measure.
+
+One ruling is worth knowing before you play: **actions are mandatory and there is no pass.**
+The published rules say "take three actions" and stop, so a player who can act must act.
 
 ## License
 

@@ -8,6 +8,12 @@ than by quietly playing badly.
 Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to install. They are
 ~3.6 MB each, which is what a 949k-parameter fp32 net costs.
 
+> **Note on the citations below.** `PLAN.md` and `FINDINGS.md` were rewritten on 2026-09-05.
+> `PLAN.md` no longer has numbered sections, so a `§4.x` reference here points at
+> `archive/PLAN.md`; the same goes for any `FINDINGS.md` F1.x, F2.x or F3.x, which are in
+> `archive/FINDINGS.md`. F4.1, F4.3 and F4.5 still resolve in the live file. The measurements
+> in this document are unchanged and were not re-run.
+
 | File | Variant | Slots | Params | Provenance |
 | --- | --- | --- | --- | --- |
 | **[duel52-split-gen031.d52nn](duel52-split-gen031.d52nn)** — the default | `split` | 21 | 949,267 | Phase 4 `train-3h`, warm-started from gen022, lane augmentation |

@@ -10,11 +10,18 @@ the instrument.
 | File | Purpose |
 |---|---|
 | `game_rules.md` | **The spec.** Canonical, disambiguated ruleset. The engine implements this. |
-| `DESIGN.md` | Engine + model architecture: state, action encoding, observations, training. |
-| `PLAN.md` | Phased roadmap with status. Update as phases complete. |
-| `OPEN_QUESTIONS.md` | Unresolved rules and design questions. Resolve → move the ruling into `game_rules.md` and delete the entry. |
+| `PLAN.md` | What is done, and in detail what is next and why. Update as items close. |
 | `FINDINGS.md` | Strategy insights as they emerge. This is the actual output of the project. |
-| `REPLAY.md` | How to read `duel52 replay`: the columns, the board notation, and the §4.0a buckets. |
+| `README.md` | The public front door, and where `duel52 replay` is documented. |
+| `CLAUDE.md` | This file. Commands, architecture, and the traps. |
+| `archive/` | The superseded working docs, frozen 2026-09-05 and not maintained. |
+
+⚠️ **`DESIGN.md`, `OPEN_QUESTIONS.md` and `REPLAY.md` were archived on 2026-09-05.** Roughly 90
+source comments still cite `DESIGN.md §N`; those section numbers are unchanged and refer to
+`archive/DESIGN.md`. The parts that are still load-bearing were moved into the Architecture
+section below, so read that first and only open the archive for the rationale behind a
+decision. `OPEN_QUESTIONS.md` was archived because it closed: every rules question raised for
+this project has been answered and ported into `game_rules.md`.
 
 ## Facts that are easy to get wrong
 
@@ -34,10 +41,11 @@ Read `game_rules.md` before touching engine code. These six trip people up:
    to one player (`replay`'s `node` column, `--node N`); a **turn** is one player's turn —
    3 actions, 2 on the opening turn, 4 after an Ace (`turn N` on every board, `GameState::ply`);
    a **round** is both players' turns and nothing counts it. Game 2 of the corpus is 172 nodes
-   = 51 turns. `ply` survives *only* as the spec's synonym for a turn (`game_rules.md` §7,
-   `stalemate_quiet_plies`, `max_plies`, and every `FINDINGS.md` length), because those config
-   keys are written verbatim into each game record and renaming them would stop old games
-   replaying. No user-facing line of `replay` or the board says "ply". See `REPLAY.md` §0.
+   = 51 turns, so the node column climbs about 3.4 per turn. `ply` survives *only* as the
+   spec's synonym for a turn (`game_rules.md` §7, `stalemate_quiet_plies`, `max_plies`, and
+   every `FINDINGS.md` length), because those config keys are written verbatim into each game
+   record and renaming them would stop old games replaying. No user-facing line of `replay` or
+   the board says "ply". `README.md` has the reader-facing version.
 
 ## Conventions
 
@@ -57,9 +65,13 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 
 ## Working agreements
 
-- When a rules question comes up, check `OPEN_QUESTIONS.md` first. If it's not there and
-  the online implementation at <https://www.juddmadden.com/duel52/play.html> can settle it,
-  settle it there rather than interrupting the owner. Escalate only what testing can't answer.
+- When a rules question comes up, check `game_rules.md` first: several rulings are stated once
+  in a general form (resolution ordering, mandatory powers, fizzling) rather than repeated per
+  card, so the answer is often already there. If it is not, and the online implementation at
+  <https://www.juddmadden.com/duel52/play.html> can settle it, settle it there rather than
+  interrupting the owner. Escalate only what testing can't answer, and record the ruling in
+  `game_rules.md` with its marker. `archive/OPEN_QUESTIONS.md` holds the rulings that reversed
+  an earlier answer, which is worth reading before re-deriving a superseded one.
 - Owner has limited time on this project and is delegating implementation. Prefer making a
   defensible call, documenting it as `[ASSUMED]`, and flagging it — over blocking.
 - Log measured results in `FINDINGS.md` with the config and seed range that produced them.
@@ -71,7 +83,7 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 330 tests: rules, determinism, information hiding,
+cargo test                               # 332 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, and
                                          # the training corpus
 
@@ -87,8 +99,8 @@ cargo test                               # 330 tests: rules, determinism, inform
 
 # Record what you played, then ask the net about it (PLAN.md §4.0). A game is
 # (config, seed, chosen indices), so a 153-node game is 918 bytes and replays exactly —
-# hidden information included. Only finished games are written. `REPLAY.md` reads the output;
-# its §0 is the node / turn / round distinction, which is the thing to get straight first.
+# hidden information included. Only finished games are written. README.md's "Recording a game
+# and replaying it" reads the output; get the node / turn / round distinction straight first.
 ./target/release/duel52 play --encoding-slots 21 --seed 101 \
     --record games/owner-vs-gen031.jsonl \
     --opponent netmcts:models/duel52-split-gen031.d52nn@4096
@@ -100,11 +112,26 @@ cargo test                               # 330 tests: rules, determinism, inform
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
 ./target/release/duel52 config configs/split.toml          # validate a config file
 
-# Phase 2 agents. Budgets are part of the agent name, so a result row names the agent that
+# Rating agents. Budgets are part of the agent name, so a result row names the agent that
 # produced it: random · greedy · flatmc:600 · pimc:32x1 · ismcts:800.
-./target/release/duel52 ladder --games 400 --markdown      # the frozen Elo table (~26 min)
+#
+# ⚠️ THE HAND-WRITTEN LADDER IS RETIRED. gen031 beats ismcts:800, its top rung, 200-0, so a
+# fit that includes those rungs is an extrapolation off a handful of losses. The live scale is
+# the three trained agents with gen016 pinned at 0 (FINDINGS.md, "The scale"). `--anchor` is
+# what pins it, and it errors rather than falling back if the name is not in --agents, because
+# the old silent fallback was "whichever agent you listed first".
+./target/release/duel52 ladder --games 400 --seed 1 --variant split \
+    --encoding-slots 21 --stalemate-value 0.0 \
+    --anchor netmcts:models/duel52-split-gen016.d52nn@256 \
+    --agents netmcts:models/duel52-split-gen016.d52nn@256,\
+netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.d52nn@256
+# ~11 min. Drop --markdown to also get the per-pairing detail the fit was made of.
 ./target/release/duel52 match --a ismcts:800 --b pimc:32x1 --games 400
-./target/release/duel52 probe --games 300 --markdown       # self-play behaviour per rung
+./target/release/duel52 probe --games 400 --markdown --seed 1 --encoding-slots 21 \
+    --agents netmcts:models/duel52-split-gen031.d52nn@256,random
+# probe is self-play instrumentation and it is where FINDINGS.md's strong-play tables come
+# from. Keep `random` in the roster: lane and attack concentration have no absolute scale, so
+# a number like 0.907 is meaningless without uniform play's 0.777 in the same table.
 
 # Phase 3 step 1. A checkpoint is written in Python and played in Rust; the header's layout
 # hashes are what stop the two sides drifting apart.
@@ -211,6 +238,69 @@ and gen022 is now the frozen incumbent for the next run. All three still load �
 has moved since gen016, and lane augmentation did not move one either, because it transforms
 training data and nothing else.
 
+## Architecture
+
+The parts of the archived `DESIGN.md` that still bind. `engine/src/encode.rs` is the authority
+on both layouts and documents them block by block; this is the summary.
+
+**Stack.** Rules, search and inference in Rust with zero dependencies. Training in PyTorch.
+PyO3 bridges them. The engine is the sole authority on legality and never depends on Python.
+
+**Action encoding: a fixed 1324-wide policy head, legality-masked and phase-conditioned.**
+`L = 3` lanes, `S = 16` slots (`config.encoding_slots`), `R = 13` ranks, all derived from
+config so a smaller variant shrinks the head rather than misaligning it:
+
+| block | formula | at S=16 | engine `Action` |
+|---|---|---:|---|
+| `PLAY(rank, lane)` | `R·L` | 39 | `Play { rank, lane }` |
+| `FLIP(lane, slot)` | `L·S` | 48 | `Flip { lane, slot }` |
+| `ATTACK(lane, atk, tgt)` | `L·S·S` | 768 | `Attack { lane, attacker, target }` |
+| `PAIR(lane, a<b)` | `L·S(S−1)/2` | 360 | `DeclarePair { lane, slot_a, slot_b }` |
+| `CHOOSE_SLOT(side, lane, slot)` | `2·L·S` | 96 | `Peek` / `ResolveNext` / `MoveHere` / `SplitTarget` |
+| `CHOOSE_RANK(rank)` | `R` | 13 | `GiveBack { rank }` |
+| **total** | | **1324** | |
+
+There is **no `PASS` block**, and every logit is therefore something a player chooses. That is
+what makes a policy target a distribution over choices rather than a mixture of choices and
+bookkeeping.
+
+**Observation encoding: 3300 floats per observer** at the default config, dominated by the
+board tensor of `3 lanes × 2 sides × 16 slots × 33 features = 3168`. Sides are ordered
+`[observer, opponent]`, so the tensor is always from the observer's point of view and the
+network never learns a seat convention. The remaining 132 are scalars (phase, actions
+remaining, hand and pile sizes, discard rank counts, lane-derived counts) plus **belief
+features**: unseen-card rank counts from this observer's perspective. Those never reach zero
+uncertainty, because the 10 cards removed at setup stay permanently indistinguishable from
+cards in the opponent's hand or base. The size tracks `encoding_slots` almost linearly, which
+is why 21 slots gives `obs_dim = 4290` and every command in a run has to agree on it.
+
+**Search.** Information-set MCTS with per-simulation determinization, PUCT over the policy
+prior, and the value head in place of rollouts. Every agent decides from a sampled world, never
+from the state it is handed.
+
+**Training loop.** Rust self-play writes `.d52sp` trajectory shards; Python replays them into a
+buffer, fits, and writes a `.d52nn` checkpoint; a gate promotes a candidate only when it beats
+the incumbent over enough games to have an interval. At 256 simulations a generation is about
+two-thirds self-play and one-third evaluation, and the gradient step is roughly 4%.
+
+**`duel52 replay`'s verbs**, since the board and the walk both use them:
+
+| Verb | Action |
+|---|---|
+| `PLAY` | Put a card from hand, face-down, into a lane |
+| `FLIP` | Turn one of your face-down cards face-up, firing its power |
+| `ATK` | Attack: `lane L: your #a [card] -> opp #b [card]` |
+| `PAIR` | Declare two same-rank cards on your side of a lane as a pair |
+| `2ND` | A 10's Twinstrike: the second of its two targets |
+| `NEXT` | Adaptive resolution order (§8): which pending power resolves next. Often forced, and then it shows a prior of 1.000 |
+| `MOVE` | A Queen's Move: pull an allied card from another lane into hers |
+| `PEEK` | A 4's Foresight: look privately at one face-down card, either side's |
+| `BACK` | A 2's View: bottom a card from hand (house rule) or discard it, per `two_power` |
+
+Numbering (`#1`, `#2`, …) is `display.rs`'s `column_slots` order, the same order the board
+draws a column in and the same order the CLI menus use. It is the one place in the codebase
+where lanes and cards are numbered from 1.
+
 ## Where things are
 
 | Path | What |
@@ -252,7 +342,7 @@ Three structural points that are easy to undo by accident:
   `phase3_observation_is_a_function_of_the_information_set`, which asserts the observation
   tensor is bit-identical between a state and a determinized world.
 
-- **Sub-decisions are separate zero-cost decision nodes on a stack** (`DESIGN.md` §4). A 5
+- **Sub-decisions are separate zero-cost decision nodes on a stack** (Architecture, above). A 5
   that flips a King that re-empowers the lane resolves correctly because of this. Collapsing
   them into one big action would blow up the branching factor and break §8's adaptive
   ordering.
