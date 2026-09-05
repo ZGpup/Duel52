@@ -8,6 +8,32 @@ The goal is to answer a question nobody has published an answer to: what does op
 actually look like? As far as I can tell there is no existing engine, bot, or strategy
 analysis for this game. The agent is the instrument. The insight is the deliverable.
 
+## Try it
+
+A Rust toolchain is all you need to play — anything from 1.75 on. The engine has zero
+dependencies, so the build resolves nothing and takes about ten seconds. The trained agent
+ships with the repo — [models/duel52-split-gen022.d52nn](models/duel52-split-gen022.d52nn),
+3.6 MB, an ordinary git blob with no LFS to install.
+
+```bash
+# No Rust yet? This is the whole install. On Windows, run the rustup-init.exe from
+# https://rustup.rs instead. Then restart the shell, or `source "$HOME/.cargo/env"`,
+# so that `cargo` is on PATH.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+git clone https://github.com/ZGpup/Duel52.git && cd Duel52
+cargo build --release
+
+# Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
+# size of the observation, and the checkpoint refuses to load against any other value.
+./target/release/duel52 play --encoding-slots 21 \
+    --opponent netmcts:models/duel52-split-gen022.d52nn@4096
+```
+
+[models/README.md](models/README.md) records how the checkpoints were produced and what they
+score; [CLAUDE.md](CLAUDE.md) has the full command set, including recording a game and
+replaying it to see what the net thought at each of your decisions.
+
 ## Status
 
 **There is a trained agent in the repo, and you can play it.** The engine plays the full game
@@ -69,32 +95,6 @@ against gen022 has been played yet. That is the measurement Phase 4 turns on, an
 
 **What the agent actually taught us about the game is in [FINDINGS.md](FINDINGS.md)** — that
 file is the point of the project, and the strategy results live there rather than here.
-
-## Try it
-
-A Rust toolchain is all you need to play — anything from 1.75 on. The engine has zero
-dependencies, so the build resolves nothing and takes about ten seconds. The trained agent
-ships with the repo — [models/duel52-split-gen022.d52nn](models/duel52-split-gen022.d52nn),
-3.6 MB, an ordinary git blob with no LFS to install.
-
-```bash
-# No Rust yet? This is the whole install. On Windows, run the rustup-init.exe from
-# https://rustup.rs instead. Then restart the shell, or `source "$HOME/.cargo/env"`,
-# so that `cargo` is on PATH.
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-git clone https://github.com/ZGpup/Duel52.git && cd Duel52
-cargo build --release
-
-# Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
-# size of the observation, and the checkpoint refuses to load against any other value.
-./target/release/duel52 play --encoding-slots 21 \
-    --opponent netmcts:models/duel52-split-gen022.d52nn@4096
-```
-
-[models/README.md](models/README.md) records how the checkpoints were produced and what they
-score; [CLAUDE.md](CLAUDE.md) has the full command set, including recording a game and
-replaying it to see what the net thought at each of your decisions.
 
 ## The game, briefly
 
