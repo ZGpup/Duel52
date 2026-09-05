@@ -620,6 +620,191 @@ is the per-generation gen016 column from change 2 plus the held-out value MSE fr
 which together say *during* the run whether it is working. If it is not, §4.5 Stage 4 runs the
 grid.
 
+### 4.2a Lane-permutation augmentation — six exact relabellings of every sample `[x]`
+
+**Duel 52 is invariant under any permutation of its three lanes.** `game_rules.md` contains no
+rule that names a lane, orders them, or tells one from another: a lane is won by the same
+condition wherever it sits, `lanes_to_win = 2` counts lanes without regard to which two, and
+the one power that crosses lanes — the Queen's Move — names *another* lane, never a particular
+one. So for every position `s` and every element `σ` of S₃ there is a position `σ(s)` with the
+same value, whose legal actions are `σ` applied to `s`'s, and whose optimal policy is `σ`
+applied to `s`'s. This is exact rather than approximate, and it holds at **every** position in
+the game, not only on the symmetric opening.
+
+**Six, and six is the whole free lunch.** |S₃| = 6, one of which is the identity, so it is five
+new views of every sample. The symmetries a card game usually also offers are gone or were
+never here: suits collapsed to rank at the spec, colour denotes deck ownership rather than
+anything mechanical, and **the two seats are genuinely asymmetric** — the first player takes
+two actions on the opening turn (§2), and `observer_is_first_player` is a real feature that
+`encode.rs` documents as such. Whether slot order *within* a lane side is also a symmetry is
+an open question and is not claimed here; §8's adaptive resolution order is the reason to
+check rather than assume.
+
+**What it buys, stated honestly.** Not six times the information about the game — the games are
+the same games. Three things:
+
+1. **It makes a class of error impossible instead of merely unlikely.** `FINDINGS.md` F4.3
+   measures gen022 spending real capacity on an arbitrary preference for lane 3: the opening
+   prior splits .320 / .277 / .403 where it must be .333 each, lane 3 outranks lane 1 in 24 of
+   24 seeds, and the top second action changes *verb* with the lane in 38 of 128 probes. Every
+   parameter doing that is a parameter not doing something useful.
+2. **Sample efficiency exactly where this run family is short of it.** `train-2h.toml` already
+   flags itself as data-starved — 82k new samples a generation against `train-fast`'s 205k.
+   The buffer holds 6 generations, so a sample is drawn ~5–6 times over its life; with a fresh
+   `σ` per draw the net sees essentially all six views of every position **at zero extra
+   compute and zero extra RAM**.
+3. **A free regression metric.** F4.3's last row — does the top second action agree across the
+   three lanes — costs about two minutes, needs no opponent and no ladder, and already reads
+   2/43 → 6/43 → 28/43 across the untrained net, gen016 and gen022.
+
+**It is a training-data transform and changes nothing else.** No layout hash moves, gen022 and
+gen016 stay loadable, every existing `.d52sp` shard stays valid, and the engine plays exactly
+the game it played yesterday. That is what makes this cheap.
+
+**[code, ~120 lines] Where it goes.**
+
+- **`encode.rs` owns the tables**, because every lane-indexed field is a pure function of the
+  lane index and one table per `σ` therefore covers all of them at once:
+  `((lane * 2 + side) * slots + slot) * features` puts the lane outermost, so the board is a
+  permutation of three contiguous `2 × slots × features` chunks; `lane_counts` is the only
+  lane-indexed scalar (4 floats per lane,
+  lane-major); `FLIP`, `ATTACK`, `PAIR` and `CHOOSE_SLOT` are lane-major, `PLAY` is
+  `rank * lanes + lane` and so strided, and `CHOOSE_RANK` is untouched.
+- Expose it as `duel52.lane_permutations()` returning the six `(obs_perm, action_perm)` pairs.
+  **Rust computes the table, Python applies the gather.** This is the encoder rule (`CLAUDE.md`)
+  and not a new one: a permutation table derived in Python is a second copy of the layout.
+- **`buffer.py` applies it at batch-draw time, not at shard-replay time** — one random `σ` per
+  sample per draw. `replay_shard` already returns the observation sparse (`obs_index` /
+  `obs_value`) and the policy target sparse (`policy_index` / `policy_prob`), so augmenting is
+  an index remap on two short arrays. Materialising all six copies instead would be ~3.7 GB of
+  buffer and 6× the gradient steps for the same effect.
+- The value and `root_value` targets are unchanged; a relabelling cannot move a game's result.
+- Config: `[train] lane_augment = true`.
+
+**Tests.** ⚠️ **A wrong permutation table is silent.** The net trains on mismatched targets and
+comes out merely bad, with the training run as the natural suspect — the same failure mode
+`CLAUDE.md` describes for a second encoder, and it needs the same kind of guard:
+
+- `phase4_lane_permutation_commutes_with_the_encoder` — build a position with `testkit`,
+  permute the *state's* lanes, and assert `encode_observation(σ(s))` equals
+  `permute(encode_observation(s))` and `encode_action(σ(a), σ(s))` equals
+  `action_perm[encode_action(a, s)]`, for all six `σ`. This checks the table against the
+  encoder rather than against a second reading of the layout, which is the only check worth
+  having.
+- The six tables compose as S₃, the identity table is the identity, each is a bijection.
+
+**The code is in, 2026-09-05, and it is where this section said to put it.**
+`encode::lane_permutations` returns the six `(lanes, obs, action)` index maps, both running
+old index → new index because that is the direction a sparse sample is augmented in;
+`duel52.lane_permutations()` hands them to Python as flat `u32` buffers;
+`buffer.LaneAugmenter` gathers with them at batch-draw time, one σ per sample per draw; the
+holdout path does not. `[train] lane_augment` is the switch and defaults off, so every earlier
+run reproduces unchanged. Nine tests, plus `train check`, which builds the tables before a run
+rather than merely describing them. Four of the nine carry the weight:
+
+- `phase4_lane_permutation_commutes_with_the_encoder` — the guard this section asked for,
+  over `sample_positions()` and every sub-decision phase: relabel the *state's* lanes with
+  `testkit::permute_lanes`, and the encoder's own output must move exactly where the table
+  says, for all six σ, from both seats. It also asserts the relabelled position offers the
+  relabelled actions, which is the claim that makes a policy target permutable at all.
+  Verified to bite: dropping the `lane_counts` line from the table fails it at float 3288.
+- `lane_permutations_are_bijections_with_the_identity_first` and
+  `lane_permutation_tables_compose_as_s3` — the six are one group, not six bijections.
+- `test_augmentation_relabels_a_row_and_its_target_by_the_same_permutation` — Python's half:
+  the observation and the policy target of one row move together. Verified to bite.
+
+Cost, measured: **0.29 ms a batch** (0.96 → 1.25 ms at batch 512 on `runs/fourth/shards/gen001`),
+which at ~860 steps is a quarter of a second a generation against 13.5 minutes.
+
+And the regression metric is a command rather than a procedure — `python -m duel52.lanes`,
+two seconds, no opponent. It reproduces `FINDINGS.md` F4.3's published rows exactly by an
+independent route, which is also a third check on the tables.
+
+**Stage 0b — the three-hour run.** `configs/train-3h.toml`, warm-started from gen022:
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-3h.toml \
+    --run-dir runs/fifth --init-from models/duel52-split-gen022.d52nn
+```
+
+Four differences from `train-2h.toml`, and only the first is experimental:
+
+1. `[train] lane_augment = true`.
+2. `run.hours = 3.0`, `generations = 16` as the backstop — about 12 generations at Stage 0's
+   measured 14.7 minutes each. `run.seed = 4000000`, spanning 4,000,000–4,019,200, since the
+   third run holds 1,000,000+, Stage 0 holds 3,000,000+ and §4.3 reserves 2,000,000.
+3. `lr_schedule = [[0, 1.0], [5, 0.25], [9, 0.0625]]` — keyed to the twelve generations it will
+   finish rather than to the backstop, per Stage 0's own note. Stage 0's last tier arrived at
+   generation 7 of 8 and froze it.
+4. `gate.reference`'s third entry becomes `netmcts:models/duel52-split-gen022.d52nn@256`, the
+   frozen incumbent, so the per-generation column measures progress past the *shipped* agent
+   rather than past a checkpoint gen022 already beat.
+
+Everything else holds: `sims = 256`, `games = 1200`, `epochs_per_generation = 0.9`, the
+`128 × 3` trunk (pinned by the warm start, as in Stage 0), the learning rate, the gate.
+
+**On raising `selfplay.sims` again — not in this run.** Four reasons, in order of weight:
+
+- **Games are what the value head needs, and the value head is the diagnosed weak half.**
+  Change 7 above: `sims` improves the policy target, *games* improve the value target, one
+  outcome per game however many decisions it has. 4× the sims is 4× the self-play second, so
+  at a fixed three hours it takes 1200 games a generation down to 300 — roughly 20k samples,
+  against the 82k Stage 0 already called starved. Augmentation raises the *effective* sample
+  count but not the number of distinct outcomes, so it does not pay for this.
+- **Attribution.** Twelve generations and the reference column is the measurement. Two changes
+  in it and the column cannot say which one moved the number — the discipline `train-2h.toml`
+  applied to the learning rate.
+- **The predicted return is not measured for a *teacher*.** F3.8's +141 and +156 are search
+  scaling at *play* time. Used as a teacher, 64 → 256 returned +81 (F4.1) — a bit over half the
+  play-time figure. There is no measurement at all of teacher depth above 256.
+- **The measurement that should decide it has now been run, and it says no.** §4.7's repeated
+  search-scaling sweep on gen022 — `FINDINGS.md` **F4.4**, 2026-09-05, 300 games a step, 45
+  minutes on 8 cores. gen022 does **not** absorb more search than gen016 did: +222 / +144 /
+  +139 / +104 against F3.8's +252 / +141 / +156 / +69, every step inside gen016's interval and
+  the same +610 Elo end to end. So the teacher stays at 256 for the run *after* this one as
+  well, and at F4.1's measured 56% teacher discount the 256 → 1024 step would buy about +78
+  Elo of teacher quality in exchange for three quarters of the games.
+
+**Exit criteria.**
+
+- **The payoff:** head-to-head against gen022 at equal simulations, 400 games. F4.1's
+  0.6150 ± 0.0474 is the number to read it against. This, not the symmetry metric, is what
+  says the change was worth three hours.
+- **The mechanism:** F4.3's probe re-run on the new checkpoint. Opening lane marginals should
+  go to .333 / .333 / .333 and the argmax agreement to ~128/128. ⚠️ **If this does not move,
+  the augmentation is not wired up and the run is a bug report, not a result** — check it after
+  generation 1 rather than at the end.
+- **The diagnostic:** the held-out value MSE (change 7), which is also where the second-order
+  claim lives — if six views per sample buy anything for the plateaued half, it shows up here.
+- **Not measured, and do not claim it:** what the lane bias costs in Elo. F4.3 is a measured
+  defect, not a measured loss, and this run is the first thing that can price it.
+
+**Run, 2026-09-05. `FINDINGS.md` F4.5, shipped as `models/duel52-split-gen031.d52nn`.** Ten
+generations in 2.78 h — the wall clock ended it, not the gate — five promoted, generation 9
+shipped. Against every criterion above:
+
+| criterion | target | measured |
+|---|---|---|
+| payoff | beat F4.1's 0.6150 ± 0.0474 | **0.6162 ± 0.0475** vs gen022 at 256, 400 games (+82 Elo) |
+| mechanism | opening prior → .333 each | .320/.277/.403 → **.328/.331/.341** |
+| mechanism | argmax agreement → ~128/128 | 82/128 → **114/128** |
+| diagnostic | held-out value MSE falls | **0.6355 → 0.5907**, monotone after generation 4 |
+
+Plus the two checks that were not asked for and should have been: gen031 is not merely a
+*flatter* policy (median top prior 0.384 against gen022's 0.380 — it is sharper), and F4.3's
+price-in-nats table falls from 0.195 to **0.016**. Both are in F4.5.
+
+⚠️ **The last bullet stands and the run did not resolve it.** +82 is augmentation plus three
+more hours of self-play on a checkpoint that had not plateaued on strength, and this run
+cannot divide them. Pricing the lane bias needs the ablation — the same config with
+`lane_augment = false` — which is another three hours and is not scheduled.
+
+⚠️ **The generation-1 tripwire above is aimed at the wrong row.** At generation 1 the argmax
+agreement read 86/128 against gen022's 82/128, which is inside noise and would have been read
+as "not wired up"; the policy-TV row had already moved 0.152 → 0.113. **Watch TV, not
+agreement, at generation 1** — TV is continuous, agreement is an argmax over near-ties and
+only breaks late. F4.5.
+
 ### 4.3 Sizing the run — the arithmetic `[ ]`
 
 From F3.4 and F3.11, one formula covers it:
@@ -790,6 +975,35 @@ MSE falling is change 7 having been the right diagnosis. If the gen016 column is
 eight generations, the teacher was not the binding constraint and `train-big.toml`'s 24 hours
 should be spent knowing that.
 
+**Stage 0b — three hours on the laptop, one experimental change: lane-permutation
+augmentation.** §4.2a has the justification, the code tasks, the config diff from
+`train-2h.toml` and the exit criteria; `FINDINGS.md` F4.3 is the measurement that motivates it.
+It warm-starts from gen022 and is `128 × 3` for the same reason Stage 0 was. Two things worth
+lifting out of §4.2a here: **`selfplay.sims` stays at 256** — at a fixed budget a 4× teacher
+costs 4× the games, and games are what the plateaued value head needs — and §4.7's search
+scaling sweep should be run on gen022 *first*, because it is the measurement that decides the
+teacher depth for the run after this one.
+
+**Done, 2026-09-05 — `FINDINGS.md` F4.5, shipped as `models/duel52-split-gen031.d52nn`.**
+`configs/train-3h.toml` ran ten generations in 2.78 h and stopped on the wall clock;
+generation 9 was the last promotion and is the shipped file. It clears every exit criterion in
+§4.2a: **0.6162 ± 0.0475** against gen022 at equal simulations over 400 games (+82 Elo, the
+same margin the teacher uncap bought), the opening lane prior at .328 / .331 / .341, argmax
+agreement 82/128 → 114/128, and the held-out value MSE down 0.6355 → 0.5907. The table and the
+two caveats — that this does not *price* the lane bias, and that the generation-1 tripwire
+should watch policy TV rather than argmax agreement — are in §4.2a.
+
+```bash
+.venv/bin/python -m duel52.train check --config configs/train-3h.toml
+.venv/bin/python -m duel52.train run   --config configs/train-3h.toml --run-dir runs/fifth \
+    --init-from models/duel52-split-gen022.d52nn
+# after generation 1, and before walking away — this is the mechanism check, not a nicety.
+# Read the policy-TV row: the argmax row does not move for several generations.
+.venv/bin/python -m duel52.lanes --checkpoint runs/fifth/checkpoints/gen001.d52nn
+# after an interruption
+.venv/bin/python -m duel52.train run --config configs/train-3h.toml --run-dir runs/fifth --resume
+```
+
 **Stage 1 — one paid hour, measuring, before committing to 24.** In order:
 
 ```bash
@@ -870,9 +1084,21 @@ and the rented cores make them minutes instead of hours; a ladder at 400 games i
       scale. Compare gaps over a common rung, never row to row. F4.2 does the arithmetic.
 - [x] **Head-to-head vs gen016** at equal sims, 400 games — exit criterion 1. **0.6150 ±
       0.0474** (W244 L152 D4), about +81 Elo. Real, and below the 0.70 bar; see F4.1.
-- [ ] **The search-scaling sweep repeated** (F3.8's shape: `netpolicy` → @64 → @256 → @1024 →
-      @4096, ≥300 games a step). Whether the new net absorbs *more* search than gen016 did is
-      the single most informative number the run produces, and it feeds §4.8 directly.
+      Repeated for Stage 0b, 2026-09-05: gen031 scores **0.6162 ± 0.0475** on gen022 and
+      **0.7475 ± 0.0426** on gen016 (+189 Elo), which is the first row that clears the 0.70
+      bar — against the *first* agent, over two runs, not against the incumbent. F4.5.
+      **And it is the only rung still worth playing:** gen031 beats `ismcts:800` 200–0, so
+      every hand-written rung is now saturated and a checkpoint's only useful opponent is the
+      checkpoint before it.
+- [x] **The search-scaling sweep repeated** — run 2026-09-05 on gen022 at 300 games a step,
+      `FINDINGS.md` F4.4. **It does not absorb more search.** Every step is inside gen016's
+      interval and the two nets turn 64× more search into the same +610 Elo: +222 / +144 /
+      +139 / +104 against F3.8's +252 / +141 / +156 / +69. So F4.1's +81 is a better policy,
+      not a policy a tree can do more with — the two are separable and this run moved one.
+      Consequence, and it is the reason this was run first: **`selfplay.sims` stays at 256**,
+      now on evidence. At F4.1's measured 56% teacher discount, 256 → 1024 buys ~+78 Elo of
+      teacher for 4× the self-play second, which is 300 games a generation instead of 1200.
+      45 minutes on 8 cores, three quarters of it the @4096 row.
 - [ ] **`probe` against the same roster** as `FINDINGS.md`'s strong-play table, so hand@unlock,
       lane concentration and the flip-timing curve can be compared generation to generation.
       If the behavioural statistics moved, the strategy moved, and Phase 5's findings need

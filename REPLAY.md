@@ -46,8 +46,8 @@ kilobyte.
 
 ```bash
 ./target/release/duel52 play --encoding-slots 21 --seed 123 \
-    --record games/owner-vs-gen022.jsonl \
-    --opponent netmcts:models/duel52-split-gen022.d52nn@4096
+    --record games/owner-vs-gen031.jsonl \
+    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
 ```
 
 Two properties of the format are deliberate and worth knowing:

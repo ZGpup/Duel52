@@ -10,19 +10,180 @@ Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to ins
 
 | File | Variant | Slots | Params | Provenance |
 | --- | --- | --- | --- | --- |
-| **[duel52-split-gen022.d52nn](duel52-split-gen022.d52nn)** — the default | `split` | 21 | 949,267 | Phase 4 `train-2h`, warm-started from gen016 |
+| **[duel52-split-gen031.d52nn](duel52-split-gen031.d52nn)** — the default | `split` | 21 | 949,267 | Phase 4 `train-3h`, warm-started from gen022, lane augmentation |
+| [duel52-split-gen022.d52nn](duel52-split-gen022.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-2h`, warm-started from gen016 |
 | [duel52-split-gen016.d52nn](duel52-split-gen016.d52nn) — superseded | `split` | 21 | 949,267 | Phase 3 `train-fast`, generation 16 |
 
-**Play `gen022`.** `gen016` is kept because every Phase 3 finding is measured on it and
-because it is the fixed opponent Phase 4 is scored against — it is a reference point, not a
-second option.
+**Play `gen031`.** The other two are kept as **reference points, not as second options**:
+every Phase 3 finding is measured on `gen016`, every Phase 4 number is measured against it,
+and `gen022` is now the frozen incumbent the next run will be scored against in turn. All
+three load into the same build — the layout hashes have not moved since `gen016`.
+
+---
+
+## duel52-split-gen031.d52nn
+
+**The strongest Duel 52 agent that exists.** Produced by `configs/train-3h.toml`, and the
+whole of what it changes is that **every training sample is shown under a random relabelling
+of the three lanes**. Duel 52 is invariant under all six permutations of its lanes —
+`game_rules.md` contains no rule that names a lane, orders them, or tells one from another —
+so this is five extra exactly-correct views of every position, at zero extra self-play and
+zero extra RAM. `FINDINGS.md` F4.3 is why it was worth doing: it measured gen022 spending
+real capacity on an arbitrary preference for lane 3.
+
+### How it was made
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-3h.toml \
+    --run-dir runs/fifth --init-from models/duel52-split-gen022.d52nn
+```
+
+| | |
+| --- | --- |
+| Config | `configs/train-3h.toml` (recorded in the run dir as `train.toml.used`) |
+| Started from | `duel52-split-gen022.d52nn`, **not** a random init |
+| Seed | `4000000`, spanning seeds 4,000,000–4,012,000 |
+| Variant | `split`, `two_power = bottom`, `encoding_slots = 21` |
+| Generations | 10 played, 5 promoted; **generation 9 is this file** |
+| Self-play | 12,000 games, 1,677,779 positions, 256 PUCT simulations per decision |
+| Wall clock | 2.78 h on an M-series Mac, 8 cores (68% of it self-play) |
+| Network | residual MLP, width 128, 3 blocks, value head 128 → 949,267 parameters |
+| `obs_dim` / `action_dim` | 4290 / 2194 |
+| `obs_layout_hash` | `b1355a841a1fdc4a` |
+| `action_layout_hash` | `5169f9461d627b39` |
+| SHA-256 | `5b858cc8ed2b6906892b4c63fdf8768d04efdfbf335ba57e27e2d8f6700ecd7d` |
+
+**No layout hash moved.** Lane augmentation is a transform on training data and nothing else,
+so `gen016` and `gen022` still load, every existing `.d52sp` shard is still valid, and the
+engine plays exactly the game it played before. The file is byte-identical to
+`runs/fifth/checkpoints/gen009.d52nn` and to that run's `best.d52nn`.
+
+**Why "gen031" when the run calls it generation 9.** It is `runs/fifth`'s ninth generation and
+the 31st generation of training counting the 22 it inherited, by the same rule that named
+`gen022`: the run-local number would sort below its own predecessor on the shelf.
+
+**The run stopped on the clock, not on a plateau.** `run.hours = 3.0` with `generations = 16`
+as the backstop; ten generations came to 2.78 h and an eleventh would not have fit. The
+learning-rate schedule was keyed to the twelve generations it was expected to finish, so the
+last tier never arrived — generations 9 and 10 ran at 1/16 the starting rate as planned but
+the run ended mid-schedule.
+
+### How strong it is
+
+At **equal simulations**, 400 games, `--seed 1`. The first row is the exit criterion §4.2a
+set; the second puts all three checkpoints on one scale:
+
+| | score (95% CI) | W–L–D | Elo |
+| --- | --- | --- | ---: |
+| `netmcts:gen031@256` vs `netmcts:gen022@256` | **0.6162 ± 0.0475** | 245–152–3 | **+82** |
+| `netmcts:gen031@256` vs `netmcts:gen016@256` | **0.7475 ± 0.0426** | 299–101–0 | **+189** |
+
+**+82 over gen022 is the same margin gen022 took over gen016** (0.6150 ± 0.0474, F4.1) — a
+second three-hour laptop run bought as much as the second two-hour one, from a change that
+costs 0.29 ms a batch rather than more compute. The two steps are consistent end to end:
+81 + 82 = +163 against the +189 measured directly against gen016, which sits inside that
+row's own +151 to +230 interval.
+
+Head to head, 200 games each, `--seed 1`, with the two earlier checkpoints' figures from
+their own sections:
+
+| Agent | Opponent | gen031 | gen022 | gen016 |
+| --- | --- | --- | --- | --- |
+| `netpolicy` (no search) | `random` | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
+| `netpolicy` (no search) | `greedy` | **0.9900** ± 0.0138 | 0.9800 ± 0.0194 | 0.9400 ± 0.0329 |
+| `netmcts` | `greedy` | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 | 0.9675 ± 0.0241 |
+| `netmcts` | `ismcts:800` | **1.0000** ± 0.0000 | 0.9900 ± 0.0138 | 0.9300 ± 0.0354 |
+
+⚠️ **Three of those four rows are now saturated and measure nothing.** 200–0 against
+`ismcts:800` is the top of the hand-written ladder returning zero information about this
+agent, which is why the ladder was not re-run for it — `PLAN.md` §4.7 retired that table at
+gen022 and this is the confirmation. Only the `netpolicy`-vs-`greedy` row still moves, and it
+is worth reading because neither side searches: the policy head alone went 0.940 → 0.980 →
+0.990 across the three checkpoints.
+
+### What it does differently
+
+**It has learned that the three lanes are interchangeable.** `python -m duel52.lanes`, 24
+seeds, 128 (seed, opening rank) pairs — the metric `FINDINGS.md` F4.3 defined, which needs no
+opponent and takes two seconds:
+
+| 128 pairs | gen016 | gen022 | **gen031** | equivariant |
+|---|---:|---:|---:|---:|
+| opening prior on lane 1 / 2 / 3 | .317 / .328 / .354 | .320 / .277 / **.403** | **.328 / .331 / .341** | .333 each |
+| value-head spread at node 2 (median) | 0.068 | 0.068 | **0.034** | 0 |
+| policy TV between lane pairs (median) | 0.133 | 0.152 | **0.039** | 0 |
+| top second action agrees across all three lanes | 24/128 | 82/128 | **114/128** | 128/128 |
+
+Every row moves the right way and none of the earlier drift survives: gen022's opening bias
+toward lane 3 (which held in 24 of 24 seeds) is gone, and the policy distance between two
+positions that are exact relabellings of each other fell by a factor of four.
+
+**And it is not merely a flatter policy**, which is the confound F4.3 flagged when gen016's
+smaller TV turned out to be partly that. Scored on the same 10,240 positions, gen031 is if
+anything the *sharper* net — median top prior 0.384 against gen022's 0.380 and gen016's
+0.320, mean policy entropy 1.714 nats against 1.730 and 1.865.
+
+**The defect's price in nats is almost entirely paid off.** F4.3's last table, re-run
+unchanged — `runs/fourth`'s generation-5 shard, stride 2, 20 batches of 512, seed 3, each
+sample scored as recorded and again under one random lane relabelling. A perfectly
+equivariant network scores the same on both, because the relabelling is exact:
+
+| scored on the same shard | Δ policy loss | Δ value MSE |
+| --- | ---: | ---: |
+| gen016 | 0.191 | 0.010 |
+| gen022 | 0.195 | 0.069 |
+| **gen031** | **0.016** | **0.011** |
+
+gen022 paid 0.195 nats to be shown the same position under different lane labels; gen031 pays
+0.016. (The gen022 row reproduces F4.3's published 0.194 / 0.066 to within the RNG path.)
+
+Behaviourally, over the 400 games against gen022:
+
+| | gen031 | gen022 |
+| --- | ---: | ---: |
+| cards in hand when lanes unlock | **6.95** | 6.52 |
+| …in games won vs lost | 7.35 vs 6.28, gap **+1.07 ± 0.20** | 7.26 vs 6.05, gap +1.21 ± 0.22 |
+| turns with nothing useful to do | **0.37** | 0.68 |
+| flip rate | 0.94 | 0.92 |
+
+The hoard grows again — 6.41 → 6.87 → 6.95 across the three checkpoints at the seam — and H2's
+hoard-predicts-win gap clears its own interval for a third independent net.
+
+**The held-out value head improved, and that was the second thing being tested.** The run's
+fixed holdout (8,000 samples carved off generation 1's shard, never trained on, never
+augmented) fell 0.6355 → 0.5907 over nine generations, monotonically after generation 4.
+⚠️ That number is **not** comparable to gen022's 0.655: each run carves its holdout from its
+own generation-1 self-play, so the two are scored on different positions. The within-run fall
+is what is comparable, and `runs/fourth`'s was 0.870 → 0.655.
+
+### Known limits
+
+- **It has still never beaten a human**, and this is still the measurement Phase 4 turns on.
+  The owner's record against gen016 was 0–5; there is no recorded series against gen022 or
+  against this checkpoint. `PLAN.md` §4.7's six-seed paired rematch is the open item.
+- **What the lane bias cost in Elo is still not separable from what three more hours cost.**
+  The run changed one thing, so +82 is the change plus the extra generations together, and
+  nothing here divides them. Claiming "lane augmentation is worth +82 Elo" would be reading
+  more than was measured — the honest claim is that the mechanism moved (the table above) and
+  the strength moved (the head-to-head), in one run that did both.
+- **The trunk is still 128 × 3**, inherited from gen022 by the warm start, and a warm start
+  cannot change the shape of the network it inherits. `PLAN.md` §4.2 change 4 still wants six
+  blocks and still needs the from-scratch run in `configs/train-big.toml`.
+- **Trained only on `split`**, like both predecessors: the observation layout is per-variant
+  and the hash check refuses `base` or `mirrored` outright.
+- **The remaining 14 of 128 disagreements are real.** 114/128 is not 128/128, and the residue
+  is what a data augmentation cannot reach: nothing in the architecture *enforces* the
+  symmetry, so the network is still free to break it where the training distribution did not
+  happen to correct it.
 
 ---
 
 ## duel52-split-gen022.d52nn
 
-**The strongest Duel 52 agent that exists.** Produced by `configs/train-2h.toml` on the same
-laptop as its predecessor, and the whole of what it changes is the *teacher*: self-play
+**Superseded by `gen031`, and kept as the frozen Phase 4 reference** — the incumbent every
+number in this file's top section is measured against, in the same role `gen016` played for
+it. Produced by `configs/train-2h.toml` on the same laptop as its own predecessor, and the
+whole of what it changed was the *teacher*: self-play
 generates its policy targets at **256 simulations rather than 64**. `FINDINGS.md` F3.8 is why
 — the policy target is the visit distribution, so training at 64 teaches the network to
 imitate a search hundreds of Elo weaker than the same weights produce at 4096. The teacher

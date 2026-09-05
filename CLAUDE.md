@@ -71,12 +71,15 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 325 tests: rules, determinism, information hiding,
-                                         # the Phase 3 encoding path, and the training corpus
+cargo test                               # 330 tests: rules, determinism, information hiding,
+                                         # the Phase 3 encoding path, the lane symmetry, and
+                                         # the training corpus
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
-./target/release/duel52 play --opponent ismcts:2000        # vs the strongest rung
+./target/release/duel52 play --encoding-slots 21 \
+    --opponent netmcts:models/duel52-split-gen031.d52nn@4096   # vs the strongest agent
+./target/release/duel52 play --opponent ismcts:2000        # vs the strongest hand-written rung
 ./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
 ./target/release/duel52 play --opponent human              # hotseat
 ./target/release/duel52 powers                             # card-power reference
@@ -87,11 +90,11 @@ cargo test                               # 325 tests: rules, determinism, inform
 # hidden information included. Only finished games are written. `REPLAY.md` reads the output;
 # its §0 is the node / turn / round distinction, which is the thing to get straight first.
 ./target/release/duel52 play --encoding-slots 21 --seed 101 \
-    --record games/owner-vs-gen022.jsonl \
-    --opponent netmcts:models/duel52-split-gen022.d52nn@4096
-./target/release/duel52 replay --record games/owner-vs-gen022.jsonl            # the index
-./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1   # walk it
-./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1 --node 34
+    --record games/owner-vs-gen031.jsonl \
+    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+./target/release/duel52 replay --record games/owner-vs-gen031.jsonl            # the index
+./target/release/duel52 replay --record games/owner-vs-gen031.jsonl --game 1   # walk it
+./target/release/duel52 replay --record games/owner-vs-gen031.jsonl --game 1 --node 34
 
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
@@ -127,8 +130,25 @@ cargo test                               # 325 tests: rules, determinism, inform
     --init-from models/duel52-split-gen016.d52nn                  # 2 h on the laptop
 ./target/release/duel52 match --a netmcts:runs/fourth/checkpoints/best.d52nn@256 \
     --b netmcts:models/duel52-split-gen022.d52nn@256 --games 400 --encoding-slots 21
-# gen022 IS runs/fourth's generation 6, shipped. gen016 is the previous agent, kept as the
+# gen022 IS runs/fourth's generation 6, shipped. gen016 is the agent before it, kept as the
 # frozen reference every Phase 4 number is measured against — not a second thing to play.
+
+# Phase 4 Stage 0b (PLAN.md §4.2a) — three hours, one experimental change: six exact lane
+# relabellings of every training sample. Warm-starts from gen022, which pins the trunk.
+# DONE 2026-09-05: FINDINGS.md F4.5, shipped as gen031, the current default agent.
+.venv/bin/python -m duel52.train check --config configs/train-3h.toml
+.venv/bin/python -m duel52.train run   --config configs/train-3h.toml --run-dir runs/fifth \
+    --init-from models/duel52-split-gen022.d52nn
+# The mechanism check, two seconds and no opponent: does the policy treat the three lanes
+# alike? Run it on generation 1, not at the end. ⚠️ Read the *policy TV* row, not the argmax
+# agreement row — F4.5 found agreement still at 86/128 after one generation (gen022 is
+# 82/128) while TV had already gone 0.152 → 0.113. Agreement is an argmax over near-ties and
+# breaks late; TV is continuous and moves first. FINDINGS.md F4.3, F4.5.
+.venv/bin/python -m duel52.lanes --checkpoint runs/fifth/checkpoints/gen001.d52nn
+./target/release/duel52 match --a netmcts:models/duel52-split-gen031.d52nn@256 \
+    --b netmcts:models/duel52-split-gen022.d52nn@256 --games 400 --encoding-slots 21
+# gen031 IS runs/fifth's generation 9, shipped, and it is the agent to play. gen022 is now
+# the frozen incumbent the next run gets scored against, in the role gen016 played for it.
 
 # The pieces, runnable on their own when something looks wrong.
 ./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \
@@ -173,13 +193,23 @@ Add `--encoding-slots 21` to both the `init` and the `duel52` command if you hit
 must match, because `encoding_slots` is what fixes `obs_dim`.
 
 Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
-`split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml`, `train-2h.toml`
-and `train-big.toml` are *training* configs rather than game configs — they carry the loop's
-knobs and set `encoding_slots = 21`, which every command in that run must agree on.
-`train-fast` is Phase 3's shakedown and produced gen016; `train-2h` is Phase 4 on a laptop and
-**warm-starts from gen016**, which is why its trunk is pinned to `128 × 3`; `train-big` is the
-24-hour rented-box run and is the only one of the three that trains a `128 × 6` trunk from
-scratch. `PLAN.md` §4.5 is the order to run them in.
+`split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml`, `train-2h.toml`,
+`train-3h.toml` and `train-big.toml` are *training* configs rather than game configs — they
+carry the loop's knobs and set `encoding_slots = 21`, which every command in that run must
+agree on. `train-fast` is Phase 3's shakedown and produced gen016; `train-2h` is Phase 4 on a
+laptop and **warm-starts from gen016**, which is why its trunk is pinned to `128 × 3`;
+`train-3h` is Stage 0b, warm-starts from **gen022**, is the only config with
+`lane_augment = true` — its one experimental change — and produced gen031, the current
+default; `train-big` is the 24-hour rented-box run and is the only one of the four that trains
+a `128 × 6` trunk from scratch. `PLAN.md` §4.5 is the order to run them in.
+
+**The three shipped checkpoints are one lineage, not a menu.** gen016 → gen022 → **gen031**,
+each warm-started from the one before it and each measured against it at equal simulations:
++81, then +82, for +189 end to end (`FINDINGS.md` F4.1, F4.5). Play gen031. The other two are
+kept because every Phase 3 finding is measured on gen016 and every Phase 4 number against it,
+and gen022 is now the frozen incumbent for the next run. All three still load — no layout hash
+has moved since gen016, and lane augmentation did not move one either, because it transforms
+training data and nothing else.
 
 ## Where things are
 
@@ -204,6 +234,7 @@ scratch. `PLAN.md` §4.5 is the order to run them in.
 | `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
 | `py/duel52/nn/` | The PyTorch model and checkpoint I/O. **Never an encoder** — see below |
 | `py/duel52/train/` | The AZ loop: replay buffer, trainer, generation driver. Gradients only |
+| `py/duel52/lanes.py` | `FINDINGS.md` F4.3's lane-symmetry metric, for one checkpoint. Analysis; the permutation tables it compares against come from `encode.rs` |
 
 Three structural points that are easy to undo by accident:
 
@@ -234,4 +265,8 @@ Three structural points that are easy to undo by accident:
   Python would let the trained function and the evaluated function drift apart *silently* —
   nothing crashes, the agent is merely bad, and the natural suspect is the training run. The
   checkpoint header carries both layout hashes and `Weights::load` refuses a mismatch, which
-  turns that into a one-line error. Never compute a layout hash outside `encode.rs`.
+  turns that into a one-line error. Never compute a layout hash outside `encode.rs` — and never
+  derive a **lane-permutation table** outside it either. `encode::lane_permutations` publishes
+  the six exact relabellings (`PLAN.md` §4.2a) and Python only gathers with them; a table
+  computed in Python would be a second reading of the layout, and a wrong one trains the network
+  on mismatched targets with nothing crashing to say so.

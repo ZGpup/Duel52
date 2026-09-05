@@ -345,6 +345,229 @@ rare. But it is the only statistic in the table where the strongest agent looks 
 
 ## Phase 4 — the scale-up
 
+### F4.5 — Six free views of every position: the lane bias is gone, and it came with +82 Elo
+
+`split`, `encoding_slots = 21`, `configs/train-3h.toml`, `runs/fifth`, seeds 4,000,000–4,012,000,
+2026-09-05. Warm-started from `models/duel52-split-gen022.d52nn`; ten generations, five
+promoted, 12,000 self-play games and 1,677,779 positions in 2.78 h on 8 cores. Generation 9 is
+shipped as `models/duel52-split-gen031.d52nn`. **One change from the run before it**:
+`[train] lane_augment = true`, which relabels every training sample by one of the six lane
+permutations at batch-draw time (`PLAN.md` §4.2a).
+
+F4.3 measured gen022 spending real capacity on an arbitrary preference for lane 3. This is
+that measurement re-run on the net trained with the fix, over the same 128 (seed, opening
+rank) pairs from seeds 1–24:
+
+| 128 pairs | gen016 | gen022 | **gen031** | equivariant |
+|---|---:|---:|---:|---:|
+| opening prior on lane 1 / 2 / 3 | .317 / .328 / .354 | .320 / .277 / **.403** | **.328 / .331 / .341** | .333 each |
+| value-head spread at node 2 (median / max) | 0.068 / 0.240 | 0.068 / 0.178 | **0.034 / 0.088** | 0 |
+| policy TV between lane pairs (median / max) | 0.133 / 0.290 | 0.152 / 0.362 | **0.039 / 0.103** | 0 |
+| top second action agrees across all three lanes | 24/128 | 82/128 | **114/128** | 128/128 |
+
+```bash
+.venv/bin/python -m duel52.lanes --checkpoint models/duel52-split-gen031.d52nn --seeds 24
+```
+
+**It is not a flatter policy**, which is the confound F4.3 raised against its own gen016
+column. Scored on 10,240 positions from `runs/fourth`'s generation-5 shard, masked to each
+sample's recorded legal set, gen031 is the *sharper* of the two — median top prior **0.384**
+against gen022's 0.380 and gen016's 0.320, mean policy entropy 1.714 nats against 1.730 and
+1.865. The distances above fell while conviction rose.
+
+**And F4.3's price in nats is nearly all paid off.** That table re-run unchanged — the same
+shard, stride 2, 20 batches of 512, seed 3, each sample scored as recorded and again under one
+random relabelling. The relabelling is exact, so a perfectly equivariant net scores the same
+on both rows and the difference *is* the defect:
+
+| scored on the same shard | policy loss Δ | value MSE Δ |
+| --- | ---: | ---: |
+| gen016 | 0.191 | 0.010 |
+| gen022 | 0.195 | 0.069 |
+| **gen031** | **0.016** | **0.011** |
+
+gen022's row reproduces F4.3's published 0.194 / 0.066 to within the RNG path, which is what
+makes the gen031 row comparable to it. A **12×** reduction in the policy price.
+
+**The strength moved by as much as uncapping the teacher did.** Equal simulations, 400 games,
+`--seed 1`:
+
+| | score (95% CI) | W–L–D | Elo |
+| --- | --- | --- | ---: |
+| `netmcts:gen031@256` vs `netmcts:gen022@256` | **0.6162 ± 0.0475** | 245–152–3 | **+82** |
+| `netmcts:gen031@256` vs `netmcts:gen016@256` | **0.7475 ± 0.0426** | 299–101–0 | **+189** |
+
+F4.1's step was 0.6150 ± 0.0474. Two successive laptop runs, two different changes, the same
+margin — and the composition checks: +81 and +82 predict +163, and the direct gen016 row's
+interval is +151 to +230.
+
+⚠️ **This does not price the lane bias.** The run changed one thing *relative to the run before
+it*, but it also ran three more hours of self-play on top of a checkpoint that had not
+plateaued on strength. +82 is augmentation **plus** those generations, and nothing here divides
+them. The clean claims are the narrow ones: the mechanism moved (both tables above, neither of
+which involves an opponent), and the run that moved it also gained as much Elo as its
+predecessor. An ablation — the same config with `lane_augment = false` — is what would price
+it, and it costs another three hours nobody has spent.
+
+**The held-out value MSE fell**, which was `PLAN.md` §4.2 change 7's second-order prediction:
+8,000 samples carved off generation 1's shard, never trained on and never augmented, went
+0.6355 → 0.5907 over nine generations, monotonically after generation 4. ⚠️ **Not comparable
+to `runs/fourth`'s 0.655** — each run carves its holdout from its own generation-1 self-play,
+so the levels are on different positions; only the within-run fall is comparable, and
+`runs/fourth`'s was 0.870 → 0.655.
+
+**Behaviourally the hoard grew again**, over the 400 games against gen022: 6.52 → **6.95** cards
+in hand at the seam, and turns with nothing useful to do 0.68 → **0.37**. Across the three
+checkpoints that is 6.41 → 6.87 → 6.95, and H2's hoard-predicts-win gap (+1.07 ± 0.20 here)
+clears its own interval for a third independent net.
+
+**Two things worth knowing before running the next one.**
+
+- ⚠️ **The argmax-agreement row is the wrong tripwire at generation 1.** `PLAN.md` §4.2a says to
+  check the metric after one generation and treat a flat reading as a bug report. At
+  generation 1 this run read **86/128** against gen022's 82/128 — inside noise, and it would
+  have been read as a failure. The **policy-TV** row had already moved, 0.152 → 0.113, and the
+  opening prior with it. TV is the sensitive row because it is continuous; agreement is an
+  argmax over near-ties and only breaks late. Watch TV at generation 1.
+- **114/128 is not 128/128, and augmentation cannot close it.** Nothing in the architecture
+  *enforces* the symmetry — the network is still free to break it wherever the training
+  distribution did not happen to correct it. Canonicalising the lane order in `encode.rs`, or
+  a permutation-equivariant trunk, is what would make the last 14 impossible rather than
+  merely unlikely. Neither is scheduled.
+
+### F4.4 — Better weights did not buy more search: gen022's scaling curve is gen016's
+
+`split`, `encoding_slots = 21`, `--seed 1`, **300 games a step** — F3.8's own power note says
+~210, and the 200-game rows below it are the reason to say so. `models/duel52-split-gen022.d52nn`
+played against itself at four budgets, each step 4× the compute of the one before:
+
+| step | gen022 (300 games) | Elo | 95% CI | gen016 (F3.8) |
+|---|---:|---:|---|---:|
+| `netpolicy` → `@64` | 0.7817 ± 0.0464 | **+222** | [+177, +273] | +252 |
+| `@64` → `@256` | 0.6967 ± 0.0520 | **+144** | [+104, +190] | +141 |
+| `@256` → `@1024` | 0.6900 ± 0.0521 | **+139** | [+98, +184] | +156 |
+| `@1024` → `@4096` | 0.6450 ± 0.0541 | **+104** | [+64, +146] | +69 |
+| **`netpolicy` → `@4096`** | | **+609** | | **+618** |
+
+**`PLAN.md` §4.7 asked whether the new net absorbs *more* search than gen016 did. It does
+not.** Every step lands inside gen016's interval, and the two nets convert 64× more search
+into the same +610 Elo. The +81 Elo gen022 holds over gen016 (F4.1) is a better *policy*, not
+a policy that a tree can do more with — which is a more interesting negative than it looks,
+because it says the two quantities the run improves are separable and this run improved only
+one of them.
+
+**Search is still paying at 4096**, +104 [+64, +146], and it is paying more than gen016's
++69 appeared to. Read that as *the knee is not established* rather than as a deepening or a
+retreat: the intervals overlap across most of their length, F3.8 already flagged its own last
+step as "suggestive rather than established", and this is the first re-measurement. Nothing
+here is a fusion signature — F2.3's PIMC bought nothing measurable from 8× more sampled
+worlds, and this buys +104 from 4×.
+
+**What it decides.** `selfplay.sims` stays at **256** for Stage 0b and for the run after it,
+and this is now on evidence rather than on caution. The arithmetic: F4.1 measured the 64 → 256
+step *as a teacher* at +81 against the +141 it is worth at play time, so a teacher converts
+about 56% of a play-time gain. Applying that to the row above, 256 → 1024 would buy roughly
++78 Elo of teacher quality for **4× the self-play second** — 300 games a generation instead of
+1200, against a value head that is already the starved half (`PLAN.md` §4.2 change 7). It is
+the wrong trade at a fixed budget, and it stays the wrong trade until the games are cheap.
+
+**Cost, for sizing the next sweep:** 15.6 → 3.0 → 0.7 → **0.2 games/sec** on 8 cores, so the
+four steps are 20s, 1m38s, 6m56s and **33m**. Budget 45 minutes and expect the last row to be
+three quarters of it.
+
+One behavioural note, and it is the only cross-budget statistic here worth trusting, because
+it is paired *inside* each match rather than compared across them: **the deeper side holds
+more cards at the seam in all four pairings** — 7.29 vs 6.63, 7.04 vs 6.52, 6.83 vs 6.35,
+6.44 vs 6.36. Hoarding (the largest behavioural gap in the project, and the one §7 argument
+the agent found) is something more search finds more of, but the margin narrows to nothing by
+4096, where both sides have found it.
+
+### F4.3 — gen022 has not learned that the three lanes are interchangeable
+
+`split`, `encoding_slots = 21`, `models/duel52-split-gen022.d52nn`, 2026-09-05, seeds 1–24,
+128 (seed, opening rank) pairs, ~5,000 policy readouts. Method: synthesized `duel52-play/1`
+records whose first two decision nodes are fixed by hand, scored with
+`duel52 replay --sims 0`, which prints each played action's share of the masked softmax.
+
+Before any card is played the position is invariant under all six permutations of the lanes,
+and after `PLAY R → lane L` the three resulting positions are *exact* relabellings of one
+another — observation tensors identical as multisets, differing in 14 of 3300 entries, from
+both seats. An equivariant policy must therefore score them identically. gen022, over all 24
+seeds, does not:
+
+| gen022, 128 pairs | measured | equivariant |
+|---|---:|---:|
+| opening prior on lane 1 / 2 / 3 | .320 / .277 / **.403** | .333 each |
+| value-head spread at node 2 (median / max) | 0.070 / 0.180 | 0 |
+| policy TV between lane pairs (median / max) | 0.196 / 0.362 | 0 |
+| gap between the two still-*empty* lanes (median / max) | 0.013 / 0.122 | 0 |
+| top second action agrees across all three lanes | 82/128 | 128/128 |
+
+Lane 3 outranks lane 1 in **24 of 24 seeds**, so the opening bias is systematic rather than
+sampling noise — and its direction is arbitrary, since the untrained net prefers lane 2.
+**38 of the 46 argmax disagreements are a different verb** (FLIP the card just played versus
+PLAY another one), decided by which of three identical lanes the first card went into. Search
+does not repair it: `netmcts@1024` agrees 21/32 against the raw policy's 19/32 on the same
+pairs, and at 4096 the pick stabilises while conviction does not — 85–91% of visits after
+opening into lane 1 or 3 against 47–78% after lane 2, root value lowest after lane 2 in 6 of 6
+seeds.
+
+Across checkpoints, on the 43 pairs from seeds 1–8 that all three share:
+
+| | untrained | gen016 | gen022 |
+|---|---:|---:|---:|
+| opening prior on lane 1 / 2 / 3 | .329 / .397 / .274 | .333 / .321 / .346 | .335 / .262 / .403 |
+| value-head spread at node 2, median | 0.090 | 0.070 | 0.070 |
+| policy TV between lane pairs, median | 0.255 | 0.157 | 0.199 |
+| top second action agrees across all three lanes | 2/43 | 6/43 | 28/43 |
+
+Read that table with two caveats: the untrained checkpoint is `checkpoints/init-21.d52nn`, a
+512 × 5 trunk and not gen016 and gen022's 128 × 3, and gen016's smaller TV is partly just a
+flatter policy — median top prior 0.128 against gen022's 0.201.
+
+Nothing in the pipeline ever asked for the symmetry: `encode.rs` is lane-indexed, the trunk is
+a flat MLP, and there is no lane-permutation augmentation or canonicalisation anywhere in
+`selfplay.rs` or `py/duel52/train/`. Training has been learning it slowly and by accident
+(2/43 → 6/43 → 28/43) while the opening bias grew. ⚠️ **What this costs in Elo is not
+measured** — it is a measured defect, not a measured loss. `PLAN.md` §4.2a is the fix, and it
+turns the last row into a regression metric that needs no opponent and no ladder.
+
+**The metric is now a command** (2026-09-05), because §4.2a asks for it to be re-read on
+generation 1 of every run rather than once:
+
+```bash
+.venv/bin/python -m duel52.lanes --checkpoint models/duel52-split-gen022.d52nn --seeds 8
+```
+
+Two seconds, and by a different route from the table above: instead of scoring hand-fixed
+replay records, it finds the permutation that carries one post-opening observation **exactly**
+onto another — `encode::lane_permutations`, the same tables §4.2a's augmentation gathers with —
+and compares the two policies under it. So it is also an independent check on those tables. It
+reproduces the opening-prior and agreement rows to the digit: gen022 at .335 / .262 / .403 and
+**28/43** over seeds 1–8, .320 / .277 / .403 and **82/128** over 1–24, gen016 at
+.333 / .321 / .346 and **6/43**. The value-spread row lands within 0.002 of the figures above.
+The policy-TV row is the one that moves — 0.152 against 0.196 at 128 pairs — because the
+command takes the kinder of the two permutations that match: after one card is played the two
+still-empty lanes are indistinguishable, and holding a network to a choice between them is not
+measuring anything.
+
+**And the defect has a price in nats.** gen022 scored on its own self-play — `runs/fourth`'s
+generation-5 shard, stride 2, 20 batches of 512, seed 3 — with each sample relabelled by one
+of the six permutations and with none:
+
+| gen022 vs its own generation-5 shard | policy loss | value MSE |
+|---|---:|---:|
+| as recorded | 1.884 | 0.545 |
+| one random lane relabelling per sample | **2.078** | **0.611** |
+
+The relabelling is exact, so a perfectly equivariant network would score the same on both
+rows. gen022 pays **0.194 nats and 0.066 MSE** to be shown the same positions under different
+lane labels — the same defect the table above measures, priced on real positions rather than
+on the opening. The value row is the sharper half: a relabelling cannot move a game's result,
+so every point of that 0.066 is the value head reading a lane label. (Scale: a *wrong*
+permutation table would put the policy row near ln 2194 = 7.69, so this is also the third
+check that the tables are right.)
+
 ### F4.2 — The frozen ladder puts gen006 at +1788, and that is the last number it can usefully give
 
 `duel52 ladder --agents random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:runs/fourth/checkpoints/gen006.d52nn@256
