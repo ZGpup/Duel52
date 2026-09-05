@@ -77,11 +77,11 @@ cargo test                               # 325 tests: rules, determinism, inform
 # (config, seed, chosen indices), so a 153-ply game is 918 bytes and replays exactly —
 # hidden information included. Only finished games are written.
 ./target/release/duel52 play --encoding-slots 21 --seed 101 \
-    --record games/owner-vs-gen006.jsonl \
-    --opponent netmcts:runs/fourth/checkpoints/gen006.d52nn@4096
-./target/release/duel52 replay --record games/owner-vs-gen006.jsonl            # the index
-./target/release/duel52 replay --record games/owner-vs-gen006.jsonl --game 1   # walk it
-./target/release/duel52 replay --record games/owner-vs-gen006.jsonl --game 1 --ply 34
+    --record games/owner-vs-gen022.jsonl \
+    --opponent netmcts:models/duel52-split-gen022.d52nn@4096
+./target/release/duel52 replay --record games/owner-vs-gen022.jsonl            # the index
+./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1   # walk it
+./target/release/duel52 replay --record games/owner-vs-gen022.jsonl --game 1 --ply 34
 
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
@@ -116,7 +116,9 @@ cargo test                               # 325 tests: rules, determinism, inform
 .venv/bin/python -m duel52.train run   --config configs/train-2h.toml --run-dir runs/fourth \
     --init-from models/duel52-split-gen016.d52nn                  # 2 h on the laptop
 ./target/release/duel52 match --a netmcts:runs/fourth/checkpoints/best.d52nn@256 \
-    --b netmcts:models/duel52-split-gen016.d52nn@256 --games 400 --encoding-slots 21
+    --b netmcts:models/duel52-split-gen022.d52nn@256 --games 400 --encoding-slots 21
+# gen022 IS runs/fourth's generation 6, shipped. gen016 is the previous agent, kept as the
+# frozen reference every Phase 4 number is measured against — not a second thing to play.
 
 # The pieces, runnable on their own when something looks wrong.
 ./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \

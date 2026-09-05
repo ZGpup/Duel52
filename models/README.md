@@ -10,11 +10,140 @@ Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to ins
 
 | File | Variant | Slots | Params | Provenance |
 | --- | --- | --- | --- | --- |
-| [duel52-split-gen016.d52nn](duel52-split-gen016.d52nn) | `split` | 21 | 949,267 | Phase 3 `train-fast`, generation 16 |
+| **[duel52-split-gen022.d52nn](duel52-split-gen022.d52nn)** — the default | `split` | 21 | 949,267 | Phase 4 `train-2h`, warm-started from gen016 |
+| [duel52-split-gen016.d52nn](duel52-split-gen016.d52nn) — superseded | `split` | 21 | 949,267 | Phase 3 `train-fast`, generation 16 |
+
+**Play `gen022`.** `gen016` is kept because every Phase 3 finding is measured on it and
+because it is the fixed opponent Phase 4 is scored against — it is a reference point, not a
+second option.
+
+---
+
+## duel52-split-gen022.d52nn
+
+**The strongest Duel 52 agent that exists.** Produced by `configs/train-2h.toml` on the same
+laptop as its predecessor, and the whole of what it changes is the *teacher*: self-play
+generates its policy targets at **256 simulations rather than 64**. `FINDINGS.md` F3.8 is why
+— the policy target is the visit distribution, so training at 64 teaches the network to
+imitate a search hundreds of Elo weaker than the same weights produce at 4096. The teacher
+was capped, and this is the cap coming off.
+
+### How it was made
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-2h.toml \
+    --run-dir runs/fourth --init-from models/duel52-split-gen016.d52nn
+```
+
+| | |
+| --- | --- |
+| Config | `configs/train-2h.toml` (recorded in the run dir; generations 2–8 under `train.toml.used.from-gen002`) |
+| Started from | `duel52-split-gen016.d52nn`, **not** a random init |
+| Seed | `3000000`, spanning seeds 3,000,000–3,009,600 |
+| Variant | `split`, `two_power = bottom`, `encoding_slots = 21` |
+| Generations | 8 played, 3 promoted; **generation 6 is this file** |
+| Self-play | 9,600 games, 256 PUCT simulations per decision |
+| Wall clock | ~1.9 h on an M-series Mac, 8 cores |
+| Network | residual MLP, width 128, 3 blocks, value head 128 → 949,267 parameters |
+| `obs_dim` / `action_dim` | 4290 / 2194 |
+| `obs_layout_hash` | `b1355a841a1fdc4a` |
+| `action_layout_hash` | `5169f9461d627b39` |
+| SHA-256 | `3d499accba3b3af8c86ac2b09c0ac9f90abc2bcfb059f46f8a0b8567ef184bce` |
+
+**Why "gen022" when the run calls it generation 6.** It is `runs/fourth`'s sixth generation,
+and the 22nd generation of training counting the 16 it inherited. The run number would sort
+below its own predecessor on the shelf, which is the one thing a filename here has to get
+right. The file is byte-identical to `runs/fourth/checkpoints/gen006.d52nn`.
+
+**The trunk is 128 × 3, the same as gen016, and that is a consequence rather than a choice.**
+A warm start cannot change the shape of the network it inherits. `PLAN.md` §4.2 change 4 wants
+six blocks; that needs a from-scratch run, which is what `configs/train-big.toml` is for.
+
+### How strong it is
+
+Against the checkpoint it was trained from, at **equal simulations**, 400 games, `--seed 1`:
+
+| | score (95% CI) | W–L–D | Elo |
+| --- | --- | --- | ---: |
+| `netmcts:gen022@256` vs `netmcts:gen016@256` | **0.6150 ± 0.0474** | 244–152–4 | **+81** |
+
+That is the honest headline, and it is worth more than the ladder row below because both
+sides of it are real agents searching the same amount. On the frozen ladder, 400 games per
+pairing, seeds from 1 (`FINDINGS.md` F4.2):
+
+| agent | Elo | ± | vs. anchor |
+|---|---:|---:|---:|
+| **`netmcts:gen022@256`** | **+1788** | 58 | 1.000 |
+| `ismcts:800` | +1052 | 15 | 0.998 |
+| `flatmc:600` | +900 | 13 | 0.994 |
+| `greedy` | +615 | 13 | 0.972 |
+| `pimc:8x1` | +584 | 13 | 0.967 |
+| `random` | +0 | 0 | 0.500 |
+
+```bash
+./target/release/duel52 ladder --games 400 --markdown --variant split --encoding-slots 21 \
+    --agents random,greedy,flatmc:600,pimc:8x1,ismcts:800,netmcts:models/duel52-split-gen022.d52nn@256
+```
+
+Head to head, 200 games each, `--seed 1`, scores for this checkpoint's side, with gen016's
+figures from its own section for comparison:
+
+| Agent | Opponent | gen022 | gen016 |
+| --- | --- | --- | --- |
+| `netpolicy` (no search) | `random` | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
+| `netpolicy` (no search) | `greedy` | **0.9800** ± 0.0194 | 0.9400 ± 0.0329 |
+| `netmcts` | `greedy` | **1.0000** ± 0.0000 | 0.9675 ± 0.0241 |
+| `netmcts` | `ismcts:800` | **0.9900** ± 0.0138 | 0.9300 ± 0.0354 |
+
+⚠️ The two `netmcts` rows are **not** a like-for-like comparison: gen022 searches 256 and
+gen016 searched 64. The `netpolicy` rows are, because neither searches at all — and there the
+policy head alone went 0.940 → 0.980 against `greedy`, which is the network improving rather
+than the budget. Against `ismcts:800` it arrives at the endgame holding **8.36** cards to
+`ismcts`'s 0.85, and has a turn with nothing useful to do **0.00** times a game against 2.40.
+
+⚠️ **This is +1788 against gen016's +1476 and the difference is not +312.** Bradley–Terry pins
+`random` at 0 and fits the rest to the whole graph, so pulling the top agent away stretches
+everything below it — every hand-written rung moved up between the two tables without a line
+of code changing. Ratings compare *within* one fit, never across two. Measured over the rungs
+common to both, the gap is **+241 to +247**, and roughly three fifths of that is the larger
+search budget rather than better weights. F4.2 has the full reconciliation.
+
+### What it does differently
+
+400 games against gen016, both at 256 simulations:
+
+| | gen022 | gen016 |
+| --- | ---: | ---: |
+| cards in hand when lanes unlock | **6.87** | 6.41 |
+| …in games won vs lost | 7.25 vs 6.30, gap **+0.94 ± 0.23** | 7.07 vs 5.98, gap +1.09 ± 0.25 |
+| turns with nothing useful to do | **0.43** | 0.70 |
+| flip rate | 0.91 | 0.88 |
+
+It hoards slightly more and wastes fewer turns. The H2 hoard-predicts-win gap clears its own
+interval for both nets, which makes it two independent agents showing the same thing rather
+than one.
+
+### Known limits
+
+- **It has never beaten a human.** The owner's record against gen016 was 0–5 and there is no
+  recorded series against this one yet. `duel52 play --record` exists now (`PLAN.md` §4.0), so
+  the next series will at least be written down.
+- **The value head is still the weak half.** It scores 0.655 held-out where gen016 scored
+  0.774 — a real improvement, and still only about a third of outcome variance explained on a
+  ±1 target. `FINDINGS.md` F4.1.
+- **Trained only on `split`**, like its predecessor: the observation layout is per-variant and
+  the hash check refuses `base` or `mirrored` outright.
+- **The run ended on a learning-rate schedule, not on a plateau.** Generations 7 and 8 scored
+  0.493 and 0.488 at a rate 16× below where they started. It stopped improving because the
+  schedule stopped it, which means the config has more in it, not that the method does.
 
 ---
 
 ## duel52-split-gen016.d52nn
+
+**Superseded by `gen022`, and kept deliberately.** Every Phase 3 finding is measured on this
+checkpoint, and it is the frozen opponent the Phase 4 run is scored against — so it is a
+fixed reference point rather than a second thing to play.
 
 The first trained Duel 52 agent, and as far as I know the first one that has ever existed.
 Produced by the Phase 3 AlphaZero loop on `configs/train-fast.toml` — the two-hour laptop
