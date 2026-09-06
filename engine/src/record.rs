@@ -69,6 +69,17 @@ pub struct GameRecord {
     pub human: Player,
     /// The opponent's [`crate::AgentSpec`] string, or `None` for hotseat.
     pub opponent: Option<String>,
+    /// The advisor's [`crate::AgentSpec`] string when the human played under `play --hint`,
+    /// and `None` when they were on their own.
+    ///
+    /// The game is identical either way — a hint changes nobody's legal actions and consumes
+    /// none of the opponent's randomness — so this is not needed to replay the line. It is
+    /// needed to *read* it. `replay` scores a human's decisions against the net, and a game
+    /// where the net's answer was already on screen agrees with it for a reason that has
+    /// nothing to do with how the human plays. Without this field an assisted game is
+    /// indistinguishable in the corpus from an unassisted one, which is exactly the kind of
+    /// silent contamination `PLAN.md` §4.0a's analysis cannot survive.
+    pub hint: Option<String>,
     /// Chosen indices into `legal_actions()`, one per decision node, in order, both sides.
     pub moves: Vec<usize>,
     /// The outcome as [`Outcome`] renders it. Checked on replay.
@@ -98,6 +109,7 @@ impl GameRecord {
             seed,
             human,
             opponent,
+            hint: None,
             moves,
             outcome: outcome.to_string(),
             human_result: match outcome {
@@ -108,6 +120,15 @@ impl GameRecord {
             }
             .to_string(),
         }
+    }
+
+    /// Note that the human was being advised by `advisor` while they played.
+    ///
+    /// A builder rather than a seventh argument to [`GameRecord::new`], because every caller
+    /// but `play --hint` would be passing `None` to say "nothing to declare".
+    pub fn with_hint(mut self, advisor: Option<String>) -> GameRecord {
+        self.hint = advisor;
+        self
     }
 
     /// Replay the game, calling `visit` before each move with the position, the legal
@@ -171,6 +192,11 @@ impl GameRecord {
             Some(spec) => write_str_field(&mut out, "opponent", spec, false),
             None => out.push_str(",\"opponent\":null"),
         }
+        // Written only when there is something to declare, so an unassisted game's line is
+        // byte-for-byte the one this build wrote before hints existed.
+        if let Some(advisor) = &self.hint {
+            write_str_field(&mut out, "hint", advisor, false);
+        }
         write_str_field(&mut out, "outcome", &self.outcome, false);
         write_str_field(&mut out, "human_result", &self.human_result, false);
         let _ = write!(out, ",\"nodes\":{}", self.moves.len());
@@ -210,6 +236,13 @@ impl GameRecord {
             Some(Json::Str(s)) => Some(s.clone()),
             Some(_) => return Err("`opponent` must be a string or null".to_string()),
         };
+        // Absent in every game recorded before `--hint` existed, and absent in every
+        // unassisted game since, which both mean the same thing: nobody was being advised.
+        let hint = match value.field("hint") {
+            Some(Json::Null) | None => None,
+            Some(Json::Str(s)) => Some(s.clone()),
+            Some(_) => return Err("`hint` must be a string or null".to_string()),
+        };
         let moves = match value.field("moves") {
             Some(Json::Arr(items)) => items
                 .iter()
@@ -229,6 +262,7 @@ impl GameRecord {
             seed: value.field_u64("seed")?,
             human,
             opponent,
+            hint,
             moves,
             outcome: value.field_str("outcome")?,
             human_result: value.field_str("human_result").unwrap_or_default(),

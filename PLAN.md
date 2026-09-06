@@ -91,30 +91,68 @@ and none of them is blocked on a stronger agent.
 
 ### 1. Play and record a human series against `gen031`
 
-**Status: the tooling is done, the games are not played.**
+**Status: under way. Five games recorded, and the agent has started winning them.**
+
+The corpus in `games/` as of 2026-09-06, all five played without hints:
+
+| opponent | budget | owner's record |
+|---|---|---|
+| `gen022` | @4096 | 0 wins, 2 losses |
+| `gen031` | @128 | 1 win |
+| `gen031` | @8192 | 1 win, 1 loss |
+
+**This is the criterion the project set for itself, and it has been met.** The agent has taken
+three of five recorded games off the owner, who beat `gen016` five out of five in the
+unrecorded series. It is not yet a measurement: five games is not a series, the seeds are not
+paired, and two different budgets are mixed together. What it settles is that the agent is no
+longer obviously below the one human who has played it, which is the thing the earlier drafts
+of this file were waiting to find out.
+
+What is still owed is the *diagnosis*, which was always the point of recording rather than
+the scoreline.
 
 `duel52 play --record` writes a game as (config, seed, chosen indices), a few hundred bytes
 that replay it exactly including hidden information, and `duel52 replay` walks it back showing
 what the net thought at each decision.
 
-**Why this is first.** The owner beat `gen016` five games out of five. No series has been
-played against `gen022` or `gen031`. Every strength number in this project is scored against
-agents this project wrote, on a scale this project anchored, so **the human series is the only
-external measurement that exists.** A +157 Elo rating and an 0 for 5 record against one person
-are not in contradiction, and until the series is replayed we do not know which of them
-describes the agent.
+⚠️ **Play the six series games without `--hint`.** The flag puts the agent's top few moves on
+screen *before* you choose, which is the right tool for learning the game and the wrong one
+for measuring it: the whole value of this series is that the human's move was made without
+seeing the net's. A hinted game is flagged in the record and `replay` prints a warning over
+the table, so a contaminated game cannot quietly join the six — but the flag is on the same
+command line, so it is worth knowing before rather than after. Use it on throwaway seeds.
 
-This also gates everything below it. `FINDINGS.md` reports what strong play looks like based
-on what the trained agents do. If a human beats them consistently and in the same way, those
+**Why this is first.** Every strength number in this project is scored against agents this
+project wrote, on a scale this project anchored, so **the human series is the only external
+measurement that exists.** A +157 Elo rating and a losing record against one person would not
+have been in contradiction, and the only way to find out which described the agent was to play.
+
+It also gates everything below it. `FINDINGS.md` reports what strong play looks like based on
+what the trained agents do. If a human beats them consistently and in the same way, those
 findings describe a flawed agent rather than the game, and the flaw is diagnosable from the
 recordings in a way that no amount of self play can reproduce.
 
-Six games on fixed seeds, paired on the deal, recorded. Then sort the losing nodes into three
-buckets: moves more search fixes, moves the value head scores wrongly at any budget, and moves
-that look fine at every budget and are still wrong. The third bucket is the valuable one,
-because an error invisible from inside the system is exactly what self play cannot label, and
-a systematic error a strong search makes is a place the game rewards something the search
-cannot see. That is a finding about Duel 52, not only about the agent.
+**What is left to do here**, in order:
+
+- **Finish the series properly.** Six games on fixed seeds, paired on the deal so each seed is
+  played from both sides, at one budget rather than three. The five games recorded so far are
+  a pilot, not the measurement.
+- **Diagnose the owner's two wins**, which is why the games were recorded at all. For each,
+  find the nodes where the value head was confident in the side that went on to lose, and sort
+  them into three buckets: moves more search fixes, moves the value head scores wrongly at any
+  budget, and moves that look fine at every budget and are still wrong. The third bucket is the
+  valuable one, because an error invisible from inside the system is exactly what self play
+  cannot label, and a systematic error a strong search makes is a place the game rewards
+  something the search cannot see. That is a finding about Duel 52, not only about the agent.
+- **Turn the corpus into a fixed evaluation set.** Score every future checkpoint on the same
+  positions and ask whether the value head still thinks it is winning at the node where it
+  actually lost. Seconds to run, and it never goes stale.
+
+⚠️ **Two housekeeping problems with the corpus as it stands**, both cheap and both worth
+fixing before it grows. The records name their opponent as `runs/fifth/checkpoints/best.d52nn`,
+and `runs/` is not tracked, so a fresh clone cannot re-score these games even though it ships
+the byte-identical `models/duel52-split-gen031.d52nn`. And `games/owner-vs-gen006.jsonl` now
+holds a game against `gen031`, so the filenames no longer say what is in them.
 
 ### 2. Turn the hand size result from a correlation into a cause
 

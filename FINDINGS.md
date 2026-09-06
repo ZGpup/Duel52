@@ -392,9 +392,12 @@ Superseded by F4.5 and kept because it is what motivated the fix, and because
 - **Everything describes `split` only.** The observation layout is per variant, so these
   checkpoints cannot even be loaded against `base` or `mirrored`. Whether the seam, the hoard
   and the concentration survive a shared draw pile is untested.
-- **The owner still beats it.** The record against gen016 is 0-5 and no series has been played
-  against gen022 or gen031. That is the most informative unrecorded signal in the project, and
-  `PLAN.md` puts recording it first.
+- **The human check has started but is not a measurement yet.** The agent lost 0-5 to the owner
+  at gen016, unrecorded. Five recorded games since, all played without hints: 2-0 to the agent
+  against gen022 at 4096 simulations, and 2-1 to the owner against gen031 across 128 and 8192.
+  So the agent can now take games off the one person who has played it, which it could not
+  before. Five games across three budgets and unpaired seeds is a pilot, and the value of the
+  corpus is the diagnosis of the losses rather than the score. `PLAN.md` item 1.
 
 ---
 

@@ -323,6 +323,53 @@ fn phase3_more_simulations_visit_more_actions() {
     );
 }
 
+/// `SearchResult::values` is what `play --hint` shows a human as "what the net thinks you
+/// are worth after this move", so it has to line up with `visits` entry for entry and it has
+/// to distinguish *unvisited* from *bad*.
+///
+/// The second half is the one that matters. If an unvisited move reported 0.0 instead of
+/// `None`, a hint would tell the owner the search hated a move it had simply never looked
+/// at — which at a small budget is most of a wide root, and is a lie that reads exactly like
+/// a strong opinion.
+#[test]
+fn phase3_a_search_reports_a_value_for_the_actions_it_visited_and_none_for_the_rest() {
+    use duel52_engine::NetMctsAgent;
+
+    let mut agent = NetMctsAgent::derived(test_checkpoint(), 7, 1, 24);
+    let mut state = GameState::new(GameConfig::default(), 20260905);
+    let mut checked = 0;
+    while !state.outcome.is_over() && checked < 12 {
+        let legal = state.legal_actions();
+        let result = agent.search(&state, &legal);
+
+        assert_eq!(result.values.len(), legal.len(), "one value per legal action");
+        assert_eq!(result.values.len(), result.visits.len());
+        for (i, value) in result.values.iter().enumerate() {
+            match value {
+                Some(v) => {
+                    assert!(result.visits[i] > 0, "action {i} has a value but no visits");
+                    // The same `0.0..=1.0` outcome scale as `root_value`, because a hint
+                    // prints the two in the same column and calls both a win probability.
+                    assert!(
+                        (0.0..=1.0).contains(v),
+                        "action {i} backed up {v}, which is not a win probability"
+                    );
+                }
+                None => assert_eq!(result.visits[i], 0, "action {i} was visited but has no value"),
+            }
+        }
+        // Not vacuous: a search with a budget has to have looked somewhere.
+        assert!(
+            result.values.iter().any(|v| v.is_some()),
+            "24 simulations visited nothing"
+        );
+
+        state.apply_trusted(legal[0]);
+        checked += 1;
+    }
+    assert!(checked > 0, "the game ended before anything was searched");
+}
+
 /// A shard path that does not exist is a clear error, not a panic — the trainer calls this
 /// from Python and a stack trace through PyO3 is worse than a sentence.
 #[test]

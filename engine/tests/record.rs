@@ -98,6 +98,40 @@ fn phase4_a_record_of_a_hotseat_game_has_no_opponent() {
     assert!(record.to_json_line().contains("\"opponent\":null"));
 }
 
+/// `play --hint` puts the net's top moves on screen before the human chooses, so a hinted
+/// game is a different kind of evidence from an unassisted one — and `replay` scoring the
+/// human against the net cannot tell them apart unless the file says which it is.
+///
+/// The other half is that an *unassisted* game's line must be exactly what it was before the
+/// field existed. The corpus is append-only and years long; a field that turned up in every
+/// line would make `git diff` on `games/` unreadable and would change nothing true.
+#[test]
+fn phase4_a_hinted_game_says_so_and_an_unassisted_one_stays_silent() {
+    let (plain, _) = play_and_record(GameConfig::split_deck(), 33);
+    assert_eq!(plain.hint, None);
+    assert!(
+        !plain.to_json_line().contains("\"hint\""),
+        "an unassisted game must not carry the field at all"
+    );
+    // And a file written before `--hint` existed still reads, as no hint.
+    assert_eq!(
+        GameRecord::parse(&plain.to_json_line())
+            .expect("parses")
+            .hint,
+        None
+    );
+
+    let advisor = "netmcts:models/duel52-split-gen031.d52nn@256";
+    let hinted = plain.clone().with_hint(Some(advisor.to_string()));
+    let parsed = GameRecord::parse(&hinted.to_json_line()).expect("a hinted line parses");
+    assert_eq!(parsed.hint.as_deref(), Some(advisor));
+    assert_eq!(parsed, hinted);
+    // The hint is a note about how the game was played, not part of what was played: the
+    // same moves still replay to the same game.
+    parsed.walk(|_, _, _| {}).expect("and still replays");
+    assert_eq!(parsed.moves, plain.moves);
+}
+
 #[test]
 fn phase4_every_variant_round_trips_including_its_config() {
     // The config is what the replay rebuilds the game from, so a variant whose config does

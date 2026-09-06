@@ -164,9 +164,11 @@ is what is comparable, and `runs/fourth`'s was 0.870 → 0.655.
 
 ### Known limits
 
-- **It has still never beaten a human**, and this is still the measurement Phase 4 turns on.
-  The owner's record against gen016 was 0–5; there is no recorded series against gen022 or
-  against this checkpoint. `PLAN.md` §4.7's six-seed paired rematch is the open item.
+- **It has beaten a human, and the series is a pilot rather than a measurement.** Updated
+  2026-09-06: the owner's record against gen016 was 0–5, unrecorded. Against this checkpoint
+  the recorded games are 1–1 at 8192 simulations and one loss at 128, so the owner leads 2–1.
+  Five recorded games in total across three budgets on unpaired seeds. The six-seed paired
+  rematch at one budget is the open item; `PLAN.md` item 1.
 - **What the lane bias cost in Elo is still not separable from what three more hours cost.**
   The run changed one thing, so +82 is the change plus the extra generations together, and
   nothing here divides them. Claiming "lane augmentation is worth +82 Elo" would be reading
@@ -292,9 +294,9 @@ than one.
 
 ### Known limits
 
-- **It has never beaten a human.** The owner's record against gen016 was 0–5 and there is no
-  recorded series against this one yet. `duel52 play --record` exists now (`PLAN.md` §4.0), so
-  the next series will at least be written down.
+- **It has beaten a human.** Updated 2026-09-06: two recorded games against the owner at 4096
+  simulations, both wins for this checkpoint, in `games/owner-vs-gen006.jsonl`. The owner's
+  record against gen016 was 0–5, unrecorded. Two games is not a series.
 - **The value head is still the weak half.** It scores 0.655 held-out where gen016 scored
   0.774 — a real improvement, and still only about a third of outcome variance explained on a
   ±1 target. `FINDINGS.md` F4.1.

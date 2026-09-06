@@ -83,7 +83,7 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 332 tests: rules, determinism, information hiding,
+cargo test                               # 334 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, and
                                          # the training corpus
 
@@ -96,6 +96,21 @@ cargo test                               # 332 tests: rules, determinism, inform
 ./target/release/duel52 play --opponent human              # hotseat
 ./target/release/duel52 powers                             # card-power reference
 ./target/release/duel52 demo --seed 47                     # watch a random game, action by action
+
+# Ask the agent you are playing what it would do, before you decide. `--hint N` lists the N
+# moves it would consider (default 3), best first, with each one's share of its search and
+# what it makes of your position afterwards. `--hint-agent <agent>` asks somebody else, and
+# implies `--hint`; it is how a hotseat game or a game against `random` gets advice, and how
+# you ask a bigger budget than the one you are playing.
+#
+# Two things it deliberately is not. It is not a peek: the search determinizes from YOUR
+# information set, so it cannot see the opponent's hand or your own base card. And it is not
+# part of the game: it runs on its own RNG stream, so the same seed plays the identical game
+# with hints on or off — verified by recording the same driven game both ways. A hinted game
+# is flagged in `--record` and warned about in `replay`, because the "second opinion" column
+# there stops being evidence about the human once the answer was on screen while they chose.
+./target/release/duel52 play --encoding-slots 21 --hint \
+    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
 
 # Record what you played, then ask the net about it (PLAN.md §4.0). A game is
 # (config, seed, chosen indices), so a 153-node game is 918 bytes and replays exactly —

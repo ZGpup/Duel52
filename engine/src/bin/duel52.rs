@@ -107,6 +107,19 @@ OPTIONS
   play only:
   --as <p0|p1>                    which side you take (default: p0, who moves first)
   --opponent <agent|human>        an agent name, or `human` for hotseat (default: random)
+  --hint [n]                      before each of your decisions, list the n moves the model
+                                  you are playing would consider, best first, with the share
+                                  of its search each got and what it thinks you are worth
+                                  after it (default 3). It reasons from YOUR information
+                                  set, so it cannot see anything you cannot, and it runs on
+                                  its own RNG: the opponent plays the same game either way.
+                                  A hinted game is marked in --record, because `replay`
+                                  scoring your moves against the net means something else
+                                  when the net's answer was already on the screen.
+  --hint-agent <agent>            who does the advising; implies --hint. Default: whoever
+                                  you are playing. Needed for a hotseat game or against a
+                                  non-net opponent, and how you ask a bigger budget than the
+                                  one you are playing against.
   --reveal                        DEBUG: show all hidden information (both hands, base
                                   cards, pile order). Do not use while genuinely playing.
   --no-clear                      do not redraw over the screen; keep every prompt in the
@@ -169,6 +182,9 @@ OPTIONS
 EXAMPLES
   duel52 play --seed 1                     play the default variant as first player
   duel52 play --opponent ismcts:2000       play against a stronger search
+  duel52 play --encoding-slots 21 --hint \\
+    --opponent netmcts:models/duel52-split-gen031.d52nn@256
+                                           decide, then read what it would have played
   duel52 stats --all --games 5000
   duel52 ladder --games 600 --markdown     the Phase 2 Elo table
   duel52 match --a ismcts:800 --b pimc:8x1 --games 400
@@ -186,6 +202,11 @@ struct Options {
     human: Player,
     /// `None` means hotseat — both sides played at the keyboard.
     opponent: Option<AgentSpec>,
+    /// How many moves `play --hint` lists before each of your decisions. `None` is off.
+    hint: Option<usize>,
+    /// Which agent does the advising. `None` means the one you are playing against, which is
+    /// what "what does the model I am playing think?" asks for.
+    hint_agent: Option<AgentSpec>,
     reveal: bool,
     /// Keep the transcript instead of redrawing over it. `play` only.
     no_clear: bool,
@@ -222,6 +243,8 @@ impl Default for Options {
             seed: 1,
             human: Player::P0,
             opponent: Some(AgentSpec::Random),
+            hint: None,
+            hint_agent: None,
             reveal: false,
             no_clear: false,
             record: None,
@@ -358,6 +381,26 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                     other => Some(AgentSpec::parse(other)?),
                 };
             }
+            // The count is optional, because `--hint` on its own is the whole of what anyone
+            // wants nine times in ten. The number is consumed only if it *is* a number, so
+            // `--hint --seed 3` leaves `--seed` alone rather than eating its flag.
+            "--hint" => {
+                let n = match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => {
+                        i += 1;
+                        n
+                    }
+                    None => Advisor::DEFAULT_TOP,
+                };
+                if n == 0 {
+                    return Err("--hint needs at least one move to list".to_string());
+                }
+                opts.hint = Some(n);
+            }
+            "--hint-agent" => {
+                let v = next_value(args, &mut i, "--hint-agent")?;
+                opts.hint_agent = Some(AgentSpec::parse(&v)?);
+            }
             "--record" => opts.record = Some(next_value(args, &mut i, "--record")?.into()),
             "--game" => opts.game = Some(next_number(args, &mut i, "--game")?),
             "--reveal" => opts.reveal = true,
@@ -388,6 +431,11 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     }
     if let Some(n) = encoding_slots {
         opts.config.encoding_slots = n;
+    }
+    // Naming an advisor is a request for hints, so `--hint-agent` alone works and nobody has
+    // to discover that it silently did nothing without `--hint` next to it.
+    if opts.hint_agent.is_some() && opts.hint.is_none() {
+        opts.hint = Some(Advisor::DEFAULT_TOP);
     }
     opts.config
         .validate()
@@ -585,6 +633,32 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 }
             }
             println!();
+        }
+
+        println!(
+            "\nWhat became of every 3 played from hand — the one rank whose power needs\n\
+             darkness. The Trap column is the only one where holding it paid.\n"
+        );
+        println!(
+            "| agent | 3s played/game | flipped by choice | flipped by a 5 | \
+             Trap sprang | still face-down at end | traps/game |"
+        );
+        println!("|---|---:|---:|---:|---:|---:|---:|");
+        for m in &rows {
+            let b = &m.behaviour[0];
+            match b.three_fates() {
+                Some((chosen, by_five, trapped, held)) => println!(
+                    "| {} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+                    m.agents[0].name(),
+                    b.threes_played_per_game(),
+                    chosen,
+                    by_five,
+                    trapped,
+                    held,
+                    b.traps_per_game(),
+                ),
+                None => println!("| {} | — | — | — | — | — | — |", m.agents[0].name()),
+            }
         }
 
         println!(
@@ -1112,6 +1186,226 @@ impl Screen {
     }
 }
 
+// ================================================================== the advisor ==
+
+/// The second opinion `play --hint` puts on screen before you choose.
+///
+/// The same machinery `replay` scores a *finished* game with, moved to the front of the
+/// decision — so that the comparison between what you would play and what the net would play
+/// can be made while it still costs something, rather than afterwards when the answer is
+/// already known.
+///
+/// **It cannot cheat, and that is structural rather than a promise.** [`NetMctsAgent::search`]
+/// determinizes from the acting player's information set on every simulation, exactly as it
+/// does when it is playing the other side, so the worlds it reasons over are worlds you
+/// yourself cannot rule out — your own face-down base card included. The policy-only path
+/// goes through [`duel52_engine::encode_observation`], which
+/// `phase3_observation_is_a_function_of_the_information_set` pins to the same standard. A
+/// hint is a stronger player's opinion about your position, never a look at the deal.
+///
+/// It also cannot change the game. It runs on its own RNG stream, so the opponent's choices
+/// are bit-identical whether hints are on or off, and the seed still replays the deal.
+struct Advisor {
+    /// The agent's name, so a hint on screen says what produced it and a line in
+    /// `FINDINGS.md` can name the advisor that was on.
+    name: String,
+    /// How many moves to list.
+    top: usize,
+    /// `None` for a policy-only advisor, which has no search to run.
+    searcher: Option<duel52_engine::NetMctsAgent>,
+    /// Set only when there is no searcher: the policy is then the whole of the opinion.
+    evaluator: Option<std::sync::Arc<duel52_engine::nn::MlpEvaluator>>,
+}
+
+/// One row of a hint: a move, and why the advisor rates it where it does.
+enum Opinion {
+    /// A search ran. `share` is this move's slice of the simulations — the rule `choose`
+    /// picks by — and `win` is what the search backed up behind it, `None` if it never went
+    /// there at all.
+    Searched { share: f32, win: Option<f32> },
+    /// No search: the policy prior is the whole opinion.
+    Prior(f32),
+}
+
+/// What the advisor made of one position, ready to draw.
+struct Hint {
+    agent: String,
+    /// The advisor's estimate that **you** win from here, `0.0..=1.0`.
+    win: f32,
+    /// At most `top` moves, best first.
+    moves: Vec<(String, Opinion)>,
+}
+
+impl Advisor {
+    /// Three: enough to see the runner-up and the one after it, which is where a disagreement
+    /// usually is, and short enough to sit under the menu without pushing the board off an
+    /// 80×24 terminal.
+    const DEFAULT_TOP: usize = 3;
+
+    /// Build the advisor, loading its checkpoint now rather than on the first decision.
+    ///
+    /// A bad path has to be an error before a card is dealt, for the same reason
+    /// `--record` is checked there: discovering it ten moves in costs the game.
+    fn new(spec: &AgentSpec, top: usize, config: &GameConfig, seed: u64) -> Result<Advisor, String> {
+        let load = |path: &str| {
+            duel52_engine::nn::evaluator_for(std::path::Path::new(path), config)
+                .map_err(|e| format!("--hint cannot load {path}: {e}"))
+        };
+        let (searcher, evaluator) = match spec {
+            AgentSpec::NetMcts { checkpoint, sims } => {
+                load(checkpoint)?;
+                // A stream of its own — `0xADD1CE`, and not the opponent's `0xBEEF`. Sharing
+                // one would make the bot's play depend on whether you asked for advice,
+                // which would put two different games behind the same seed.
+                let searcher = duel52_engine::NetMctsAgent::derived(
+                    checkpoint.clone(),
+                    seed ^ 0xADD1CE,
+                    11,
+                    *sims,
+                );
+                (Some(searcher), None)
+            }
+            AgentSpec::NetPolicy { checkpoint } => (None, Some(load(checkpoint)?)),
+            other => {
+                return Err(format!(
+                    "--hint needs a net to advise with, and `{}` is not one. Either play \
+                     against a checkpoint, or name the advisor yourself:\n  \
+                     --hint-agent netmcts:models/duel52-split-gen031.d52nn@256",
+                    other.name()
+                ))
+            }
+        };
+        Ok(Advisor {
+            name: spec.name(),
+            top,
+            searcher,
+            evaluator,
+        })
+    }
+
+    /// Whether a decision costs a search, and so whether it is worth saying so on screen.
+    fn searches(&self) -> bool {
+        self.searcher.is_some()
+    }
+
+    /// What the advisor would play here, best first. `legal` must be `state.legal_actions()`
+    /// for `state`, and `observer` is who the moves are described to.
+    fn advise(&mut self, state: &GameState, legal: &[Action], observer: Option<Player>) -> Hint {
+        let (win, mut ranked) = match self.searcher.as_mut() {
+            Some(searcher) => {
+                let result = searcher.search(state, legal);
+                let total = result.visits.iter().sum::<u32>().max(1) as f32;
+                let mut order: Vec<usize> = (0..legal.len()).collect();
+                // Most-visited first, which is the robust-child rule `NetMctsAgent::choose`
+                // picks by, so the top row of a hint is always the move it would have made.
+                // The backed-up value breaks ties; `sort_by` is stable, so the tail of
+                // never-visited moves keeps the order the menu offers them in.
+                order.sort_by(|&a, &b| {
+                    result.visits[b].cmp(&result.visits[a]).then_with(|| {
+                        let (x, y) = (result.values[b], result.values[a]);
+                        x.unwrap_or(0.0).total_cmp(&y.unwrap_or(0.0))
+                    })
+                });
+                let rows = order
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            i,
+                            Opinion::Searched {
+                                share: result.visits[i] as f32 / total,
+                                win: result.values[i],
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (result.root_value, rows)
+            }
+            None => {
+                let evaluator = self.evaluator.as_ref().expect("one path or the other");
+                let mut obs = vec![0.0f32; duel52_engine::obs_dim(&state.config)];
+                let mut logits = vec![0.0f32; duel52_engine::action_dim(&state.config)];
+                let mut values = [0.0f32; 1];
+                duel52_engine::encode_observation(state, state.acting_player(), &mut obs);
+                evaluator.eval_batch(&obs, 1, &mut logits, &mut values);
+                let priors = masked_softmax(&logits, legal, state);
+                let mut order: Vec<usize> = (0..legal.len()).collect();
+                order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
+                let rows = order
+                    .into_iter()
+                    .map(|i| (i, Opinion::Prior(priors[i])))
+                    .collect::<Vec<_>>();
+                // The value head is a tanh in `-1..=1`; everything on screen is a win
+                // probability, so put it on the engine's `0..=1` outcome scale.
+                (0.5 * (values[0] + 1.0), rows)
+            }
+        };
+        ranked.truncate(self.top);
+        Hint {
+            agent: self.name.clone(),
+            win,
+            moves: ranked
+                .into_iter()
+                .map(|(i, opinion)| (describe_move(state, legal[i], observer), opinion))
+                .collect(),
+        }
+    }
+}
+
+impl Hint {
+    /// Column width for the move text. Wide enough for the longest thing `describe_move`
+    /// writes — an attack naming both cards — and narrow enough that the whole block fits
+    /// the 79 columns the rest of the CLI is laid out to.
+    const MOVE_WIDTH: usize = 44;
+
+    /// The block that goes between the menu and the prompt.
+    fn render(&self) -> String {
+        let searched = matches!(self.moves.first(), Some((_, Opinion::Searched { .. })));
+        let mut out = format!(
+            "\n {} · it puts you at {:.0}% from here{}\n",
+            self.agent,
+            self.win * 100.0,
+            if searched { "" } else { " · no search" },
+        );
+        // Trimmed, because the policy-only variant leaves the last column empty and a screen
+        // that is redrawn on every keystroke should not carry a tail of spaces into the
+        // scrollback under --no-clear.
+        let row = |a: String, b: String, c: String, d: String| {
+            format!(" {a:>2}  {b:<width$}  {c:>6}  {d:>6}", width = Hint::MOVE_WIDTH)
+                .trim_end()
+                .to_string()
+        };
+        out.push_str(&row(
+            "#".to_string(),
+            "the net would consider".to_string(),
+            if searched { "sims" } else { "prior" }.to_string(),
+            if searched { "after" } else { "" }.to_string(),
+        ));
+        out.push('\n');
+        for (i, (text, opinion)) in self.moves.iter().enumerate() {
+            let (left, right) = match opinion {
+                // A move the search never took has no value behind it, and `—` says that
+                // rather than implying it scored badly.
+                Opinion::Searched { share, win } => (
+                    format!("{:.0}%", share * 100.0),
+                    match win {
+                        Some(w) => format!("{:.0}%", w * 100.0),
+                        None => "—".to_string(),
+                    },
+                ),
+                Opinion::Prior(p) => (format!("{p:.3}"), String::new()),
+            };
+            out.push_str(&row(
+                (i + 1).to_string(),
+                clip(text, Hint::MOVE_WIDTH),
+                left,
+                right,
+            ));
+            out.push('\n');
+        }
+        out
+    }
+}
+
 /// Interactive play.
 fn cmd_play(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
@@ -1121,6 +1415,23 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     if let Some(path) = &opts.record {
         record::prepare(path)?;
     }
+    // Built before the deal too, and for the same reason: a checkpoint that will not load is
+    // a command-line mistake, not something to discover on move ten.
+    let mut advisor = match opts.hint {
+        None => None,
+        Some(top) => {
+            let spec = opts
+                .hint_agent
+                .as_ref()
+                .or(opts.opponent.as_ref())
+                .ok_or(
+                    "--hint has nobody to ask: this is a hotseat game, so there is no \
+                     opponent to borrow. Name one with --hint-agent <agent>.",
+                )?;
+            Some(Advisor::new(spec, top, &opts.config, opts.seed)?)
+        }
+    };
+
     let mut state = GameState::new(opts.config, opts.seed);
     let mut bot = opts
         .opponent
@@ -1160,9 +1471,12 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         // banner adds only what the board does not: how to replay this game, who is who,
         // and how to get help.
         banner: format!(
-            "seed {} · {mode}{}{} · `help` for commands, `q` to quit",
+            "seed {} · {mode}{}{}{} · `help` for commands, `q` to quit",
             state.seed,
             if opts.reveal { " · REVEALED" } else { "" },
+            // On screen for the same reason it goes into the record: a game you were being
+            // advised through is a different piece of evidence from one you were not.
+            if advisor.is_some() { " · HINTED" } else { "" },
             match plain {
                 Some(why) => format!(" · no live highlight ({why})"),
                 None => String::new(),
@@ -1195,6 +1509,30 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         let legal = state.legal_actions();
         let root = menu::build(&state, &legal, observer);
 
+        // Ask the advisor before the keyboard opens, not after: a 4096-simulation search is
+        // seconds of thinking, and the terminal should not sit in raw mode through it.
+        let hint = match advisor.as_mut() {
+            // A forced move needs no second opinion. Skipping it also keeps a long chain of
+            // sub-decisions — `NEXT` after `NEXT` — from costing a search each to be told
+            // the one thing that can happen.
+            Some(_) if legal.len() < 2 => None,
+            Some(advisor) => {
+                // Only when there is a screen to redraw over and something to wait for. A
+                // policy-only advisor answers instantly, and under --no-clear a frame that
+                // is superseded a moment later is a whole board of noise in the transcript.
+                if screen.clear && advisor.searches() {
+                    screen.draw(
+                        &render(&state, observer),
+                        &format!("\n {} is thinking…\n", advisor.name),
+                        observer,
+                        "",
+                    );
+                }
+                Some(advisor.advise(&state, &legal, observer))
+            }
+            None => None,
+        };
+
         // Character-at-a-time for the length of this decision only, so that a thinking bot
         // between turns is never waiting with the terminal in raw mode.
         let mut keys = Keyboard::open(screen.clear);
@@ -1220,7 +1558,13 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             };
 
             let board = render_focus(&state, observer, &focus);
+            // The menu stays directly under the board it applies to, and the hint goes below
+            // it, so the block that changes as you walk the tree is the one next to the
+            // board and the block that does not is the one next to the prompt.
             let mut menu_text = node.render_with(!path.is_empty(), hovered);
+            if let Some(hint) = &hint {
+                menu_text.push_str(&hint.render());
+            }
             if !complaint.is_empty() {
                 menu_text.push_str(&format!("\n !! {complaint}\n"));
             }
@@ -1341,7 +1685,8 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             opts.opponent.as_ref().map(|spec| spec.name()),
             moves,
             state.outcome,
-        );
+        )
+        .with_hint(advisor.as_ref().map(|a| a.name.clone()));
         // A finished game is never thrown away because of a filesystem problem. If the
         // append fails anyway — the disk filled, the directory went away mid-game — the
         // line goes to the terminal, where it can be pasted into the file by hand. It is
@@ -1501,7 +1846,11 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 g.human.to_string(),
                 g.moves.len(),
                 g.human_result,
-                g.opponent.as_deref().unwrap_or("hotseat"),
+                format!(
+                    "{}{}",
+                    g.opponent.as_deref().unwrap_or("hotseat"),
+                    if g.hint.is_some() { "  (hinted)" } else { "" },
+                ),
             );
         }
         println!("\nWalk one with --game <n>.");
@@ -1552,6 +1901,13 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
         game.moves.len(),
         game.outcome,
     );
+    // Said before the table rather than in a footnote. Every "you agreed with the net" number
+    // below is worth much less when the net's pick was on screen while the human chose, and
+    // the reader has to know that before they read the numbers, not after.
+    if let Some(advisor) = &game.hint {
+        println!("  ⚠ HINTED: `{advisor}` listed its top moves before each of your decisions.");
+        println!("    Agreement below is not evidence about how you play unassisted.");
+    }
     match (&checkpoint, sims) {
         (None, _) => println!(
             "  no checkpoint to score with — pass --checkpoint <file> for the net's view"
@@ -1828,6 +2184,19 @@ Choosing a move — one question at a time:
 
   (Needs a colour terminal. Under --no-clear, or piped to a file, or with NO_COLOR set,
   the prompt goes back to plain lines with no preview.)
+
+Under --hint, a block below the menu:
+  The moves the advising net would consider here, best first. `sims` is the share of its
+  search that went into a move — the rule it picks by, so row 1 is the move it would play —
+  and `after` is what it thinks your chances are once you have played it. `—` there means
+  the search never went down that branch at all, which is not the same as a bad score. The
+  header line is what it makes of the position before you move, so a move whose `after`
+  beats it is one the net thinks improves your position.
+
+  It is thinking from your side of the table: it samples worlds consistent with what YOU
+  know, so it can no more see the opponent's hand — or your own base card — than you can.
+  It never touches the game: the opponent's moves are identical whether hints are on or off,
+  and the seed replays the same deal. A recorded game notes that hints were on.
 
 Commands at the prompt:
   <number>   pick that numbered line — see it on the board first

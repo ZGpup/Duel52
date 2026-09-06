@@ -132,6 +132,18 @@ pub struct SearchResult {
     /// Visit count per entry of the `legal` slice the search was given. **This is the
     /// policy target** — `DESIGN.md` §6.
     pub visits: Vec<u32>,
+    /// What the search backed up *behind* each entry of `legal`, for the player to move, on
+    /// the same `0.0..=1.0` scale as [`SearchResult::root_value`]. Aligned with `visits`.
+    ///
+    /// `None` where the search never took that edge. An unvisited move has no estimate at
+    /// all, which is a different thing from an estimate of zero, and collapsing the two
+    /// would read on screen as "the search hates this move" when it means "the search never
+    /// looked". A wide root at a small budget leaves most entries `None`.
+    ///
+    /// Nothing in the training loop reads this — the policy target is `visits` and the value
+    /// target is the game's outcome. It exists so a *human* can be shown what the search
+    /// thought each candidate was worth (`play --hint`).
+    pub values: Vec<Option<f32>>,
     /// The root's backed-up value for the player to move, in `0.0..=1.0`.
     pub root_value: f32,
     /// Nodes in the tree, for instrumentation.
@@ -307,15 +319,18 @@ impl NetMctsAgent {
             }
         }
 
-        let visits = legal
+        let (visits, values): (Vec<u32>, Vec<Option<f32>>) = legal
             .iter()
-            .map(|&action| {
-                tree[0]
-                    .edge_for(action)
-                    .map(|i| tree[0].edges[i].visits)
-                    .unwrap_or(0)
+            .map(|&action| match tree[0].edge_for(action) {
+                Some(i) => {
+                    let edge = &tree[0].edges[i];
+                    let value = (edge.visits > 0)
+                        .then(|| (edge.reward[me.idx()] / edge.visits as f64) as f32);
+                    (edge.visits, value)
+                }
+                None => (0, None),
             })
-            .collect();
+            .unzip();
 
         // The root's own value, preferring what the tree backed up over the raw net call.
         let root_value = {
@@ -333,6 +348,7 @@ impl NetMctsAgent {
 
         SearchResult {
             visits,
+            values,
             root_value,
             nodes: tree.len(),
         }

@@ -26,6 +26,7 @@
 
 use crate::action::Action;
 use crate::agents::{Agent, AgentSpec};
+use crate::card::CardId;
 use crate::config::GameConfig;
 use crate::outcome::{DrawReason, Outcome};
 use crate::player::Player;
@@ -85,6 +86,22 @@ pub struct GameStats {
     /// not that the agent is being passive; there is no longer any way to be passive.
     pub stuck_turns: [u32; 2],
     pub pairs_declared: [u32; 2],
+
+    /// Face-down 3s that were killed and sprang their Trap (§6), by player.
+    ///
+    /// The 3 is the one rank whose power is conditioned on staying hidden, so the flip rate
+    /// alone cannot say whether holding it paid: a 3 held to the end of the game and a 3
+    /// held until it sprang look identical in `flips_by_rank`. This counts the payoff.
+    pub traps_sprung: [u32; 2],
+    /// 3s turned face-up by a **5's cascade** rather than by their owner choosing to,
+    /// by player.
+    ///
+    /// Split out because `flips_by_rank` counts only [`Action::Flip`]; a 5 flips the lane
+    /// from inside `apply`, so those never reach [`GameStats::note_action`]. Without this
+    /// the four outcomes of a played 3 do not sum.
+    pub threes_flipped_by_five: [u32; 2],
+    /// 3s still face-down on the board when the game ended, by player. Includes base 3s.
+    pub threes_face_down_at_end: [u32; 2],
 }
 
 impl GameStats {
@@ -108,6 +125,59 @@ impl GameStats {
             unflipped_at_end: [0, 0],
             stuck_turns: [0, 0],
             pairs_declared: [0, 0],
+            traps_sprung: [0, 0],
+            threes_flipped_by_five: [0, 0],
+            threes_face_down_at_end: [0, 0],
+        }
+    }
+
+    /// Every face-down 3 in play, as `(id, owner)`. Snapshotted before an `apply` so the
+    /// transitions that `apply` causes can be read off afterwards.
+    fn face_down_threes(state: &GameState) -> Vec<(CardId, Player)> {
+        let mut out = Vec::new();
+        for p in Player::BOTH {
+            for (_, _, card) in state.cards_of(p) {
+                if card.rank == Rank::THREE && !card.face_up {
+                    out.push((card.id, p));
+                }
+            }
+        }
+        out
+    }
+
+    /// Classify every face-down 3 that turned face-up during one `apply`.
+    ///
+    /// A face-down 3 never dies — it springs (§6) — so a snapshotted id is always still in
+    /// play afterwards, either still face-down or face-up. Three ways it can have turned
+    /// face-up, and the acting player separates them:
+    ///
+    /// 1. **Its owner was not acting.** Then it was killed, and the Trap sprang. Nothing
+    ///    else can turn an opponent's card face-up: the 4 only *looks*, privately, and the
+    ///    5 flips its own side. And the owner cannot have sprung their own 3 on their own
+    ///    turn, because damage only ever originates from an attack — including the 8's
+    ///    Retaliate and the 10's Twinstrike — and a face-down card cannot attack (§4).
+    /// 2. **Its owner was acting and chose it.** An ordinary flip, already counted in
+    ///    [`GameStats::note_action`].
+    /// 3. **Its owner was acting and did not choose it.** A 5's cascade flipped the lane.
+    fn note_three_transitions(
+        &mut self,
+        before: &[(CardId, Player)],
+        acting: Player,
+        action: Action,
+        state: &GameState,
+    ) {
+        for &(id, owner) in before {
+            let still_down = state
+                .cards_of(owner)
+                .any(|(_, _, card)| card.id == id && !card.face_up);
+            if still_down {
+                continue;
+            }
+            if owner != acting {
+                self.traps_sprung[owner.idx()] += 1;
+            } else if !matches!(action, Action::Flip { .. }) {
+                self.threes_flipped_by_five[owner.idx()] += 1;
+            }
         }
     }
 
@@ -193,6 +263,10 @@ impl GameStats {
                 .cards_of(p)
                 .filter(|(_, _, card)| !card.face_up)
                 .count() as u32;
+            self.threes_face_down_at_end[p.idx()] = state
+                .cards_of(p)
+                .filter(|(_, _, card)| !card.face_up && card.rank == Rank::THREE)
+                .count() as u32;
         }
     }
 
@@ -245,11 +319,14 @@ pub fn play_instrumented(
         let allowance_before = state.actions_remaining;
         let costs = action.costs_an_action();
 
+        let threes_before = GameStats::face_down_threes(&state);
+
         stats.note_action(&state, action);
         state.apply_trusted(action);
         stats.decisions += 1;
         stats.note_state(&state);
         stats.note_turn_ends(acting, ply_before, allowance_before, costs, &state);
+        stats.note_three_transitions(&threes_before, acting, action, &state);
     }
 
     stats.finish(&state);
@@ -299,6 +376,10 @@ pub struct AgentBehaviour {
     pub flip_ply_sum: [u64; Rank::COUNT],
     pub lane_concentration: Vec<f64>,
     pub attack_concentration: Vec<f64>,
+    /// The fate of the 3, the one rank whose power needs darkness. See [`GameStats`].
+    pub traps_sprung: u64,
+    pub threes_flipped_by_five: u64,
+    pub threes_face_down_at_end: u64,
 }
 
 impl AgentBehaviour {
@@ -323,6 +404,9 @@ impl AgentBehaviour {
         self.stuck_turns += stats.stuck_turns[i] as u64;
         self.pairs += stats.pairs_declared[i] as u64;
         self.unflipped_at_end += stats.unflipped_at_end[i] as u64;
+        self.traps_sprung += stats.traps_sprung[i] as u64;
+        self.threes_flipped_by_five += stats.threes_flipped_by_five[i] as u64;
+        self.threes_face_down_at_end += stats.threes_face_down_at_end[i] as u64;
         for r in 0..Rank::COUNT {
             self.plays_by_rank[r] += stats.plays_by_rank[i][r] as u64;
             self.flips_by_rank[r] += stats.flips_by_rank[i][r] as u64;
@@ -352,6 +436,9 @@ impl AgentBehaviour {
         self.stuck_turns += other.stuck_turns;
         self.pairs += other.pairs;
         self.unflipped_at_end += other.unflipped_at_end;
+        self.traps_sprung += other.traps_sprung;
+        self.threes_flipped_by_five += other.threes_flipped_by_five;
+        self.threes_face_down_at_end += other.threes_face_down_at_end;
         for r in 0..Rank::COUNT {
             self.plays_by_rank[r] += other.plays_by_rank[r];
             self.flips_by_rank[r] += other.flips_by_rank[r];
@@ -434,6 +521,53 @@ impl AgentBehaviour {
         }
         let voluntary = self.flips_by_rank[r].saturating_sub(self.base_flips_by_rank[r]);
         Some(voluntary as f64 / self.plays_by_rank[r] as f64)
+    }
+
+    /// What became of every 3 this agent played from hand, as fractions that sum to 1:
+    /// `(flipped by choice, flipped by a 5, Trap sprang, still face-down at the end)`.
+    ///
+    /// `None` if it never played a 3. The four are exhaustive because a face-down 3 cannot
+    /// die — it springs instead — so a played 3 is always still on the board.
+    ///
+    /// The last two are the point. `flip_rate_for` says how often the agent *declines* to
+    /// spend a 3's concealment, but declining is only worth something if the Trap then
+    /// fires; a 3 held all game and never killed bought nothing, and is indistinguishable
+    /// from a blank card the agent happened not to flip.
+    ///
+    /// The face-down-at-end count includes **base** 3s, which were never played from hand,
+    /// so it is the one term that can push the sum past 1. At the default config each
+    /// player has two 3s and three base cards, so this is a small and infrequent bias.
+    pub fn three_fates(&self) -> Option<(f64, f64, f64, f64)> {
+        let r = Rank::THREE.index();
+        let played = self.plays_by_rank[r];
+        if played == 0 {
+            return None;
+        }
+        let n = played as f64;
+        let voluntary = self.flips_by_rank[r].saturating_sub(self.base_flips_by_rank[r]);
+        Some((
+            voluntary as f64 / n,
+            self.threes_flipped_by_five as f64 / n,
+            self.traps_sprung as f64 / n,
+            self.threes_face_down_at_end as f64 / n,
+        ))
+    }
+
+    /// Threes played from hand per game — the denominator `three_fates` divides by.
+    pub fn threes_played_per_game(&self) -> f64 {
+        if self.games == 0 {
+            return f64::NAN;
+        }
+        self.plays_by_rank[Rank::THREE.index()] as f64 / self.games as f64
+    }
+
+    /// Traps sprung per game. The absolute frequency behind `three_fates`, because a rate
+    /// out of a rarely played card can look large while describing almost nothing.
+    pub fn traps_per_game(&self) -> f64 {
+        if self.games == 0 {
+            return f64::NAN;
+        }
+        self.traps_sprung as f64 / self.games as f64
     }
 
     /// Mean ply at which this agent turns a given rank face-up. `None` if it never did.

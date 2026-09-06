@@ -37,6 +37,35 @@ Every prompt names the rule it is applying, so if you think the engine is wrong 
 at the line. `duel52 powers` prints the card-power reference, and `duel52 demo --seed 47`
 watches a game play out action by action.
 
+Add `--hint` and the agent you are playing will show you the three moves it would consider
+before each of your decisions, best first — the share of its search each one got, and what it
+thinks your chances are after it. Useful for exactly one thing: make up your own mind, *then*
+look down. It reasons from your side of the table, so it cannot see anything you cannot, and
+it plays the same game whether hints are on or off.
+
+```bash
+./target/release/duel52 play --encoding-slots 21 --hint \
+    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+```
+
+```text
+   PLAY   #1
+   FLIP   #2
+   ATTACK #3
+   PAIR    —
+
+ netmcts:models/duel52-split-gen031.d52nn@4096 · it puts you at 52% from here
+  #  the net would consider                          sims   after
+  1  FLIP  lane 2 #1 (7 ²♥) -> reveals 7              41%     61%
+  2  ATK   lane 1: your #2 (8 ²♥) -> opp #1           22%     55%
+  3  PLAY  9 face-down into lane 3                    12%     52%
+```
+
+`--hint 5` lists five instead of three, and `--hint-agent <agent>` asks somebody other than
+your opponent — a bigger budget than you are playing against, say, or anybody at all in a
+hotseat game. A hinted game is marked as such in `--record`, because it is a different kind
+of evidence from one you played on your own.
+
 ## The game, briefly
 
 Three lanes, three actions per turn, and every card has a power tied to its rank. Cards are
@@ -85,9 +114,14 @@ phases. gen031 beats the strongest of them 200 games to 0, and a rung that loses
 measures nothing about the winner.
 
 **Every number above is scored against agents written for this project.** The one external
-check that exists says something different: the project owner beat gen016 five games out of
-five, and no series has been played against the two agents since. That is the measurement the
-project turns on, which is why [PLAN.md](PLAN.md) puts it first.
+check is a human, and that series has now started. The owner beat gen016 five games out of
+five, unrecorded. Of the five games recorded since, against the two later agents, **the agent
+has won three**: 2-0 against the owner at gen022, and 1-2 at gen031.
+
+Five games is a pilot rather than a series, and they mix three search budgets. But the question
+the project set for itself was whether the agent could take a game off the one person who had
+played it, and it can. [PLAN.md](PLAN.md) has what is still owed, which is the diagnosis of the
+games it lost rather than the scoreline.
 
 What the agents have taught us about the game is in [FINDINGS.md](FINDINGS.md). That file is
 the point of the project.
@@ -131,6 +165,11 @@ The checkpoint and search budget default to the agent that actually played the g
 `replay --game 1` says what your opponent was thinking at the time. Passing `--checkpoint`
 scores the same game with a different net, which is how an old game becomes a permanent
 evaluation set for a new one.
+
+A game played under `--hint` is flagged `(hinted)` in the index and carries a warning above
+the table, because the second-opinion column then measures something else: the net's pick was
+already on the screen when the move was chosen, so agreeing with it says nothing about how
+the human plays unassisted.
 
 The footer counts the nodes where the value head was **confident and wrong**: `|v| > 0.6`,
 better than four to one, backing the side that went on to lose. A value head that is uncertain
