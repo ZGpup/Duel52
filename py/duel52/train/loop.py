@@ -412,16 +412,28 @@ class TrainingLoop:
 
     # ------------------------------------------------------------------- the gate --
 
+    def reference_games_for(self, opponent: str) -> int:
+        """Games for one reference row this generation — see :meth:`GateSettings.games_for`.
+
+        Read off the *high-water mark* rather than the incumbent's latest score, for the
+        same reason the veto is: a row that has saturated and then slipped is a row the
+        panel should still be watching at full size.
+        """
+        return self.config.gate.games_for(opponent, self.reference_best.get(opponent))
+
     def reference_scores(self, checkpoint: Path) -> dict[str, float]:
         """Score `checkpoint` against each fixed reference opponent.
 
         These are the opponents that will not cooperate with a stall, which is exactly why
-        they are the veto rather than the readout.
+        they are the veto rather than the readout. Rows that have saturated are re-run at a
+        smaller size; the panel is a veto, and a veto only has to resolve a cliff.
         """
         gate = self.config.gate
         return {
             opponent: self.play_match(
-                f"netmcts:{checkpoint}@{gate.sims}", opponent, gate.reference_games
+                f"netmcts:{checkpoint}@{gate.sims}",
+                opponent,
+                self.reference_games_for(opponent),
             ).score
             for opponent in gate.reference
         }
@@ -513,7 +525,7 @@ class TrainingLoop:
             say(
                 "  reference   "
                 + " · ".join(
-                    f"vs {name} {score:.3f}"
+                    f"vs {name} {score:.3f}/{self.reference_games_for(name)}g"
                     + (f" (best {self.reference_best[name]:.3f})" if name in self.reference_best else "")
                     for name, score in reference.items()
                 )

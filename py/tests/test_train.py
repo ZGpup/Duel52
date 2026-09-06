@@ -135,6 +135,9 @@ def test_the_phase4_configs_carry_the_scale_up(name):
     assert config.train.buffer_samples >= window
     # §4.2a is Stage 0b's one experimental change, and it is the only config that carries it.
     assert config.train.lane_augment == (name == "train-3h")
+    # The saturated-row trim is `train-big`'s alone. The other two are the record of runs
+    # that have already happened, and gen022 and gen031 were measured on a full panel.
+    assert (config.gate.reference_games_saturated > 0) == (name == "train-big")
 
 
 def test_the_gate_reads_decisive_games_not_half_points():
@@ -227,6 +230,80 @@ def test_the_gate_refuses_a_regression_against_the_reference_panel():
     )
     assert promoted
     assert "abstains" in why
+
+
+def test_a_saturated_reference_row_is_trimmed_and_a_moving_one_is_not():
+    """A saturated panel row is a one-bit check, and a bit does not need 300 games.
+
+    The trim keys off the row's *high-water mark*, never its name: `random` and `greedy`
+    are saturated on a warm start (18 of 18 generations across ``runs/fourth`` and
+    ``runs/fifth``) but genuinely informative from scratch, where ``runs/third`` read
+    `greedy` at 0.36 → 0.47 → 0.68 → 0.81 → 0.89 before it flattened.
+    """
+    from dataclasses import replace
+
+    from duel52.train.config import GateSettings, TrainConfig
+    from duel52.train.loop import TrainingLoop
+
+    gate = GateSettings(reference_games=300, reference_games_saturated=60)
+
+    # Never scored, and still climbing: full size both times.
+    assert gate.games_for("greedy", None) == 300
+    assert gate.games_for("greedy", 0.89) == 300
+    # Saturated: trimmed.
+    assert gate.games_for("greedy", 0.99) == 60
+    assert gate.games_for("random", 1.0) == 60
+    # Off by default, which is what every run before this setting did.
+    assert GateSettings(reference_games=300).games_for("random", 1.0) == 300
+
+    # The loop reads the high-water mark, not the latest score — a row that saturated and
+    # then slipped is one the panel should still be watching at full size.
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.config = replace(TrainConfig(), gate=gate)
+    loop.reference_best = {"random": 1.0, "greedy": 0.89}
+    assert loop.reference_games_for("random") == 60
+    assert loop.reference_games_for("greedy") == 300
+    assert loop.reference_games_for("never-played") == 300
+
+    # A trimmed row is still a veto: the tolerance is absolute, so 60 games resolves
+    # F3.6's collapse (`random` 0.929 → 0.600) exactly as 300 would.
+    loop.reference_best = {"random": 0.929}
+    promoted, why = loop.judge(_stalled_mirror(), {"random": 0.600})
+    assert not promoted and "random" in why
+
+    # And the count actually reaches the match — the saving is in this argument and
+    # nowhere else, so asserting on `games_for` alone would pass with the wiring cut.
+    from duel52.train.loop import MatchResult
+
+    played: list[tuple[str, int]] = []
+    loop.config = replace(
+        TrainConfig(), gate=replace(gate, reference=["random", "greedy"], sims=256)
+    )
+    loop.reference_best = {"random": 1.0, "greedy": 0.89}
+    loop.play_match = lambda a, b, games: (  # noqa: ARG005
+        played.append((b, games)),
+        MatchResult(score=1.0, ci95=0.0, wins=games, losses=0, draws=0),
+    )[1]
+    loop.reference_scores(Path("candidate.d52nn"))
+    assert played == [("random", 60), ("greedy", 300)]
+
+
+def _stalled_mirror():
+    from duel52.train.loop import MatchResult
+
+    return MatchResult(score=0.502, ci95=0.005, wins=1, losses=0, draws=199)
+
+
+def test_a_trimmed_panel_row_cannot_be_bigger_than_an_untrimmed_one():
+    """The failure this catches is a config that reads as a saving and is a cost."""
+    from duel52.train.config import GateSettings
+
+    with pytest.raises(ValueError, match="not a raise"):
+        GateSettings(reference_games=120, reference_games_saturated=300)
+    with pytest.raises(ValueError, match="cannot be negative"):
+        GateSettings(reference_games_saturated=-1)
+    with pytest.raises(ValueError, match="reference_saturated_at"):
+        GateSettings(reference_games_saturated=60, reference_saturated_at=1.5)
 
 
 def test_the_device_string_is_the_whole_handoff():

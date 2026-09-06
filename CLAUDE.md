@@ -148,10 +148,18 @@ netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.
 .venv/bin/python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first \
     --resume                                                      # continue after a stop
 
-# Phase 4 — the scale-up. `check` also prints the gate's statistical power, the LR schedule
-# and the held-out size, which is the five seconds that tells you whether the run can decide
-# anything. `--init-from` starts from a shipped checkpoint instead of a random init, and
-# refuses one whose trunk disagrees with [net].
+# Phase 4 — the scale-up. `check` also prints the gate's statistical power, the reference
+# panel's plan and veto power, the LR schedule and the held-out size, which is the five
+# seconds that tells you whether the run can decide anything. `--init-from` starts from a
+# shipped checkpoint instead of a random init, and refuses one whose trunk disagrees
+# with [net].
+#
+# A panel row that has saturated (best-ever ≥ `gate.reference_saturated_at`) is re-run at
+# `gate.reference_games_saturated` instead of `gate.reference_games` — `random` and `greedy`
+# sit at 1.000 for every generation of a warm-started run and detect a cliff, nothing more.
+# It keys off the high-water mark, not the opponent's name, because from scratch those rows
+# are informative for several generations. Only `train-big.toml` sets it; the three spent
+# configs are the record of runs measured on a full panel.
 .venv/bin/python -m duel52.train check --config configs/train-2h.toml
 .venv/bin/python -m duel52.train run   --config configs/train-2h.toml --run-dir runs/fourth \
     --init-from models/duel52-split-gen016.d52nn                  # 2 h on the laptop

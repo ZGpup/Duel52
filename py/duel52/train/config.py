@@ -233,6 +233,12 @@ class GateSettings:
     #: Opponents that will not cooperate with a stall. Also the readout's strength line.
     reference: list[str] = field(default_factory=lambda: ["random", "greedy"])
     reference_games: int = 150
+    #: Games for a row that has **saturated** — see :meth:`games_for`. 0 keeps every row at
+    #: ``reference_games``, which is what every run before this setting did.
+    reference_games_saturated: int = 0
+    #: High-water mark at or above which a row counts as saturated and drops to
+    #: ``reference_games_saturated``.
+    reference_saturated_at: float = 0.99
     #: How far below the incumbent a candidate may fall on any reference opponent before it
     #: is refused. Wide enough to absorb paired-match noise at `reference_games`, narrow
     #: enough that F3.6's 0.33 collapse is nowhere near it.
@@ -241,6 +247,59 @@ class GateSettings:
     #: refuses forever is doing its job; a loop that hides that behind healthy-looking loss
     #: curves is not.
     max_consecutive_refusals: int = 3
+
+    def games_for(self, opponent: str, best: float | None) -> int:
+        """How many games this reference row gets this generation.
+
+        A saturated row is not a measurement. Across ``runs/fourth`` and ``runs/fifth`` —
+        18 generations, 120 games a row — `random` scored 1.000 eighteen times out of
+        eighteen and `greedy` never fell below 0.9833: five lost games in 2,160, a ~0.2%
+        loss rate. Those 4,320 games bought one bit each generation, *did the agent fall
+        off a cliff*, and a bit does not need 120 games.
+
+        It does not follow that the rows can simply be shrunk, which is why this keys off
+        the high-water mark rather than off the opponent's name. In ``runs/third``, which
+        trained from scratch, `greedy` went 0.36 → 0.47 → 0.68 → 0.81 → 0.89 → 0.95 over
+        its first seven generations. That is a real signal about a real net, and cutting it
+        to a catastrophe detector before it saturates would throw it away. So: full
+        ``reference_games`` until a row's best-ever reaches ``reference_saturated_at``,
+        ``reference_games_saturated`` thereafter. A warm start begins saturated and pays the
+        reduced rate from generation 1; a from-scratch run pays full rate until it earns the
+        discount, and `best` is ``None`` for a row that has never been scored.
+
+        The trimmed row is still a veto. At 60 games against a 1.000 high-water mark and
+        ``reference_tolerance`` 0.05, a truly-0.995 row false-vetoes 0.02% of the time,
+        while a fall to 0.900 is caught 86% of the time, a fall to 0.800 99.9%, and F3.6's
+        actual collapse — `random` 0.929 → 0.600 — every time. Those are the numbers for
+        60 and 0.05; ``train check`` recomputes them for whatever a config actually sets.
+
+        `opponent` is unused and stays in the signature because it is what a caller has and
+        what the call site reads by. Keying on it instead is the mistake above.
+        """
+        if self.reference_games_saturated <= 0 or best is None:
+            return self.reference_games
+        return (
+            self.reference_games_saturated
+            if best >= self.reference_saturated_at
+            else self.reference_games
+        )
+
+    def __post_init__(self) -> None:
+        if self.reference_games_saturated < 0:
+            raise ValueError(
+                "[gate] reference_games_saturated cannot be negative; got "
+                f"{self.reference_games_saturated}"
+            )
+        if self.reference_games_saturated > self.reference_games:
+            raise ValueError(
+                f"[gate] reference_games_saturated ({self.reference_games_saturated}) is above "
+                f"reference_games ({self.reference_games}) — it is a discount for rows that have "
+                "stopped moving, not a raise"
+            )
+        if not 0.0 < self.reference_saturated_at <= 1.0:
+            raise ValueError(
+                f"[gate] reference_saturated_at must be in (0, 1]; got {self.reference_saturated_at}"
+            )
 
 
 @dataclass(frozen=True)

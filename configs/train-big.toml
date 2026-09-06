@@ -128,6 +128,31 @@ sims = 256
 # A veto, never a target.
 reference = ["random", "greedy", "netmcts:models/duel52-split-gen016.d52nn@64"]
 reference_games = 300
+
+# **A saturated row is re-run at 60 games, not 300.** Once a row's best-ever reaches 0.99 it
+# has stopped being a measurement and become a one-bit check — did the agent fall off a
+# cliff — and a bit does not need 300 games. Measured with
+# `match --a netmcts:models/duel52-split-gen031.d52nn@256 --b {random,greedy} --games 120
+# --encoding-slots 21 --seed 1` on the 8-core laptop: 6.1 games/s and 4.5 games/s, so the
+# two saturated rows cost 46.3 s a generation. Here it is 300 → 60 on two of three rows.
+#
+# Keyed to the high-water mark rather than to the opponent's name, which matters *for this
+# config specifically*: this is the from-scratch run, and in `runs/third` — also from
+# scratch — `greedy` read 0.36 / 0.47 / 0.68 / 0.81 / 0.89 / 0.95 over its first seven
+# generations. Trimming it by name would have thrown that away. It pays full rate until it
+# earns the discount. A warm-started run starts saturated and pays 60 from generation 1.
+#
+# The trimmed row is still a veto: at 60 games against a 1.000 high-water mark and a 0.05
+# tolerance, a truly-0.995 row false-vetoes 0.02% of the time, while a fall to 0.900 is
+# caught 86% of the time and F3.6's actual collapse — `random` 0.929 → 0.600 — every time.
+# `train check` prints these for whatever numbers are set here.
+#
+# Honest sizing: self-play is 15,000 games a generation here, so this is well under 1% of
+# this run's wall clock. It is worth more on a laptop-shaped config (~2.4% of a train-3h
+# generation), and it costs nothing either way.
+reference_games_saturated = 60
+reference_saturated_at = 0.99
+
 reference_tolerance = 0.05
 
 max_consecutive_refusals = 5

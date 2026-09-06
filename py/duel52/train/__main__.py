@@ -117,9 +117,44 @@ def _check(args: argparse.Namespace) -> int:
         f"of the time (a refused improvement, and "
         f"{gate.max_consecutive_refusals} in a row ends the run)"
     )
+    # A panel row that has saturated gets fewer games (`GateSettings.games_for`). Whether
+    # that is still a veto is arithmetic, and it belongs next to the gate's power rather
+    # than in a comment in a config.
+    if not gate.reference:
+        print("panel:          none — the mirror gate decides alone")
+    elif gate.reference_games_saturated <= 0:
+        print(f"panel:          {len(gate.reference)} rows at {gate.reference_games} games each")
+    else:
+        n = gate.reference_games_saturated
+        tol = gate.reference_tolerance
+        print(
+            f"panel:          {len(gate.reference)} rows at {gate.reference_games} games, "
+            f"{n} once a row's best reaches {gate.reference_saturated_at:.2f} —\n"
+            f"                a trimmed row on a 1.000 best false-vetoes "
+            f"{_veto(n, 1.0 - 0.005, 1.0, tol):.2%} of the time if it is really 0.995\n"
+            f"                and catches a fall to 0.900 {_veto(n, 0.900, 1.0, tol):.0%} of the "
+            f"time, to 0.600 {_veto(n, 0.600, 1.0, tol):.0%}"
+        )
+
     if not engine.exists():
         return 1
     return 0
+
+
+def _veto(games: int, true_score: float, best: float, tolerance: float) -> float:
+    """P(a reference row vetoes) at `games`, when it is really `true_score`.
+
+    The veto fires below ``best - tolerance``, so this is one binomial tail. It is what says
+    whether a trimmed row is still a catastrophe detector or has become a coin flip.
+    """
+    from math import comb
+
+    threshold = best - tolerance
+    return sum(
+        comb(games, k) * true_score**k * (1.0 - true_score) ** (games - k)
+        for k in range(games + 1)
+        if k / games < threshold - 1e-12
+    )
 
 
 def _passes(threshold: float, true_score: float, games: int) -> float:
