@@ -33,7 +33,7 @@ torch = pytest.importorskip("torch")
 
 from duel52._engine import encoding_spec  # noqa: E402
 from duel52.nn.checkpoint import read_checkpoint  # noqa: E402
-from duel52.nn.model import Duel52Net, NetConfig  # noqa: E402
+from duel52.nn.model import NetConfig, build_net, lane_spec_for  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 BINARY = REPO / "target" / "release" / "duel52"
@@ -90,16 +90,23 @@ def _read_dump(path: Path) -> dict:
     }
 
 
-@pytest.fixture(scope="module")
-def parity(tmp_path_factory) -> dict:
-    """A checkpoint, and the Rust dump produced from it."""
+@pytest.fixture(scope="module", params=["mlp", "lane"])
+def parity(request, tmp_path_factory) -> dict:
+    """A checkpoint, and the Rust dump produced from it.
+
+    Parametrised over **both architectures**. The lane-equivariant network (``PLAN.md``
+    §4.2b) is a second forward pass in each language, and it is the one with real arithmetic
+    to get wrong: a shared per-lane matrix, a mean across lanes, and a scatter from per-lane
+    outputs into the flat policy vector. Everything this file says about transcription bugs
+    applies to it with more force, not less.
+    """
     if not BINARY.exists():
         pytest.skip(f"{BINARY} is not built — run `cargo build --release`")
 
-    tmp = tmp_path_factory.mktemp("parity")
+    tmp = tmp_path_factory.mktemp(f"parity-{request.param}")
     checkpoint = tmp / "parity.d52nn"
 
-    _init_checkpoint(checkpoint)
+    _init_checkpoint(checkpoint, request.param)
 
     dump = tmp / "parity.bin"
     subprocess.run(
@@ -123,7 +130,7 @@ def parity(tmp_path_factory) -> dict:
     return {"checkpoint": checkpoint, **_read_dump(dump)}
 
 
-def _init_checkpoint(path: Path) -> None:
+def _init_checkpoint(path: Path, arch: str) -> None:
     """Write a small random-init checkpoint in-process.
 
     In-process rather than by shelling out to ``python -m duel52.nn``, so the test uses the
@@ -133,25 +140,25 @@ def _init_checkpoint(path: Path) -> None:
     from duel52.nn.checkpoint import write_checkpoint
 
     spec = encoding_spec()
-    config = NetConfig.from_spec(spec, width=64, blocks=3, value_hidden=32)
+    config = NetConfig.from_spec(spec, width=64, blocks=3, value_hidden=32, arch=arch)
     generator = torch.Generator().manual_seed(20260903)
     torch.manual_seed(20260903)
-    model = Duel52Net(config)
+    model = build_net(config, lane_spec_for() if arch == "lane" else None)
     model.randomise_layernorms(generator)
     write_checkpoint(path, model=model, spec=spec)
 
 
-def _torch_model(checkpoint: Path) -> Duel52Net:
+def _torch_model(checkpoint: Path):
     ckpt = read_checkpoint(checkpoint)
-    model = Duel52Net(
-        NetConfig(
-            obs_dim=ckpt.obs_dim,
-            action_dim=ckpt.action_dim,
-            width=ckpt.width,
-            blocks=ckpt.blocks,
-            value_hidden=ckpt.value_hidden,
-        )
+    config = NetConfig(
+        obs_dim=ckpt.obs_dim,
+        action_dim=ckpt.action_dim,
+        width=ckpt.width,
+        blocks=ckpt.blocks,
+        value_hidden=ckpt.value_hidden,
+        arch=ckpt.arch,
     )
+    model = build_net(config, lane_spec_for() if ckpt.arch == "lane" else None)
     model.load_tensors(ckpt.tensors)
     model.eval()
     return model

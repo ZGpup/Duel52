@@ -104,6 +104,10 @@ class Generation:
     policy_prob: np.ndarray
     value: np.ndarray
     root_value: np.ndarray
+    #: ``uint8``, one per sample: 1 where the search ran to the full budget and the policy
+    #: span is a training target, 0 where playout cap randomisation capped it and the span is
+    #: empty. See ``TrainingSet::policy_target`` in ``engine/src/selfplay.rs``.
+    policy_target: np.ndarray
     header: dict[str, str]
 
     @property
@@ -145,6 +149,7 @@ class Generation:
             policy_prob=self.policy_prob[pol_from:pol_to],
             value=self.value[start:stop],
             root_value=self.root_value[start:stop],
+            policy_target=self.policy_target[start:stop],
             header=self.header,
         )
 
@@ -181,6 +186,7 @@ def load_generation(path: str | Path, generation: int, *, stride: int = 1, threa
         policy_prob=f32("policy_prob"),
         value=f32("value"),
         root_value=f32("root_value"),
+        policy_target=np.frombuffer(d["policy_target"], dtype=np.uint8),
         header=dict(d["header"]),
     )
 
@@ -224,7 +230,7 @@ def _batch_from(
     """
     obs_rows, obs_cols, obs_vals = [], [], []
     pol_rows, pol_cols, pol_vals = [], [], []
-    values = []
+    values, targets = [], []
     base = 0
     for gen, local in pieces:
         if local.size == 0:
@@ -247,6 +253,7 @@ def _batch_from(
         pol_vals.append(gen.policy_prob[pos])
 
         values.append(gen.value[local])
+        targets.append(gen.policy_target[local])
         base += local.size
 
     empty_i, empty_f = np.empty(0, np.int64), np.empty(0, np.float32)
@@ -259,6 +266,10 @@ def _batch_from(
         "policy_cols": join(pol_cols, empty_i),
         "policy_vals": join(pol_vals, empty_f),
         "value": join(values, empty_f),
+        # Per row, not per policy entry: a capped row contributes no entries at all, so it
+        # is invisible in `policy_rows` and the trainer would otherwise never know it was
+        # there. See `Generation.policy_target`.
+        "policy_target": join(targets, np.empty(0, np.uint8)),
     }
 
 

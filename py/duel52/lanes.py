@@ -96,20 +96,23 @@ class LaneReport:
         return "\n".join(rows)
 
 
-def _model(checkpoint: str | Path):
+def _model(checkpoint: str | Path, variant: str = "split", encoding_slots: int | None = None):
     from .nn.checkpoint import read_checkpoint
-    from .nn.model import Duel52Net, NetConfig
+    from .nn.model import NetConfig, build_net, lane_spec_for
 
     ckpt = read_checkpoint(checkpoint)
-    model = Duel52Net(
-        NetConfig(
-            obs_dim=ckpt.obs_dim,
-            action_dim=ckpt.action_dim,
-            width=ckpt.width,
-            blocks=ckpt.blocks,
-            value_hidden=ckpt.value_hidden,
-        )
+    config = NetConfig(
+        obs_dim=ckpt.obs_dim,
+        action_dim=ckpt.action_dim,
+        width=ckpt.width,
+        blocks=ckpt.blocks,
+        value_hidden=ckpt.value_hidden,
+        arch=ckpt.arch,
     )
+    # The architecture comes from the checkpoint, so this measures whichever network it
+    # holds. On a `lane` one the answer is known in advance — every row must read 0.000, and
+    # a non-zero row means the equivariance is broken, not that the net has a preference.
+    model = build_net(config, lane_spec_for(variant, encoding_slots) if ckpt.arch == "lane" else None)
     model.load_tensors(ckpt.tensors)
     model.eval()
     return model, ckpt
@@ -152,7 +155,7 @@ def measure(
     """Play the first card into each lane in turn and compare the three resulting policies."""
     from . import Game
 
-    model, ckpt = _model(checkpoint)
+    model, ckpt = _model(checkpoint, variant, encoding_slots)
     perms = _permutations(variant, encoding_slots)
     if ckpt.obs_dim != len(perms[0][0]) or ckpt.action_dim != len(perms[0][1]):
         raise ValueError(

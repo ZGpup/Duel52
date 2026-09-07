@@ -200,6 +200,21 @@ netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.
 # gen031 IS runs/fifth's generation 9, shipped, and it is the agent to play. gen022 is now
 # the frozen incumbent the next run gets scored against, in the role gen016 played for it.
 
+# Phase 4 Stage 1 (PLAN.md §4.2b, §4.2c) — three hours, from scratch, two changes:
+# the lane-equivariant network and playout cap randomisation. NOT a warm start, and it
+# cannot be: `arch = "lane"` shares no tensor name with the flat network, so `--init-from`
+# refuses across the two by name.
+.venv/bin/python -m duel52.train check --config configs/train-3h-new.toml
+.venv/bin/python -m duel52.train run   --config configs/train-3h-new.toml --run-dir runs/sixth
+# The mechanism check, and on this architecture it is pass/fail rather than a trend: every
+# row must read **exactly** 0.000 / 128 of 128, because no parameter is indexed by a lane.
+# Contrast gen022 (TV 0.152, 82/128) and gen031 (0.039, 114/128), which is as close as six-
+# fold augmentation could get. A non-zero row means the equivariance is broken.
+.venv/bin/python -m duel52.lanes --checkpoint runs/sixth/checkpoints/gen001.d52nn
+# Build a lane checkpoint by hand:
+.venv/bin/python -m duel52.nn init --arch lane --encoding-slots 21 \
+    --width 128 --blocks 3 --value-hidden 128 --out checkpoints/lane.d52nn
+
 # The pieces, runnable on their own when something looks wrong.
 ./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \
     --out /tmp/gen.d52sp --games 200 --sims 64 --encoding-slots 21
@@ -237,6 +252,45 @@ so an encoder change silently repoints every one of them — the header always c
 layout hashes but nothing read them back until this change. `Shard::read` now compares both
 and refuses a mismatch (`phase3_a_shard_from_a_different_action_layout_is_refused`).
 
+⚠️ **There are two architectures now, and depth costs far more than the parameter count
+suggests.** `arch = "mlp"` is `DESIGN.md` §5's flat trunk — gen016, gen022 and gen031 are all
+this — and `arch = "lane"` is the lane-equivariant network (`PLAN.md` §4.2b), whose trunk runs
+**once per lane** with shared weights. So `lane 128×3` is nine block-evaluations against a flat
+`128×3`'s three.
+
+The trap is reasoning from parameters: the input projection is 58% of a flat checkpoint's
+weights and the policy head 30%, so sharing them across lanes looks like it should make depth
+cheap. It does not, because **in the search path neither matrix is the cost** — the input layer
+walks only the observation's ~205 non-zeros (`FINDINGS.md` F3.3) and the policy head is masked
+to the ~21 legal logits. The trunk is what self-play pays for. Measured, 40 games at 256 sims
+on the 8-core laptop:
+
+| network | games/sec | vs gen031 |
+|---|---:|---:|
+| flat `128×3` (gen031), no PCR | 2.0 | 1.00× |
+| lane `128×3` + PCR | 2.0 | 1.00× |
+| lane `128×4` + PCR | 1.7 | 0.85× |
+| lane `128×6` + PCR | 1.2 | 0.60× |
+| lane `128×6`, no PCR | 0.5 | 0.25× |
+
+Playout cap randomisation (`PLAN.md` §4.2c) is what pays for the trunk: a quarter of decisions
+get the full `sims` and a policy target, the rest get `cap_sims` and a **value** target only,
+which costs nothing extra because one game has one outcome however little search produced the
+position. `--full-search-fraction` and `--cap-sims` on `duel52 selfplay`; the trainer masks the
+policy loss on the flag and divides by the **masked count**, not the batch size — dividing by
+the batch size would scale the policy gradient by the capping fraction with nothing to say so.
+
+Two consequences worth keeping straight. **A checkpoint without an `arch` header key reads as
+`mlp`**, which is what keeps the three shipped ones loading — the key is optional on read, not
+versioned. And **`lane_augment` is pointless on `arch = "lane"`**: the network satisfies
+`f(σ·x) = σ·f(x)`, so a relabelled sample gives the identical loss *and* the identical gradient
+(`test_lane_augmentation_is_a_no_op_on_the_lane_equivariant_network`). F4.5's +82 Elo was an
+augmentation result on the *flat* net and does not carry over.
+
+⚠️ **A `.d52sp` shard is version 3 as of Stage 1, and version 2 shards are refused.** The
+per-sample `policy_target` byte is not optional the way the checkpoint's `arch` key is: it sits
+in the middle of each record, so a v2 reader and a v3 file misparse from the first sample on.
+
 ⚠️ `encoding_slots` defaults to **16** and the encoder **asserts** rather than truncating.
 A `netpolicy` checkpoint played against `random` can exceed it — see `FINDINGS.md` F3.1.
 Add `--encoding-slots 21` to both the `init` and the `duel52` command if you hit it; the two
@@ -250,8 +304,9 @@ agree on. `train-fast` is Phase 3's shakedown and produced gen016; `train-2h` is
 laptop and **warm-starts from gen016**, which is why its trunk is pinned to `128 × 3`;
 `train-3h` is Stage 0b, warm-starts from **gen022**, is the only config with
 `lane_augment = true` — its one experimental change — and produced gen031, the current
-default; `train-big` is the 24-hour rented-box run and is the only one of the four that trains
-a `128 × 6` trunk from scratch. `PLAN.md` §4.5 is the order to run them in.
+default; `train-3h-new` is Stage 1, the only config with `arch = "lane"` and playout cap
+randomisation, and the only one that starts **from scratch** on a laptop; `train-big` is the
+24-hour rented-box run. `PLAN.md` §4.5 is the order to run them in.
 
 **The three shipped checkpoints are one lineage, not a menu.** gen016 → gen022 → **gen031**,
 each warm-started from the one before it and each measured against it at equal simulations:
@@ -338,7 +393,8 @@ where lanes and cards are numbered from 1.
 | `engine/src/record.rs` | The JSONL game record: `(config, seed, chosen indices)` replays a game exactly. `walk` **verifies** rather than decodes — a record that no longer reproduces its own outcome is refused, which is what stops a rules change turning the corpus into games nobody played. Hand-rolled JSON, because the engine has no dependencies |
 | `engine/src/determinize.rs` | Sampling a world from an information set. Every search agent goes through it |
 | `engine/src/encode.rs` | Observation and action tensors, and the layout hashes that pin them |
-| `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass |
+| `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass. `mlp.rs` is the flat network and dispatches to `lane.rs`, the lane-equivariant one, on `arch.kind` |
+| `engine/src/nn/lane.rs` | The lane-equivariant forward pass. Its module header carries the equations both languages implement |
 | `engine/src/agents/` | The five ladder rungs plus `netpolicy` and `netmcts`, and the evaluation in `eval.rs` |
 | `engine/src/selfplay.rs` | Self-play generation and the `.d52sp` trajectory shard |
 | `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit |
@@ -382,4 +438,10 @@ Three structural points that are easy to undo by accident:
   derive a **lane-permutation table** outside it either. `encode::lane_permutations` publishes
   the six exact relabellings (`PLAN.md` §4.2a) and Python only gathers with them; a table
   computed in Python would be a second reading of the layout, and a wrong one trains the network
-  on mismatched targets with nothing crashing to say so.
+  on mismatched targets with nothing crashing to say so. The same holds for
+  `encode::lane_structure` (`PLAN.md` §4.2b), which says *which lane owns* each observation
+  float and each logit — the lane-equivariant network shares one weight matrix across the three
+  lanes on the strength of it, so a wrong table routes lane 2's board through lane 1's weights
+  and produces an agent that is merely bad.
+  `phase4_lane_structure_agrees_with_the_permutations` checks the two tables against each
+  other rather than transcribing the layout a third time.

@@ -63,11 +63,10 @@ fn test_checkpoint() -> String {
     PATH.get_or_init(|| {
         let config = GameConfig::default();
         let arch = duel52_engine::nn::Arch {
-            obs_dim: duel52_engine::encode::obs_dim(&config),
-            action_dim: duel52_engine::encode::action_dim(&config),
             width: 24,
             blocks: 2,
             value_hidden: 12,
+            ..duel52_engine::nn::Arch::default_for(&config)
         };
         let path = std::env::temp_dir().join(format!("duel52-roster-{}.d52nn", std::process::id()));
         duel52_engine::nn::Weights::random(20260903, arch)

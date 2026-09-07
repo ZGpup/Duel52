@@ -15,9 +15,25 @@
 # roughly 50× the teacher compute. `configs/train-2h.toml` is the same seven changes on a
 # laptop, and it is worth running first: it is free and it has caught things.
 #
-# This run starts from a **random init**, not from gen016 — `net.blocks = 6` cannot inherit
-# gen016's 3-block trunk. That is the deliberate cost of change 4, and it is why the
-# gen016 reference column below is the run's progress chart rather than a formality.
+# This run starts from a **random init**, and now for a second and stronger reason: it is
+# lane-equivariant (`arch = "lane"`), which shares no tensor name with the flat network every
+# shipped checkpoint is. `--init-from` refuses across the two by name. The gen031 reference
+# column below is therefore the run's progress chart rather than a formality.
+#
+# ⚠️ **Rebuilt after `runs/sixth` (FINDINGS.md F4.6).** Four things changed, and three of them
+# are corrections to mistakes this file would otherwise have repeated at 24-hour scale:
+#
+#   1. `arch = "lane"` and playout cap randomisation, the two changes F4.6 validated.
+#   2. `net.blocks` is now **a Stage 1 measurement, not a constant** — the throughput table
+#      this file used to quote is for the *flat* network and does not describe what it would
+#      now be running. See `[net]`.
+#   3. `holdout_generation` is no longer 1. F4.6's most important operational finding is that
+#      a from-scratch run's generation-1 holdout is built from random play and becomes noise
+#      within a few generations — `runs/sixth` had no trustworthy internal diagnostic at all.
+#   4. `lr_schedule` is keyed to the generations this run will *actually finish*. F4.6 lost
+#      three generations to a schedule keyed to a length the run never reached, and the fix
+#      tripled the slope. That is the cheapest mistake on this list to avoid and the easiest
+#      to make.
 
 [game]
 variant = "split"
@@ -25,18 +41,32 @@ encoding_slots = 21               # FINDINGS.md F3.1; also what fixes obs_dim
 stalemate_value = 0.0             # FINDINGS.md F3.6
 
 [net]
-# PLAN.md §4.2 change 4. Only 10.5% of gen016's 949k parameters are in the residual trunk;
-# 58% is the input projection and 30% the policy head, both pinned by obs_dim and
-# action_dim. Depth is much the better buy than width — but F3.11 measured what it costs,
-# and "+25% parameters" reads as free and is not:
+# **The lane-equivariant network** — PLAN.md §4.2b, FINDINGS.md F4.6. The trunk runs once per
+# lane with one shared set of weights and the lanes interact only through their mean, so a
+# lane preference is unrepresentable rather than merely small: `runs/sixth` measured policy TV
+# 0.000 and agreement 128/128, against gen031's augmented 0.039 and 114/128, and those hold on
+# a random init and do not erode with training.
+arch = "lane"
+
+# ⚠️ **`blocks` is a Stage 1 measurement, not the constant it looks like, and the old
+# throughput table here was for the flat network.** Reasoning from parameters is the trap
+# F4.6 walked into: the input projection is 58% of a flat checkpoint's weights and does not
+# grow under lane sharing, so depth *looks* cheap. It is not, because in the search path the
+# input layer walks only the observation's ~205 non-zeros and the policy head is masked to the
+# ~21 legal logits. **The trunk is the whole cost, and it now runs three times per position.**
 #
-#   128×3  949k params  1078 decisions/sec  1.00× self-play throughput
-#   128×6  1049k        721                 0.67×
-#   128×10 1182k        471                 0.44×
-#   256×3  2093k        324                 0.30×
+# Measured on the 8-core laptop, 40 games at 256 sims (F4.6):
 #
-# 6 blocks at 32 cores, 10 blocks only at ≥96 cores. If Stage 1 shows the box is bigger
-# than expected, spend it on depth before width.
+#   flat 128x3 (gen031), no capping    2.0 games/sec   1.00x
+#   lane 128x3 + capping               2.0             1.00x
+#   lane 128x4 + capping               1.7             0.85x
+#   lane 128x6 + capping               1.2             0.60x
+#   lane 128x6, no capping             0.5             0.25x
+#
+# 3 blocks is what three laptop hours could afford. **This box is the reason to go deeper**,
+# and 6 is the hypothesis rather than the answer — Stage 1 must re-measure `lane 128x{3,4,6}`
+# with capping on, on the rented box, and this number set from that. Prefer depth to width:
+# width costs the trunk quadratically and the trunk is already tripled.
 width = 128
 blocks = 6
 value_hidden = 128
@@ -54,6 +84,24 @@ games = 15000
 # 1024. Cost is close to linear.
 sims = 256
 c_puct = 1.25
+
+# **Playout cap randomisation** — PLAN.md §4.2c, FINDINGS.md F4.6. A quarter of decisions get
+# the full 256 and a policy target; the rest get 32 and a value target only, which costs
+# nothing extra because one game has one outcome however little search produced the position.
+# Measured 4.0x cheaper search on the laptop, and it is what makes the equivariant trunk
+# affordable at all.
+#
+# 0.25 rather than 0.4 was measured, not assumed: at a fixed self-play budget the games capping
+# buys back nearly replace the policy targets it costs (~21k vs ~24k) while yielding 43% more
+# *outcomes*, and outcomes are the scarce half — PLAN.md §4.2 change 7 has the value head as
+# the plateaued one.
+#
+# ⚠️ **Re-derive `games` from this, not from the old flat-network formula.** The
+# `games/hour ~= 28,000 x (cores/8) x (64/sims) x trunk_factor` estimate at the top of this
+# file predates both changes: `sims` is now a *mean* of 88 rather than 256, and `trunk_factor`
+# is the lane trunk's, which Stage 1 must measure.
+full_search_fraction = 0.25
+cap_sims = 32
 
 dirichlet_alpha = 0.3
 dirichlet_weight = 0.25
@@ -85,6 +133,18 @@ grad_clip = 1.0
 # index, because `--resume` rebuilds the Trainer and an optimiser step counter does not
 # survive it — which on a preemptible box means a step-keyed schedule silently restarts at
 # full learning rate every time the instance is reclaimed.
+#
+# ⚠️ **Key these to the generations the run will actually finish, from Stage 1's measured
+# generation time — not to the 50 in `[run]`, which is a backstop.** This is the third time
+# the project has made this mistake and F4.6 is the clearest measurement of what it costs:
+# `runs/sixth`'s tiers were keyed to 7-8 generations, the run was extended, and generations
+# 6-8 crawled at a sixteenth rate while the training loss was still falling monotonically —
+# +0.055 on the reference column against +0.180 for the three generations after the boundary
+# was moved. Moving one number tripled the slope.
+#
+# So: if Stage 1 says 29 minutes a generation, the run finishes ~48 and these numbers are
+# right. If it says 45, the run finishes ~32 and they must become [[0,1.0],[13,0.25],[24,…]].
+# Setting them to the backstop wastes the tail of the run at a rate that cannot learn.
 lr_schedule = [[0, 1.0], [20, 0.25], [38, 0.0625]]
 
 # 1.02M samples a generation at ~1.6 KB each, so six generations is 6.1M samples ≈ 10 GB —
@@ -103,6 +163,22 @@ buffer_samples = 6500000
 # holdout is what turns "the value head plateaued" from suggestive into testable.
 holdout_samples = 50000
 
+# ⚠️ **Not generation 1, and this is FINDINGS.md F4.6's most important operational finding.**
+# A from-scratch run plays generation 1 with a *random init*, and the agent leaves that
+# distribution within a few generations. In `runs/sixth` the held-out value MSE rose
+# monotonically 0.723 -> 1.002 while the training value loss fell 0.780 -> 0.469 and external
+# strength climbed the whole way; at 1.002 a head that always predicted zero scores the same,
+# so the number had become noise and the run was steered entirely on the gate and the panel.
+#
+# `runs/fourth` and `runs/fifth` never saw this because they were warm-started and their
+# generation 1 was already strong play. This run is from scratch and will hit it.
+#
+# 8 is chosen so the holdout comes from a net that has at least beaten `greedy` — `runs/sixth`
+# managed that at generation 3 and this run's generations are longer. The cost is no held-out
+# score before generation 8, which is real and worth it: a diagnostic that is noise is worse
+# than one that is absent, because it invites being read.
+holdout_generation = 8
+
 [gate]
 # PLAN.md §4.2 change 1 — 600 games at 0.52, not 200 at 0.55. `check` prints the power:
 # at 600 decisive games a true-0.500 candidate passes 16% of the time (harmless — the new
@@ -112,21 +188,38 @@ games = 600
 threshold = 0.52
 min_decisive = 60                 # the same 10% of `games` the first run's 20-of-200 was
 
-# Matches selfplay.sims: measure the weights at the budget they are trained for.
+# 256, matching the *peak* of `selfplay.sims` rather than its mean.
+#
+# ⚠️ With capping on, "the budget they are trained for" is no longer one number — 75% of
+# self-play decisions are played at 32. 256 is still right here, because the gate is what
+# decides whether a checkpoint is promoted and 256 is the budget the agent will be *played*
+# at. Worth knowing it is now a choice rather than the tautology the old comment made it.
 sims = 256
 
 # PLAN.md §4.2 change 2. `random` and `greedy` were both saturated at 1.000 by generation
 # 19 of the first run — they detect a catastrophe and nothing else, which is worth keeping
-# and is not a measurement. The gen016 column is the one to watch: rising monotonically
-# means the loop is working, and flat-or-falling while the mirror gate keeps passing is the
-# exploitability signature §4.8 tripwire 2 is looking for.
+# and is not a measurement. In `runs/sixth`, also from scratch, `greedy` was a real progress
+# chart for three generations before saturating, which is why the discount below is keyed to
+# the high-water mark rather than to those opponents' names.
 #
-# @64 rather than @256 because a from-scratch net spends its first generations far below
-# gen016 at any budget, and @64 is ~40% cheaper. When the new net saturates this too
-# (≥ 0.95 for several generations), freeze the current best and add it as a fourth entry.
+# The third row is the one to watch: rising monotonically means the loop is working, and
+# flat-or-falling while the mirror gate keeps passing is the exploitability signature §4.8
+# tripwire 2 is looking for. When the new net saturates it (≥ 0.95 for several generations),
+# freeze the current best and add it as a fourth entry.
 #
 # A veto, never a target.
-reference = ["random", "greedy", "netmcts:models/duel52-split-gen016.d52nn@64"]
+# **gen031, not gen016.** gen016 was the incumbent when this file was written; gen031 beats it
+# by +189 Elo end to end (F4.1, F4.5) and is the agent this run has to clear to be worth
+# shipping. A gen016 column would spend 48 generations re-measuring a fight that is over.
+#
+# ⚠️ **Read this column's slope, never its level.** It scores gen031 at **@64** against the
+# candidate's @256 — a deliberate 4:1 search handicap, because a from-scratch net reads 0.00
+# against gen031@256 for many generations and a column pinned at zero says nothing. In
+# `runs/sixth` this row reached 0.515 while the honest equal-simulation match was
+# 0.3233 ± 0.0527, i.e. −128 Elo. F3.8 and F4.4 price 64 → 256 at ~+141 Elo, which is very
+# nearly the whole gap. **The run's real result is an equal-sims match against gen031, run at
+# the end** — not this column.
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen031.d52nn@64"]
 reference_games = 300
 
 # **A saturated row is re-run at 60 games, not 300.** Once a row's best-ever reaches 0.99 it

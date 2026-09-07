@@ -773,7 +773,7 @@ fn cmd_nn_dump(args: &[String]) -> Result<(), String> {
 
     let weights = duel52_engine::nn::Weights::load(std::path::Path::new(&checkpoint), &opts.config)?;
     let arch = weights.arch;
-    let evaluator = duel52_engine::nn::MlpEvaluator::new(weights);
+    let evaluator = duel52_engine::nn::MlpEvaluator::new(weights, &opts.config);
 
     // Pass 1: how many decision nodes are there? Cheap — no encoding, no forward pass.
     let total: usize = (0..games)
@@ -2301,6 +2301,10 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
             "--temperature-decisions" => {
                 sp.temperature_decisions = next_number(args, &mut i, "--temperature-decisions")?
             }
+            "--full-search-fraction" => {
+                sp.full_search_fraction = next_number(args, &mut i, "--full-search-fraction")?
+            }
+            "--cap-sims" => sp.cap_sims = next_number(args, &mut i, "--cap-sims")?,
             "--quiet" => quiet = true,
             other => rest.push(other.to_string()),
         }
@@ -2312,6 +2316,22 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
     let games = opts.games_or(1000);
     if sp.sims == 0 {
         return Err("--sims must be at least 1".to_string());
+    }
+    if !(0.0..=1.0).contains(&sp.full_search_fraction) {
+        return Err("--full-search-fraction must be between 0 and 1".to_string());
+    }
+    if sp.full_search_fraction < 1.0 {
+        if sp.cap_sims == 0 {
+            return Err("--cap-sims must be at least 1".to_string());
+        }
+        if sp.cap_sims >= sp.sims {
+            // Not a hard requirement of the format, but it is always a mistake: a cap that
+            // is not smaller than the full budget buys no time and costs policy targets.
+            return Err(format!(
+                "--cap-sims {} must be smaller than --sims {} to be worth anything",
+                sp.cap_sims, sp.sims
+            ));
+        }
     }
 
     let out = std::path::PathBuf::from(&out_path);

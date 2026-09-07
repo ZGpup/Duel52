@@ -23,7 +23,7 @@ when agent strength is the thing blocking a question, and right now it mostly is
 | 1. Engine and rules validation | Done |
 | 2. Hand written baselines | Done, and now retired as a benchmark |
 | 3. Neural self play loop | Done |
-| 4. Scale up | Three laptop runs done. The rented run is not started |
+| 4. Scale up | Four laptop runs done, the fourth a from scratch architecture change. The rented run is not started |
 | 5. Extract the insight | Started early, partly banked, and now the critical path |
 | 6. Verification | Not started |
 | 7. R-NaD | Held in reserve, on a tripwire |
@@ -256,18 +256,97 @@ Two instruments, in order of cost:
 Until one of these exists, `FINDINGS.md` should keep saying "what the strongest available
 agent does" and not "what optimal play is", which is the discipline it currently holds.
 
+### 6b. Stage 1: the lane equivariant network and playout cap randomisation
+
+**Status: DONE 2026-09-06. `runs/sixth`, 13 generations over 4.69 hours from scratch.
+FINDINGS.md F4.6.** Both changes work. The lane symmetry is closed completely — policy TV
+0.000 and agreement 128 of 128, against gen031's augmented 0.039 and 114 of 128 — and it holds
+on a random init, so it is a property of the architecture rather than a training result.
+Capping paid for the trunk exactly as intended: self play held at gen031's throughput despite a
+forward pass roughly three times as expensive. 13 of 13 candidates promoted, no refusals, and
+the equal simulation result was 0.3233 ± 0.0527 against gen031, or −128 Elo, from scratch.
+
+Nothing was shipped to `models/`; the lineage is still gen016 → gen022 → gen031. **The answer
+this run existed to give is yes**, and item 7 below is re-scoped around it.
+
+**§4.2b, lane equivariance.** F4.3 measured the flat network not knowing its three lanes are
+interchangeable, and F4.5 attacked that with six fold data augmentation: policy TV between
+lane pairs fell 0.152 to 0.039 and bought +82 Elo, but argmax agreement stopped at 114 of 128,
+because augmentation can only *ask* a network to be symmetric. `arch = "lane"` makes it
+symmetric. The trunk runs once per lane with one shared set of weights and the lanes exchange
+information only through their mean, so relabelling them permutes the policy exactly and
+leaves the value alone. Measured on a trained checkpoint: opening prior `.333 / .333 / .333`,
+policy TV `0.000`, agreement `128/128`. There is no parameter that could encode a lane
+preference, so this is not a smaller defect but no defect.
+
+Two consequences. It forces a from scratch run — the two architectures share no tensor name,
+so `--init-from` refuses across them. And it makes `lane_augment` pointless: on an
+equivariant net a relabelled sample gives the identical loss *and* the identical gradient, so
+F4.5's result does not carry over.
+
+**§4.2c, playout cap randomisation** (Wu 2019). A value target is the game's outcome and costs
+nothing extra however little search produced the position; a policy target is the visit
+distribution and is worthless if the visits are few. So a quarter of decisions get the full 256
+simulations and a policy target and three quarters get 32 and a value target only, which makes
+search 4.0 times cheaper as measured.
+
+**The two are in one run on purpose, which breaks the one change per run rule.** They are not
+independent: the equivariant trunk costs about 2.9 times the flat network's forward pass and
+capping pays almost exactly that back. Separately, the first is a run with fewer generations
+and the second is a run whose only change is a speed up. Attribution survives because each has
+its own specific readout — `duel52.lanes` for the first, the policy target count for the
+second.
+
+**The trap this uncovered, which item 7 must not walk into.** Depth on the equivariant net
+costs far more than the parameter count suggests, because in the search path the input layer
+is sparse and the policy head is masked, so the trunk is the whole cost. `lane 128 x 6` runs at
+0.25 times gen031's throughput and `lane 128 x 3` at 1.00 with capping on. `blocks = 3` is what
+fits in three hours on eight cores; `blocks = 6` belongs on the rented box. CLAUDE.md has the
+measured table.
+
 ### 7. The from scratch run on rented cores
 
-**Status: configured, not run, and deliberately last.**
+**Status: configured and re-scoped after 6b. Not run, and still deliberately last.**
+`configs/train-big.toml` is a 24 hour from scratch run, and 6b changed what it is.
 
-Every agent so far is a `128 x 3` trunk, because a warm start cannot change the shape of the
-network it inherits. `configs/train-big.toml` is a 24 hour from scratch run at a deeper trunk.
+**What it now is.** A lane-equivariant `128 x N` trunk trained from a random init with playout
+cap randomisation, against a gen031 progress column. Not the flat deeper trunk this item
+described before: 6b showed the equivariant network learning far faster from scratch — beating
+`greedy` at generation 3 where `runs/third` needed seven — and reaching within 128 Elo of
+gen031 in 4.7 laptop hours. The instrument change is now the point of the run rather than a
+side effect of it.
 
-**Why it is last rather than first.** It is the only item on this list that costs money, and
-it answers none of the four questions above. It makes the instrument better, and the
-instrument is not currently what is blocking the insight. The one exception is item 4: the
-value table needs a value head worth trusting, and the value head is the half that has
-plateaued in every run.
+**The four things 6b fixed in the config, all of them mistakes this run would otherwise have
+made at 24 hour scale** (FINDINGS.md F4.6):
+
+1. `arch = "lane"` and `full_search_fraction = 0.25`, the two validated changes.
+2. **`blocks` is a Stage 1 measurement, not a constant.** The throughput table this file used
+   to quote is for the flat network. The equivariant trunk runs once per lane, and depth is
+   the whole cost, because the input layer is sparse and the policy head is masked. On the
+   laptop `lane 128 x 6` ran at 0.25 times gen031's uncapped throughput and 0.60 with capping.
+   Stage 1 must re-measure `lane 128 x {3,4,6}` **with capping on** and set `blocks` from that.
+3. **The holdout is carved from generation 8, not generation 1.** A from scratch run plays
+   generation 1 with a random init, and 6b's held out value MSE rose 0.723 to 1.002 while the
+   training loss fell and external strength climbed the whole way. At 1.002 the number is what
+   predicting zero scores. 6b had no trustworthy internal diagnostic at all; this run must.
+4. **`lr_schedule` is keyed to the generations Stage 1 says the run will finish**, not to the
+   `generations` backstop. 6b lost three generations to a schedule keyed to a length the run
+   outgrew, and moving one boundary tripled the slope. This is the third time the project has
+   made this mistake and the cheapest one on the list to avoid.
+
+**What success looks like, and what does not count.** The result is an **equal simulation match
+against gen031**, run at the end. The reference column in the log scores gen031 at `@64`
+against the candidate's `@256`, a deliberate 4:1 handicap so that a from scratch net's column
+is not pinned at zero — in 6b that column read 0.515 while the honest number was
+0.3233 ± 0.0527, which is −128 Elo. Read the column's slope during the run and never its
+level, and do not ship on it.
+
+**Why it is still last rather than first.** It is the only item on this list that costs money,
+and it answers none of the four questions above. It makes the instrument better, and the
+instrument is not what is blocking the insight. The one exception is item 4: the value table
+needs a value head worth trusting, and the value head is the half that has plateaued in every
+run — which is also the half playout cap randomisation is aimed at, so 6b's value curve is
+the thing to look at hardest when this run finishes.
 
 Rent cores, not a GPU. 87 percent of the loop is Rust self play on CPU cores and 4 percent is
 gradient work, and the gradient step is only 1.4 times faster on a GPU than on eight CPU

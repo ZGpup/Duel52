@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from .checkpoint import read_checkpoint, write_checkpoint
-from .model import Duel52Net, NetConfig, spec_for
+from .model import NetConfig, build_net, lane_spec_for, spec_for
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -28,19 +28,21 @@ def _init(args: argparse.Namespace) -> int:
         width=args.width,
         blocks=args.blocks,
         value_hidden=args.value_hidden,
+        arch=args.arch,
     )
     # Seeded, because `CLAUDE.md` says everything is: the same seed and the same
     # architecture must produce the same bytes, so an "identical" run really is one.
     generator = torch.Generator().manual_seed(args.seed)
     torch.manual_seed(args.seed)
-    model = Duel52Net(config)
+    lanes = lane_spec_for(args.variant, args.encoding_slots) if args.arch == "lane" else None
+    model = build_net(config, lanes)
     model.randomise_layernorms(generator)
 
     path = write_checkpoint(args.out, model=model, spec=spec)
     total = sum(p.numel() for p in model.parameters())
     print(
         f"wrote {path} — {total:,} parameters, {path.stat().st_size / 1e6:.1f} MB\n"
-        f"  obs_dim={config.obs_dim} action_dim={config.action_dim} "
+        f"  arch={config.arch} obs_dim={config.obs_dim} action_dim={config.action_dim} "
         f"width={config.width} blocks={config.blocks} value_hidden={config.value_hidden}\n"
         f"  obs_layout_hash={spec['obs_layout_hash']} "
         f"action_layout_hash={spec['action_layout_hash']}"
@@ -52,11 +54,19 @@ def _inspect(args: argparse.Namespace) -> int:
     ckpt = read_checkpoint(args.path)
     spec = spec_for(args.variant, args.encoding_slots)
     print(f"{args.path}")
+    print(f"  arch               {ckpt.arch}")
     print(f"  obs_dim            {ckpt.obs_dim}")
     print(f"  action_dim         {ckpt.action_dim}")
     print(f"  width              {ckpt.width}")
     print(f"  blocks             {ckpt.blocks}")
     print(f"  value_hidden       {ckpt.value_hidden}")
+    if ckpt.arch == "lane":
+        print(f"  lanes              {ckpt.lanes}")
+        print(f"  lane_obs           {ckpt.lane_obs}  (global {ckpt.obs_dim - ckpt.lanes * ckpt.lane_obs})")
+        print(
+            f"  lane_action        {ckpt.lane_action}  "
+            f"(global {ckpt.action_dim - ckpt.lanes * ckpt.lane_action})"
+        )
     print(f"  obs_layout_hash    {ckpt.obs_layout_hash}")
     print(f"  action_layout_hash {ckpt.action_layout_hash}")
     print(f"  tensors            {len(ckpt.param_order)}")
@@ -90,6 +100,14 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--width", type=int, default=512)
     init.add_argument("--blocks", type=int, default=5)
     init.add_argument("--value-hidden", type=int, default=256, dest="value_hidden")
+    init.add_argument(
+        "--arch",
+        choices=("mlp", "lane"),
+        default="mlp",
+        help="'mlp' is DESIGN.md §5's flat trunk; 'lane' is the lane-equivariant network "
+        "(PLAN.md §4.2b), which shares one set of weights across the three lanes and so "
+        "cannot represent a lane preference at all",
+    )
     add_shape_flags(init)
     init.set_defaults(func=_init)
 

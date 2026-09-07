@@ -60,9 +60,12 @@ from .trainer import Trainer
 
 __all__ = ["MatchResult", "TrainingLoop", "run_loop"]
 
-#: Which generation's shard the fixed holdout is carved from. The first one, always: it is
-#: the only generation guaranteed to exist for the whole run, and ``--resume`` can rebuild
-#: the holdout from it without needing to remember anything. See ``TrainSettings``.
+#: Default generation the fixed holdout is carved from, when ``train.holdout_generation`` is
+#: not set. One, because that is the only generation guaranteed to exist for the whole run and
+#: ``--resume`` can rebuild the holdout from it without remembering anything.
+#:
+#: ⚠️ It is the wrong default for a **from-scratch** run, whose generation 1 is played by a
+#: random init — see ``TrainSettings.holdout_generation`` and ``FINDINGS.md`` F4.6.
 HOLDOUT_GENERATION = 1
 
 #: `MatchStats::report` in `engine/src/ladder.rs`. Parsed rather than re-derived so the
@@ -215,9 +218,9 @@ class TrainingLoop:
                     self._replay_into_buffer(shard, h["generation"])
             if self.buffer.generations:
                 say(f"  refilled the buffer with {self.buffer.samples:,} samples from disk")
-            # The holdout is derived from generation 1's shard, so it survives a resume
-            # without being stored — but only if that shard is still on disk, and after a
-            # few generations it is no longer in the window that was just refilled.
+            # The holdout is derived from `train.holdout_generation`'s shard, so it survives
+            # a resume without being stored — but only if that shard is still on disk, and
+            # after a few generations it is no longer in the window that was just refilled.
             self._rebuild_holdout()
             # A warm-started run's veto baseline is the checkpoint it started from, which
             # is in `baseline.json` and in no history record.
@@ -296,6 +299,15 @@ class TrainingLoop:
         ckpt = read_checkpoint(checkpoint)
         ckpt.check_against(self.spec)  # variant, encoding_slots, both layout hashes
         net = self.config.net
+        if ckpt.arch != net.arch:
+            # Checked before the trunk sizes because it is the more fundamental mismatch and
+            # the more confusing one: `128 × 6` describes both architectures, so a size-only
+            # message would look like the shapes agreed when they share no tensor at all.
+            raise ValueError(
+                f"--init-from {checkpoint} is a {ckpt.arch!r} network but [net] asks for "
+                f"{net.arch!r}. The two share no tensor names, so there is nothing to carry "
+                f"over — a change of architecture is a from-scratch run by construction."
+            )
         have = (ckpt.width, ckpt.blocks, ckpt.value_hidden)
         want = (net.width, net.blocks, net.value_hidden)
         if have != want:
@@ -333,7 +345,7 @@ class TrainingLoop:
         """
         cfg = self.config.train
         want = cfg.holdout_samples
-        if want <= 0 or generation != HOLDOUT_GENERATION:
+        if want <= 0 or generation != cfg.holdout_generation:
             return self.buffer.add(path, generation)
 
         full = load_generation(path, generation, stride=cfg.sample_stride, threads=self.config.run.threads)
@@ -346,14 +358,21 @@ class TrainingLoop:
     def _rebuild_holdout(self) -> None:
         """Re-derive the holdout after a resume. Deterministic — it is a prefix of a shard
         that is still on disk — so nothing about it needs storing."""
-        if self.config.train.holdout_samples <= 0 or self.holdout is not None:
-            return
-        shard = self.shards / f"gen{HOLDOUT_GENERATION:03d}.d52sp"
-        if not shard.exists():
-            say(f"  no {shard.name} on disk — the held-out score is unavailable for this run")
-            return
         cfg = self.config.train
-        full = load_generation(shard, HOLDOUT_GENERATION, stride=cfg.sample_stride, threads=self.config.run.threads)
+        if cfg.holdout_samples <= 0 or self.holdout is not None:
+            return
+        at = cfg.holdout_generation
+        shard = self.shards / f"gen{at:03d}.d52sp"
+        if not shard.exists():
+            # Two different situations, and the message says which: the run has not reached
+            # the holdout generation yet (normal, and it will be carved on the way past), or
+            # the shard is gone (the score is lost for good).
+            if self.generation < at:
+                say(f"  holdout     will be carved from generation {at}, not yet played")
+            else:
+                say(f"  no {shard.name} on disk — the held-out score is unavailable for this run")
+            return
+        full = load_generation(shard, at, stride=cfg.sample_stride, threads=self.config.run.threads)
         self.holdout = full.slice(0, min(cfg.holdout_samples, full.samples // 2))
         say(f"  rebuilt the {self.holdout.samples:,}-sample holdout from {shard.name}")
 

@@ -199,6 +199,20 @@ impl NetMctsAgent {
         self
     }
 
+    /// Change the simulation budget and the root noise **between searches**.
+    ///
+    /// For playout cap randomisation (`PLAN.md` §4.2c): most self-play decisions get a small
+    /// budget and contribute only a value target, and a minority get the full budget and a
+    /// policy target. Both settings move together because they belong together — noise on a
+    /// cheap search buys no exploration worth having and only degrades the move played.
+    ///
+    /// Not a builder method: the budget changes per decision inside one game, and rebuilding
+    /// the agent would drop the loaded evaluator and the search RNG's position.
+    pub fn set_budget(&mut self, sims: usize, noise: Option<RootNoise>) {
+        self.sims = sims;
+        self.noise = noise;
+    }
+
     /// Load the checkpoint if it is not loaded, or if the layout moved under us.
     fn evaluator(&mut self, config: &GameConfig) -> Arc<MlpEvaluator> {
         let wanted = obs_dim(config);

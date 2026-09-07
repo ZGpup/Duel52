@@ -27,11 +27,12 @@
 //! crate alongside a `cli` crate. [`Evaluator`] is the seam that makes that swap cheap; see
 //! `DESIGN.md` §9.
 
+mod lane;
 mod mlp;
 mod weights;
 
 pub use mlp::{MlpEvaluator, Scratch};
-pub use weights::{Arch, Weights, CHECKPOINT_MAGIC, CHECKPOINT_VERSION};
+pub use weights::{Arch, ArchKind, Weights, CHECKPOINT_MAGIC, CHECKPOINT_VERSION};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ pub fn evaluator_for(path: &Path, config: &GameConfig) -> Result<Arc<MlpEvaluato
     if let Some(found) = cache().lock().expect("checkpoint cache").get(&key) {
         return Ok(found.clone());
     }
-    let evaluator = Arc::new(MlpEvaluator::new(Weights::load(path, config)?));
+    let evaluator = Arc::new(MlpEvaluator::new(Weights::load(path, config)?, config));
     cache()
         .lock()
         .expect("checkpoint cache")

@@ -39,9 +39,19 @@ def _check(args: argparse.Namespace) -> int:
     print(f"            obs_layout_hash={spec['obs_layout_hash']}")
     print(f"            action_layout_hash={spec['action_layout_hash']}")
     print(
-        f"net         width={config.net.width} blocks={config.net.blocks} "
-        f"value_hidden={config.net.value_hidden}"
+        f"net         arch={config.net.arch} width={config.net.width} "
+        f"blocks={config.net.blocks} value_hidden={config.net.value_hidden}"
     )
+    if config.net.arch == "lane":
+        # The equivariance is the reason the architecture exists, so `check` says so rather
+        # than leaving "lane" to be looked up.
+        print(
+            "            lane-equivariant: the trunk runs once per lane with shared weights,"
+        )
+        print(
+            "            so a lane preference (FINDINGS.md F4.3) is unrepresentable rather"
+        )
+        print("            than merely small. Warm-starting from an 'mlp' checkpoint is refused.")
     if engine.exists():
         version = subprocess.run([str(engine), "version"], capture_output=True, text=True)
         print(f"            {version.stdout.strip()}")
@@ -53,10 +63,32 @@ def _check(args: argparse.Namespace) -> int:
         if tr.epochs_per_generation > 0
         else f"{tr.steps_per_generation} training steps"
     )
+    search = (
+        f"{sp.sims} sims"
+        if sp.full_search_fraction >= 1.0
+        else f"{sp.mean_sims:.0f} sims on average"
+    )
     print(
-        f"\nper generation: {sp.games} self-play games at {sp.sims} sims, "
+        f"\nper generation: {sp.games} self-play games at {search}, "
         f"{fitting} in batches of {tr.batch_size}, a {config.gate.games}-game gate"
     )
+    if sp.full_search_fraction < 1.0:
+        # The two numbers that decide whether the technique is paying: how much cheaper
+        # self-play got, and how many policy targets are left to pay for it with.
+        speedup = sp.sims / sp.mean_sims
+        print(
+            f"                playout cap: {sp.full_search_fraction:.0%} of decisions get "
+            f"{sp.sims} sims and a policy target,"
+        )
+        print(
+            f"                the rest get {sp.cap_sims} and a value target only — "
+            f"{speedup:.1f}x cheaper search,"
+        )
+        print(
+            f"                ~{sp.games * 136 // tr.sample_stride * sp.full_search_fraction:,.0f} "
+            f"policy targets a generation against "
+            f"{sp.games * 136 // tr.sample_stride:,} value targets"
+        )
     # What a fixed step count actually means depends on how full the buffer is, and the
     # answer at generation 1 is what cost `runs/fourth` its first generation.
     if tr.epochs_per_generation <= 0:
@@ -85,14 +117,34 @@ def _check(args: argparse.Namespace) -> int:
         + (
             "none — the value loss is a training-batch number only"
             if config.train.holdout_samples <= 0
-            else f"{config.train.holdout_samples:,} samples off generation 1, scored every generation"
+            else f"{config.train.holdout_samples:,} samples off generation "
+            f"{config.train.holdout_generation}, scored from then on"
         )
     )
+    # ⚠️ `FINDINGS.md` F4.6: a from-scratch run's generation 1 is played by a random init, and
+    # its holdout becomes noise within a few generations — `runs/sixth` ended at a held-out
+    # value MSE of 1.002, which is what predicting zero scores. Five seconds is the right
+    # place to catch that, since the alternative is finding out at the end of a 24-hour run.
+    if config.train.holdout_samples > 0 and config.train.holdout_generation == 1:
+        print(
+            "                ⚠️  generation 1 — right for a warm start, and noise for a\n"
+            "                    from-scratch run (FINDINGS.md F4.6). If this run has no\n"
+            "                    --init-from, set train.holdout_generation later."
+        )
 
     # Building the tables here rather than only describing them is deliberate: a wrong or
     # mis-shaped permutation table does not crash a run, it just trains the net on somebody
     # else's targets (`PLAN.md` §4.2a). Five seconds is the right place to find that out.
-    if not config.train.lane_augment:
+    if not config.train.lane_augment and config.net.arch == "lane":
+        # Off *because* the architecture already has it, which is a different fact from
+        # having forgotten to turn it on — and the readout should not make the two look
+        # alike. See `test_lane_augmentation_is_a_no_op_on_the_lane_equivariant_network`.
+        print(
+            "augmentation:   off, and correctly so — the lane-equivariant network satisfies\n"
+            "                f(σ·x) = σ·f(x), so relabelling a sample gives the identical\n"
+            "                loss and the identical gradient. It would be a gather for nothing."
+        )
+    elif not config.train.lane_augment:
         print("augmentation:   off — every sample is seen in one lane labelling only")
     else:
         from .buffer import LaneAugmenter

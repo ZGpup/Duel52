@@ -72,6 +72,18 @@ class NetSettings:
     width: int = 128
     blocks: int = 3
     value_hidden: int = 128
+    #: ``"mlp"`` — ``DESIGN.md`` §5's flat trunk, which every shipped checkpoint is — or
+    #: ``"lane"``, the lane-equivariant network of ``PLAN.md`` §4.2b.
+    #:
+    #: Changing this **forces a from-scratch run**: the two architectures share no tensor
+    #: names, so ``--init-from`` refuses across them rather than reinterpreting the payload.
+    #: That is the deliberate cost, and it is why `configs/train-3h-new.toml` has no warm
+    #: start where `train-3h.toml` had one.
+    arch: str = "mlp"
+
+    def __post_init__(self) -> None:
+        if self.arch not in ("mlp", "lane"):
+            raise ValueError(f"[net] arch must be 'mlp' or 'lane', got {self.arch!r}")
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,33 @@ class SelfPlaySettings:
     dirichlet_weight: float = 0.25
     temperature: float = 1.0
     temperature_decisions: int = 24
+    #: **Playout cap randomisation** (`PLAN.md` §4.2c). The fraction of decisions given the
+    #: full ``sims`` and therefore a policy target; the rest get ``cap_sims`` and contribute
+    #: a value target only. ``1.0`` is off, and is what every run before this one used.
+    full_search_fraction: float = 1.0
+    cap_sims: int = 32
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.full_search_fraction <= 1.0:
+            raise ValueError(
+                f"[selfplay] full_search_fraction must be in (0, 1], got "
+                f"{self.full_search_fraction}"
+            )
+        if self.full_search_fraction < 1.0 and not 0 < self.cap_sims < self.sims:
+            raise ValueError(
+                f"[selfplay] cap_sims must be between 1 and sims-1 ({self.sims - 1}) to be "
+                f"worth anything, got {self.cap_sims}"
+            )
+
+    @property
+    def mean_sims(self) -> float:
+        """Simulations per decision on average — what self-play actually costs.
+
+        The number to reason about when sizing a run: ``games`` and ``sims`` no longer
+        multiply to the search budget once capping is on. ``train check`` prints it.
+        """
+        f = self.full_search_fraction
+        return f * self.sims + (1.0 - f) * self.cap_sims
 
     def cli_flags(self) -> list[str]:
         return [
@@ -93,6 +132,8 @@ class SelfPlaySettings:
             "--dirichlet-weight", str(self.dirichlet_weight),
             "--temperature", str(self.temperature),
             "--temperature-decisions", str(self.temperature_decisions),
+            "--full-search-fraction", str(self.full_search_fraction),
+            "--cap-sims", str(self.cap_sims),
         ]
 
 
@@ -162,6 +203,20 @@ class TrainSettings:
     #: second reading. The cost is that it drifts off-policy as the net improves — it
     #: measures the same question getting answered better, not the current question.
     holdout_samples: int = 0
+    #: Which generation's shard the holdout is carved from. 1 is right for a warm-started
+    #: run and **wrong for a from-scratch one**.
+    #:
+    #: ⚠️ ``FINDINGS.md`` F4.6. Generation 1 of a from-scratch run is played by a *random
+    #: init*, and the agent leaves that distribution within a few generations — in
+    #: ``runs/sixth`` the held-out value MSE rose 0.723 → 1.002 while the training loss fell
+    #: 0.780 → 0.469 and external strength climbed the whole way. At 1.002 a head that always
+    #: predicted zero would score the same, so the diagnostic had become noise and the run had
+    #: nothing internal to steer on. Carving from a mid-run generation costs the held-out
+    #: score for the generations before it and buys a yardstick that means something after.
+    #:
+    #: The drift never goes away entirely — that is the price of a *fixed* holdout, and it is
+    #: the point of one. This only stops the yardstick being built out of noise to begin with.
+    holdout_generation: int = 1
 
     def steps_for(self, buffer_samples: int) -> int:
         """How many optimisation steps this generation gets.

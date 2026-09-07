@@ -42,8 +42,10 @@
 //! weight, a swapped gamma and beta, a missing residual — fails immediately, because those
 //! produce `O(1)` differences rather than `O(1e-6)` ones.
 
-use super::weights::{Arch, Weights};
+use super::lane::{LaneBody, LaneScratch};
+use super::weights::{Arch, ArchKind, Weights};
 use super::Evaluator;
+use crate::config::GameConfig;
 
 /// LayerNorm epsilon. Matches PyTorch's `nn.LayerNorm` default; the parity test is sensitive
 /// to this, because a different epsilon shifts every activation slightly.
@@ -55,7 +57,7 @@ pub struct MlpEvaluator {
     /// ~20 MB — cloning it per game would cost more than the games.
     weights: std::sync::Arc<Weights>,
     /// Index of each tensor in `weights.params`, resolved once so the hot loop does no
-    /// string comparison.
+    /// string comparison. Meaningful only for [`ArchKind::Mlp`].
     idx: Index,
     /// `W_in` transposed to `[obs_dim × width]`, so the input layer can walk the
     /// observation's non-zeros and add whole contiguous rows. See [`input_layer`].
@@ -63,6 +65,13 @@ pub struct MlpEvaluator {
     /// Costs `obs_dim × width` floats — 8.8 MB at the default architecture — which is why
     /// [`crate::nn::evaluator_for`] caches evaluators rather than weights.
     in_wt: Vec<f32>,
+    /// Present exactly when the checkpoint is lane-equivariant, and then it owns the whole
+    /// forward pass. `None` is the flat network `idx` and `in_wt` describe.
+    ///
+    /// One type rather than two evaluators because every caller — `net_mcts`, `net_policy`,
+    /// `selfplay`, the ladder — wants "the network this checkpoint holds" and none of them
+    /// wants to know which arrangement it is.
+    lane: Option<LaneBody>,
 }
 
 /// Resolved tensor positions. Built from [`Arch::params`], so it cannot drift from the
@@ -103,8 +112,8 @@ impl Index {
 }
 
 impl MlpEvaluator {
-    pub fn new(weights: Weights) -> MlpEvaluator {
-        MlpEvaluator::shared(std::sync::Arc::new(weights))
+    pub fn new(weights: Weights, config: &GameConfig) -> MlpEvaluator {
+        MlpEvaluator::shared(std::sync::Arc::new(weights), config)
     }
 
     /// Build over weights someone else already holds — how a cached checkpoint reaches an
@@ -112,9 +121,21 @@ impl MlpEvaluator {
     ///
     /// Not cheap: it transposes the input matrix. Build one per checkpoint per process
     /// ([`crate::nn::evaluator_for`]), not one per game.
-    pub fn shared(weights: std::sync::Arc<Weights>) -> MlpEvaluator {
-        let idx = Index::new(&weights.arch);
+    pub fn shared(weights: std::sync::Arc<Weights>, config: &GameConfig) -> MlpEvaluator {
         let arch = weights.arch;
+        if arch.kind == ArchKind::Lane {
+            // `LaneBody` owns its own transposed matrices and its own index; the flat
+            // fields stay empty rather than being half-built from tensors that do not
+            // exist under this architecture.
+            let lane = LaneBody::new(&weights, config);
+            return MlpEvaluator {
+                weights,
+                idx: Index::new(&arch),
+                in_wt: Vec::new(),
+                lane: Some(lane),
+            };
+        }
+        let idx = Index::new(&arch);
         let w_in = &weights.params[idx.in_w];
         let mut in_wt = vec![0.0f32; arch.obs_dim * arch.width];
         for i in 0..arch.width {
@@ -126,6 +147,7 @@ impl MlpEvaluator {
             weights,
             idx,
             in_wt,
+            lane: None,
         }
     }
 
@@ -158,9 +180,9 @@ impl MlpEvaluator {
             let at = i.blocks_at + b * 6;
             scratch.a.copy_from_slice(&scratch.h);
             layer_norm(&mut scratch.a, &w[at], &w[at + 1]);
-            matvec(&w[at + 2], &w[at + 3], &scratch.a, arch.width, &mut scratch.b);
+            matvec(&w[at + 2], Some(&w[at + 3]), &scratch.a, arch.width, &mut scratch.b);
             relu(&mut scratch.b);
-            matvec(&w[at + 4], &w[at + 5], &scratch.b, arch.width, &mut scratch.a);
+            matvec(&w[at + 4], Some(&w[at + 5]), &scratch.b, arch.width, &mut scratch.a);
             for (h, r) in scratch.h.iter_mut().zip(&scratch.a) {
                 *h += *r;
             }
@@ -178,7 +200,7 @@ impl MlpEvaluator {
         // A two-layer head ending in tanh, so it is bounded to the zero-sum range.
         matvec(
             &w[i.value1_w],
-            &w[i.value1_b],
+            Some(&w[i.value1_b]),
             &scratch.h,
             arch.width,
             &mut scratch.v,
@@ -195,12 +217,18 @@ impl MlpEvaluator {
 
     /// One row. `logits` is `action_dim` long; the value is returned.
     fn forward_one(&self, x: &[f32], logits: &mut [f32], scratch: &mut Scratch) -> f32 {
+        if let Some(lane) = &self.lane {
+            let s = scratch.lane.as_mut().expect("a lane evaluator builds a lane scratch");
+            lane.trunk(&self.weights, x, s);
+            lane.policy(&self.weights, logits, s);
+            return lane.value(&self.weights, s);
+        }
         let arch = &self.weights.arch;
         let w = &self.weights.params;
         let i = &self.idx;
         self.trunk(x, scratch);
         // Policy: raw logits, unmasked. Masking and softmax are the caller's job.
-        matvec(&w[i.policy_w], &w[i.policy_b], &scratch.h, arch.width, logits);
+        matvec(&w[i.policy_w], Some(&w[i.policy_b]), &scratch.h, arch.width, logits);
         self.value_head(scratch)
     }
 
@@ -227,6 +255,13 @@ impl MlpEvaluator {
         assert_eq!(x.len(), arch.obs_dim, "observation is the wrong length");
         assert_eq!(mask.len(), arch.action_dim, "mask is the wrong length");
         assert_eq!(logits.len(), arch.action_dim, "logit buffer is the wrong length");
+
+        if let Some(lane) = &self.lane {
+            let s = scratch.lane.as_mut().expect("a lane evaluator builds a lane scratch");
+            lane.trunk(&self.weights, x, s);
+            lane.policy_masked(&self.weights, mask, logits, s);
+            return lane.value(&self.weights, s);
+        }
 
         self.trunk(x, scratch);
 
@@ -285,6 +320,9 @@ pub struct Scratch {
     a: Vec<f32>,
     b: Vec<f32>,
     v: Vec<f32>,
+    /// The lane network's buffers, present exactly when the architecture is
+    /// [`ArchKind::Lane`].
+    lane: Option<LaneScratch>,
 }
 
 impl Scratch {
@@ -294,6 +332,10 @@ impl Scratch {
             a: vec![0.0; arch.width],
             b: vec![0.0; arch.width],
             v: vec![0.0; arch.value_hidden],
+            // Allocated only for the architecture that uses it: the lane buffers are
+            // `lanes × width` and a search loop holds one scratch for millions of
+            // evaluations.
+            lane: (arch.kind == ArchKind::Lane).then(|| LaneScratch::new(arch)),
         }
     }
 }
@@ -332,14 +374,18 @@ fn input_layer(wt: &[f32], bias: &[f32], x: &[f32], out_dim: usize, out: &mut [f
 ///
 /// The accumulation order — bias first, then `j` ascending — is part of the reproducibility
 /// contract. See the module docs.
+///
+/// `bias` is optional because the lane network's `glob_in` and `fcm` deliberately have none:
+/// their outputs are added to something that already carries a bias, and a second one would
+/// be the same parameter twice.
 #[inline]
-fn matvec(w: &[f32], bias: &[f32], x: &[f32], in_dim: usize, out: &mut [f32]) {
+pub(super) fn matvec(w: &[f32], bias: Option<&[f32]>, x: &[f32], in_dim: usize, out: &mut [f32]) {
     debug_assert_eq!(w.len(), out.len() * in_dim);
-    debug_assert_eq!(bias.len(), out.len());
+    debug_assert!(bias.is_none_or(|b| b.len() == out.len()));
     debug_assert_eq!(x.len(), in_dim);
     for (i, o) in out.iter_mut().enumerate() {
         let row = &w[i * in_dim..(i + 1) * in_dim];
-        let mut acc = bias[i];
+        let mut acc = bias.map_or(0.0, |b| b[i]);
         // Ascending `j`, one term at a time. `zip` rather than an index because it is
         // clearer, not because it is faster — the *order* is the contract here, and any
         // rewrite must preserve it.
@@ -350,10 +396,20 @@ fn matvec(w: &[f32], bias: &[f32], x: &[f32], in_dim: usize, out: &mut [f32]) {
     }
 }
 
+/// `out += v`, elementwise. How the lane block folds its mean-mixing term into `fc1`'s
+/// output without a second bias.
+#[inline]
+pub(super) fn matvec_add(v: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(v.len(), out.len());
+    for (o, &vj) in out.iter_mut().zip(v.iter()) {
+        *o += vj;
+    }
+}
+
 /// LayerNorm over the whole vector, with elementwise affine. Biased variance (divide by `n`),
 /// matching PyTorch.
 #[inline]
-fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
+pub(super) fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
     let n = x.len() as f32;
     let mut mean = 0.0f32;
     for &v in x.iter() {
@@ -373,7 +429,7 @@ fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
 }
 
 #[inline]
-fn relu(x: &mut [f32]) {
+pub(super) fn relu(x: &mut [f32]) {
     for v in x.iter_mut() {
         if *v < 0.0 {
             *v = 0.0;
@@ -394,12 +450,23 @@ mod tests {
             width: 8,
             blocks: 2,
             value_hidden: 4,
+            kind: ArchKind::Mlp,
+            lanes: 0,
+            lane_obs: 0,
+            lane_action: 0,
         }
+    }
+
+    /// These arches are synthetic — 12 floats in, 5 out — so no `GameConfig` describes them.
+    /// The config only matters to the lane architecture, which reads its index tables from
+    /// the encoder; a flat evaluator ignores it entirely.
+    fn flat(weights: Weights) -> MlpEvaluator {
+        MlpEvaluator::new(weights, &GameConfig::default())
     }
 
     #[test]
     fn output_shapes_and_ranges_are_what_the_trait_promises() {
-        let e = MlpEvaluator::new(Weights::random(1, tiny()));
+        let e = flat(Weights::random(1, tiny()));
         let n = 3;
         let obs = vec![0.25f32; n * 12];
         let mut logits = vec![0.0; n * 5];
@@ -438,7 +505,7 @@ mod tests {
 
         let obs = vec![0.1f32, -0.2, 0.3, 0.4, 0.0, 1.0, -1.0, 0.5, 0.25, 0.75, -0.5, 0.6];
         let run = |w: Weights| {
-            let e = MlpEvaluator::new(w);
+            let e = flat(w);
             let mut logits = vec![0.0; 5];
             let mut value = vec![0.0; 1];
             e.eval_batch(&obs, 1, &mut logits, &mut value);
@@ -458,7 +525,7 @@ mod tests {
             ..tiny()
         };
         let weights = Weights::random(9, arch);
-        let e = MlpEvaluator::shared(std::sync::Arc::new(weights.clone()));
+        let e = MlpEvaluator::shared(std::sync::Arc::new(weights.clone()), &GameConfig::default());
 
         let mut rng = crate::rng::Rng::new(11);
         for sparsity in [0usize, 3, 30, 37] {
@@ -469,7 +536,7 @@ mod tests {
             let mut dense = vec![0.0f32; arch.width];
             matvec(
                 &weights.params[0],
-                &weights.params[1],
+                Some(&weights.params[1]),
                 &x,
                 arch.obs_dim,
                 &mut dense,
@@ -489,7 +556,7 @@ mod tests {
             action_dim: 23,
             ..tiny()
         };
-        let e = MlpEvaluator::new(Weights::random(5, arch));
+        let e = flat(Weights::random(5, arch));
         let mut rng = crate::rng::Rng::new(2);
         let mut x = vec![0.0f32; arch.obs_dim];
         for _ in 0..12 {

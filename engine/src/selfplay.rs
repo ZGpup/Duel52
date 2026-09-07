@@ -51,12 +51,21 @@ pub const SHARD_MAGIC: &[u8; 6] = b"D52SP\0";
 /// shards are refused rather than read, because the information needed to interpret them
 /// correctly is not in the file: reading one would silently train every engine-declared
 /// stalemate as an honest tie, which is the bug the version exists to prevent.
-pub const SHARD_VERSION: u16 = 2;
+/// Version 3 adds a per-sample `policy_target` byte for playout cap randomisation
+/// (`PLAN.md` §4.2c): a capped decision carries a value target but no policy target, and its
+/// visit distribution is not written at all. A version 2 shard is refused rather than read,
+/// for the same reason version 1 was — every sample in it *is* a policy target, and a reader
+/// that assumed otherwise would train on nothing, while one that assumed the byte was there
+/// would misparse the payload from the first sample on.
+pub const SHARD_VERSION: u16 = 3;
 
 /// Stream tags, so a game's search and its move-sampling are independent streams of one seed
 /// and the whole game reproduces from `(checkpoint, config, seed)`.
 const SEARCH_STREAM: u64 = 0x5350_0000_0000_0001;
 const PICK_STREAM: u64 = 0x5350_0000_0000_0002;
+/// Which decisions get the full playout budget. Its own stream so the choice is a function
+/// of the seed alone — see [`SelfPlayConfig::full_search_fraction`].
+const CAP_STREAM: u64 = 0x5350_0000_0000_0003;
 
 /// How self-play differs from evaluation play.
 #[derive(Clone, Copy, Debug)]
@@ -71,6 +80,20 @@ pub struct SelfPlayConfig {
     /// sampled for diversity; late moves are played properly, so the value target is the
     /// result of a game both sides were trying to win.
     pub temperature_decisions: u32,
+    /// **Playout cap randomisation** (`PLAN.md` §4.2c; Wu 2019, *Accelerating Self-Play
+    /// Learning in Go*). The fraction of decisions that get the full [`Self::sims`] and
+    /// therefore a policy target; the rest get [`Self::cap_sims`] and contribute a value
+    /// target only. `1.0` turns it off and is the default.
+    ///
+    /// The asymmetry it exploits is specific and real: a **value** target is the game's
+    /// outcome, which costs nothing extra however little search produced the position, while
+    /// a **policy** target is the visit distribution and is worthless if the visits are few.
+    /// Spending 256 simulations on every decision buys a good policy target at every one of
+    /// them and pays for the value targets twice over. `configs/train-3h-new.toml` has the
+    /// sizing.
+    pub full_search_fraction: f32,
+    /// Simulations for a capped decision. Ignored when `full_search_fraction >= 1.0`.
+    pub cap_sims: usize,
 }
 
 impl Default for SelfPlayConfig {
@@ -83,6 +106,11 @@ impl Default for SelfPlayConfig {
             // A self-play game runs ~70 decisions, so this is roughly the first third —
             // the same proportion AlphaZero's 30-of-~80 chess moves works out to.
             temperature_decisions: 24,
+            // Off by default: every existing config and every shipped checkpoint was
+            // produced without it, and a default that silently changed what `selfplay`
+            // means would make those incomparable.
+            full_search_fraction: 1.0,
+            cap_sims: 32,
         }
     }
 }
@@ -96,7 +124,16 @@ pub struct Sample {
     /// what makes "is the value head learning anything?" answerable without a second run.
     pub root_value: f32,
     /// `(index into legal_actions, share of root visits)`, for the actions that got one.
+    ///
+    /// Empty when [`Self::policy_target`] is false: a capped search's visit distribution is
+    /// not a target, so it is not stored either.
     pub policy: Vec<(u16, f32)>,
+    /// Whether this decision got the full simulation budget, and so whether its policy is a
+    /// training target. Always true without playout cap randomisation.
+    ///
+    /// The value target is unaffected either way — one game, one outcome, however much
+    /// search produced the position.
+    pub policy_target: bool,
 }
 
 /// One self-play game.
@@ -112,6 +149,10 @@ pub struct GameRecord {
 pub struct SelfPlayReport {
     pub games: usize,
     pub samples: usize,
+    /// Of `samples`, how many carry a policy target. Equal to `samples` without playout cap
+    /// randomisation, and the number to check when it is on — a run whose ratio is not the
+    /// configured fraction has it misconfigured.
+    pub policy_targets: usize,
     pub p0_wins: usize,
     pub p1_wins: usize,
     pub draws: usize,
@@ -125,9 +166,21 @@ pub struct SelfPlayReport {
 impl SelfPlayReport {
     pub fn report(&self, path: &Path) -> String {
         let g = self.games.max(1) as f64;
+        // The policy-target line appears only when playout cap randomisation is on, so an
+        // unchanged run's output is unchanged.
+        let capped = if self.policy_targets == self.samples {
+            String::new()
+        } else {
+            format!(
+                "  {} policy targets ({:.1}% of samples) · {} value-only\n",
+                self.policy_targets,
+                100.0 * self.policy_targets as f64 / self.samples.max(1) as f64,
+                self.samples - self.policy_targets,
+            )
+        };
         format!(
             "wrote {} — {} games, {} samples, {:.1} MB\n  \
-             {:.1} games/sec · {:.1} decisions/game · P0 {:.1}% P1 {:.1}% draw {:.1}%\n  \
+             {:.1} games/sec · {:.1} decisions/game · P0 {:.1}% P1 {:.1}% draw {:.1}%\n{}  \
              widest lane side seen: {}\n",
             path.display(),
             self.games,
@@ -138,6 +191,7 @@ impl SelfPlayReport {
             100.0 * self.p0_wins as f64 / g,
             100.0 * self.p1_wins as f64 / g,
             100.0 * self.draws as f64 / g,
+            capped,
             self.max_slots_seen,
         )
     }
@@ -155,6 +209,10 @@ pub fn play_game(
         .with_c_puct(sp.c_puct)
         .with_root_noise(Some(sp.noise));
     let mut rng = Rng::derive(seed, PICK_STREAM);
+    // Its own stream, so which decisions get the full budget is reproducible from the seed
+    // and independent of how many random draws the move sampling happens to make.
+    let mut cap_rng = Rng::derive(seed, CAP_STREAM);
+    let capping = sp.full_search_fraction < 1.0;
     let mut samples: Vec<Sample> = Vec::new();
 
     while !state.outcome.is_over() {
@@ -164,6 +222,16 @@ pub fn play_game(
             state.apply_trusted(legal[0]);
             continue;
         }
+
+        // Playout cap randomisation. Noise rides with the full budget: Dirichlet noise on a
+        // 32-simulation search perturbs the prior without buying exploration, and the move
+        // actually played is worse for it.
+        let policy_target = !capping || cap_rng.unit() < sp.full_search_fraction as f64;
+        if capping {
+            let sims = if policy_target { sp.sims } else { sp.cap_sims };
+            agent.set_budget(sims, policy_target.then_some(sp.noise));
+        }
+
         let result = agent.search(&state, &legal);
         let total: u32 = result.visits.iter().sum();
 
@@ -203,7 +271,11 @@ pub fn play_game(
         samples.push(Sample {
             chosen,
             root_value: result.root_value,
-            policy,
+            // A capped search's visits are not a target, so they are not carried. Dropping
+            // them here rather than at write time keeps the shard and the in-memory record
+            // saying the same thing.
+            policy: if policy_target { policy } else { Vec::new() },
+            policy_target,
         });
         state.apply_trusted(legal[chosen as usize]);
     }
@@ -322,6 +394,8 @@ pub fn run(
     let _ = writeln!(header, "dirichlet_alpha={}", sp.noise.alpha);
     let _ = writeln!(header, "dirichlet_weight={}", sp.noise.weight);
     let _ = writeln!(header, "temperature={}", sp.temperature);
+    let _ = writeln!(header, "full_search_fraction={}", sp.full_search_fraction);
+    let _ = writeln!(header, "cap_sims={}", sp.cap_sims);
     let _ = writeln!(
         header,
         "temperature_decisions={}",
@@ -367,6 +441,10 @@ pub fn run(
             bytes.extend_from_slice(&sample.chosen.to_le_bytes());
             bytes.extend_from_slice(&(sample.policy.len() as u16).to_le_bytes());
             bytes.extend_from_slice(&sample.root_value.to_le_bytes());
+            bytes.push(u8::from(sample.policy_target));
+            if sample.policy_target {
+                report.policy_targets += 1;
+            }
             for &(index, share) in &sample.policy {
                 bytes.extend_from_slice(&index.to_le_bytes());
                 bytes.extend_from_slice(&share.to_le_bytes());
@@ -549,6 +627,7 @@ impl Shard {
                     u16::from_le_bytes(take!(2, "entry count").try_into().expect("2 bytes")) as usize;
                 let root_value =
                     f32::from_le_bytes(take!(4, "root value").try_into().expect("4 bytes"));
+                let policy_target = take!(1, "policy target flag")[0] != 0;
                 let mut policy = Vec::with_capacity(entries);
                 for _ in 0..entries {
                     let index = u16::from_le_bytes(take!(2, "policy index").try_into().expect("2"));
@@ -559,6 +638,7 @@ impl Shard {
                     chosen,
                     root_value,
                     policy,
+                    policy_target,
                 });
             }
             games.push(ShardGame {
@@ -600,6 +680,16 @@ pub struct TrainingSet {
     pub value: Vec<f32>,
     /// The search's own root value, same convention. Diagnostic only.
     pub root_value: Vec<f32>,
+    /// `1` where the sample carries a policy target, `0` where playout cap randomisation
+    /// capped the search. One byte per sample.
+    ///
+    /// ⚠️ A capped sample has an **empty** policy span, so a trainer that ignored this and
+    /// took a cross-entropy against the stored target would compute a zero loss for it and
+    /// silently divide by the full batch size — the policy gradient would be scaled down by
+    /// the capped fraction with nothing to say so. `py/duel52/train/trainer.py` masks on
+    /// this, and `phase4_capped_samples_carry_a_value_target_and_no_policy_target` is the
+    /// guard on the shape.
+    pub policy_target: Vec<u8>,
 }
 
 /// Replay one game and append its samples to `out`.
@@ -658,6 +748,7 @@ fn replay_game(
             2.0 * config.learning_value(outcome_from_code(game.outcome_code), actor) - 1.0,
         );
         out.root_value.push(2.0 * sample.root_value - 1.0);
+        out.policy_target.push(u8::from(sample.policy_target));
         out.samples += 1;
 
         state.apply_trusted(legal[sample.chosen as usize]);
@@ -756,6 +847,7 @@ pub fn replay_with(
             .extend(part.policy_offset.iter().map(|o| o + policy_base));
         out.value.extend_from_slice(&part.value);
         out.root_value.extend_from_slice(&part.root_value);
+    out.policy_target.extend_from_slice(&part.policy_target);
     }
     out
 }

@@ -31,7 +31,7 @@ import torch
 from torch import nn
 
 from ..nn.checkpoint import read_checkpoint, write_checkpoint
-from ..nn.model import Duel52Net, NetConfig
+from ..nn.model import NetConfig, build_net, lane_spec_for
 from .buffer import Generation, ReplayBuffer
 from .config import TrainConfig
 
@@ -90,17 +90,29 @@ class Trainer:
         self.spec = spec
         self.device = resolve_device(config.train.device)
 
+        # The lane partition, when the architecture needs it. Built from the engine every
+        # time rather than cached on the config — `CLAUDE.md`'s encoder rule, and it costs
+        # microseconds.
+        lanes = lambda: lane_spec_for(  # noqa: E731
+            config.game.variant, config.game.encoding_slots
+        )
+
         if checkpoint is not None:
             ckpt = read_checkpoint(checkpoint)
             ckpt.check_against(spec)
+            # The checkpoint's own `arch`, not the config's: after generation 1 the shape
+            # comes from the file, which is the only thing that can be right about it.
             net_config = NetConfig(
                 obs_dim=ckpt.obs_dim,
                 action_dim=ckpt.action_dim,
                 width=ckpt.width,
                 blocks=ckpt.blocks,
                 value_hidden=ckpt.value_hidden,
+                arch=ckpt.arch,
             )
-            self.model = Duel52Net(net_config).to(self.device)
+            self.model = build_net(
+                net_config, lanes() if net_config.arch == "lane" else None
+            ).to(self.device)
             self.model.load_tensors(ckpt.tensors)
         else:
             net_config = NetConfig(
@@ -109,8 +121,11 @@ class Trainer:
                 width=config.net.width,
                 blocks=config.net.blocks,
                 value_hidden=config.net.value_hidden,
+                arch=config.net.arch,
             )
-            self.model = Duel52Net(net_config).to(self.device)
+            self.model = build_net(
+                net_config, lanes() if net_config.arch == "lane" else None
+            ).to(self.device)
 
         self.net_config = net_config
         self.optimizer = torch.optim.AdamW(
@@ -121,8 +136,15 @@ class Trainer:
 
     # ------------------------------------------------------------------- fitting --
 
-    def _to_device(self, batch: dict[str, np.ndarray]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Scatter one sparse batch into the dense tensors the network takes."""
+    def _to_device(
+        self, batch: dict[str, np.ndarray]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scatter one sparse batch into the dense tensors the network takes.
+
+        Returns ``(x, target, value, policy_mask)``. The mask is 1.0 for rows whose policy
+        target is real and 0.0 for rows playout cap randomisation capped — see
+        :meth:`_policy_loss`, which is where forgetting it would go wrong quietly.
+        """
         n = len(batch["value"])
         x = torch.zeros((n, self.net_config.obs_dim), device=self.device)
         x[
@@ -137,7 +159,33 @@ class Trainer:
         ] = torch.from_numpy(batch["policy_vals"]).to(self.device)
 
         value = torch.from_numpy(batch["value"]).to(self.device)
-        return x, target, value
+        # `.get` with a full-ones fallback so a shard replayed by an older path, or a test
+        # that builds a batch by hand, still trains every row — the mask is an addition, not
+        # a new requirement.
+        flags = batch.get("policy_target")
+        mask = (
+            torch.ones(n, device=self.device)
+            if flags is None
+            else torch.from_numpy(flags.astype(np.float32)).to(self.device)
+        )
+        return x, target, value, mask
+
+    @staticmethod
+    def _policy_loss(log_probs: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+        """Cross-entropy over the rows that have a policy target, and the count of them.
+
+        ⚠️ **The denominator is the masked count, not the batch size.** A capped row's target
+        is all zeros, so its cross-entropy is exactly 0 and a plain ``.mean()`` would average
+        those zeros in — scaling the policy gradient by the full-search fraction with nothing
+        anywhere to say so. At 25% full search that is a silent 4× cut in the policy learning
+        rate, which would look like "the policy head stopped learning" and send the search
+        for a bug into the wrong file entirely.
+
+        Returns ``(sum, count)`` rather than a mean so the caller can decide, and so the
+        holdout can accumulate across batches of different sizes.
+        """
+        per_row = -(target * log_probs).sum(dim=-1) * mask
+        return per_row.sum(), mask.sum()
 
     def lr_for(self, generation: int) -> float:
         """The learning rate in force at `generation`.
@@ -175,11 +223,18 @@ class Trainer:
 
         for step in range(steps):
             batch = buffer.sample_batch(rng, cfg.batch_size)
-            x, target, value = self._to_device(batch)
+            x, target, value, mask = self._to_device(batch)
 
             logits, predicted = self.model(x)
             log_probs = torch.log_softmax(logits, dim=-1)
-            policy_loss = -(target * log_probs).sum(dim=-1).mean()
+            total, counted = self._policy_loss(log_probs, target, mask)
+            # `clamp` guards the batch in which every row happened to be capped: at a 25%
+            # fraction and 512 rows that is astronomically unlikely, but a division by zero
+            # here would poison the weights rather than raise.
+            policy_loss = total / counted.clamp(min=1.0)
+            # The value head trains on **every** row. That asymmetry is the entire point of
+            # playout cap randomisation: one game, one outcome, however little search
+            # produced the position.
             value_loss = nn.functional.mse_loss(predicted, value)
             loss = policy_loss + cfg.value_weight * value_loss
 
@@ -210,22 +265,29 @@ class Trainer:
         was_training = self.model.training
         self.model.eval()
         stats = EvalStats()
-        policy_sum = value_sum = 0.0
+        policy_sum = value_sum = policy_rows = 0.0
         try:
             for batch in holdout.batches(cfg.batch_size):
-                x, target, value = self._to_device(batch)
+                x, target, value, mask = self._to_device(batch)
                 logits, predicted = self.model(x)
                 log_probs = torch.log_softmax(logits, dim=-1)
                 n = len(value)
                 # Summed, not meaned, so the last short batch does not get a full batch's
                 # weight in the average.
-                policy_sum += float(-(target * log_probs).sum())
+                total, counted = self._policy_loss(log_probs, target, mask)
+                policy_sum += float(total)
+                policy_rows += float(counted)
                 value_sum += float(((predicted - value) ** 2).sum())
                 stats.samples += n
         finally:
             self.model.train(was_training)
         if stats.samples:
-            stats.policy_loss = policy_sum / stats.samples
+            # The two denominators differ, deliberately: the value head is scored on every
+            # held-out row and the policy head only on the rows that have a target. Dividing
+            # both by `samples` would make the held-out policy loss depend on the capping
+            # fraction, and `PLAN.md` §4.2 change 7 exists so this number is comparable
+            # between runs.
+            stats.policy_loss = policy_sum / max(policy_rows, 1.0)
             stats.value_mse = value_sum / stats.samples
         return stats
 

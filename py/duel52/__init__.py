@@ -42,6 +42,7 @@ from ._engine import (
     Game,
     ladder_agents,
     lane_permutations,
+    lane_structure,
     power_reference,
     random_play_stats,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "TWO_POWERS",
     "ladder_agents",
     "lane_permutations",
+    "lane_structure",
     "power_reference",
     "random_play_stats",
     "play_agent_game",

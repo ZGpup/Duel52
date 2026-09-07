@@ -1,0 +1,281 @@
+# Phase 4, Stage 1 — three hours on the laptop, and the first run of a new architecture.
+# PLAN.md §4.2b (lane equivariance) and §4.2c (playout cap randomisation).
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-3h-new.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-3h-new.toml \
+#       --run-dir runs/sixth
+#
+# **There is no `--init-from`, and there cannot be.** `train-fast`, `train-2h` and `train-3h`
+# were one lineage — gen016 → gen022 → gen031, each warm-started from the one before. This
+# run starts from a random init because `[net] arch = "lane"` shares no tensor name with the
+# flat network every shipped checkpoint is, so there is nothing to carry over. `_warm_start`
+# refuses the combination by name rather than letting the shapes look compatible.
+#
+# ⚠️ **Read this before judging the result.** From scratch in three hours on eight cores does
+# not produce an agent that beats gen031, and nothing here is trying to. `runs/third` — also
+# from scratch — needed seven generations to reach 0.95 against *greedy*, and this run gets
+# roughly nine. What it is for is deciding whether the two changes work and scale, so that
+# `configs/train-big.toml` is worth 24 hours of a rented box. The things to read are, in
+# order:
+#
+#   1. `duel52.lanes` on generation 1: policy TV between lane pairs must be **0.000**, not
+#      merely small. FINDINGS.md F4.5 got 0.113 after a generation of augmentation and 0.039
+#      by the end; the equivariant net starts at zero and stays there, because no parameter
+#      is indexed by a lane. If it is not zero, the architecture is not wired up and this run
+#      is a bug report rather than a result.
+#   2. The held-out **value** MSE curve. Playout cap randomisation exists to buy value
+#      targets, so this is where it shows up. runs/fourth ran 0.870 → 0.655 over eight
+#      generations and runs/fifth is the other comparison; both are flat-network numbers on
+#      different positions, so read the shape, not the float.
+#   3. The `random` and `greedy` columns rising. From scratch they are a real progress chart
+#      for the first several generations, which is exactly why `reference_games_saturated`
+#      below is keyed to the high-water mark rather than to those opponents' names.
+#
+# And one number that is **not** evidence of anything: the gen031 column. A from-scratch net
+# does not reach it in three hours and is not meant to.
+#
+# The two changes are deliberately taken together, which breaks this project's usual
+# one-change-per-run rule. The reason is that they are not independent: the equivariant trunk
+# runs once per lane and costs ~1.9x the flat network's forward pass, and playout cap
+# randomisation makes search ~2.9x cheaper. Run separately, the first is a run that gets
+# fewer generations and the second is a run whose only change is a speed-up. Run together
+# they roughly cancel and the question — is this architecture worth the rented box — is
+# answerable in one sitting. Attribution is recoverable if it matters: the mechanism check
+# in (1) is specific to equivariance and the policy-target count in the self-play line is
+# specific to capping, so a failure names itself.
+
+[game]
+variant = "split"
+# FINDINGS.md F3.1 for why 21 and not the default 16. Here it also fixes the lane widths:
+# lane_obs = 1390 and lane_action = 727, which the checkpoint header carries and
+# `Weights::load` checks against `encode::lane_structure`.
+encoding_slots = 21
+stalemate_value = 0.0             # FINDINGS.md F3.6
+
+[net]
+# **The first experimental change.** PLAN.md §4.2b.
+#
+# FINDINGS.md F4.3 measured the flat network not knowing its three lanes are interchangeable:
+# an opening prior of .320 / .277 / .403 where it must be .333 each, lane 3 outranking lane 1
+# in 24 of 24 seeds. F4.5 attacked that with six-fold data augmentation and got most of the
+# way — policy TV 0.152 → 0.039 — but argmax agreement stopped at 114/128, because
+# augmentation can only *ask* a network to be symmetric. This makes it symmetric: the trunk
+# runs once per lane with one shared set of weights and the lanes exchange information only
+# through their mean, so relabelling them permutes the policy exactly and leaves the value
+# alone. `engine/tests/encoding.rs::phase4_the_lane_network_is_exactly_equivariant` asserts
+# it on **random** weights, which is the point — it holds before a single gradient step.
+arch = "lane"
+
+# ⚠️ **`blocks = 3` IS the expansion, and this is the one number here that was measured
+# rather than chosen.** The equivariant trunk runs once per lane, so 3 blocks is **nine**
+# block-evaluations against gen031's three — in cost it is the deeper network by a wide
+# margin, even though the parameter count falls.
+#
+# Parameters are not the constraint; the forward pass is. The tempting reasoning — "the input
+# projection is 58% of gen031's parameters and it does not grow, so depth is cheap" — is
+# **wrong**, because in the search path the input layer walks only the observation's ~205
+# non-zeros (FINDINGS.md F3.3) and the policy head is masked to the ~21 legal logits. Both of
+# the big matrices are nearly free, so the trunk is what self-play actually pays for.
+#
+# Measured on the machine this is for, 40 games at 256 sims, `selfplay` with PCR on:
+#
+#   flat 128x3 (gen031), no PCR     2.0 games/sec    1.00x   — the baseline to beat
+#   lane 128x2 + PCR                3.5             1.75x
+#   lane 128x3 + PCR                2.0             1.00x   <- this config
+#   lane 128x4 + PCR                1.7             0.85x
+#   lane 128x6 + PCR                1.2             0.60x
+#   lane 128x6, no PCR              0.5             0.25x
+#
+# So `blocks = 3` with playout cap randomisation costs exactly what gen031's flat network
+# cost without it — the two changes pay for each other, which is why they are in the same
+# run. `blocks = 6` was the plan and it is affordable only where cores are: it belongs in
+# `configs/train-big.toml`, on the rented box, and this run is the evidence for whether that
+# is worth doing.
+#
+#   gen031, flat 128x3    ~950k params
+#   this,   lane 128x3    ~455k params    (~604k at blocks = 6, for reference)
+#
+# `python -m duel52.nn inspect` prints the real numbers for whatever is written.
+width = 128
+blocks = 3
+value_hidden = 128
+
+[selfplay]
+# 1400 at the measured 2.0 games/sec is ~11.7 minutes of self-play. With ~11 minutes of gate
+# and panel and a minute of fitting, a generation is ~24 minutes and three hours is **7 to 8
+# generations**. That is the honest expectation; `lr_schedule` below is keyed to it.
+games = 1400
+
+sims = 256
+c_puct = 1.25
+
+# **The second experimental change.** PLAN.md §4.2c; Wu 2019, *Accelerating Self-Play
+# Learning in Go*.
+#
+# The asymmetry it exploits is specific. A **value** target is the game's outcome, and it
+# costs nothing extra however little search produced the position. A **policy** target is the
+# visit distribution, and it is worthless if the visits are few. Spending 256 simulations on
+# every decision buys a good policy target at every one of them and pays for the value
+# targets several times over.
+#
+# So: a quarter of decisions get the full 256 and a policy target, and three quarters get 32
+# and contribute a value target only. Mean search is 0.25x256 + 0.75x32 = 88 simulations,
+# **2.9x cheaper** in theory and a measured 4.0x on the trunk above (0.5 -> 2.0 games/sec),
+# which is what pays for the equivariant trunk. `train check` prints the multiplier and the
+# resulting policy-target count.
+#
+# **0.25 rather than 0.4, and it was measured rather than assumed.** The fraction trades
+# policy targets for games, but the games it buys back partly replace the policy targets it
+# costs, so the curve is flatter than it looks. At a fixed 11.7-minute self-play budget:
+#
+#   frac   games/sec   games   policy targets   outcomes
+#   0.25   2.0         1400    ~21,000          1400
+#   0.40   1.4          980    ~24,000           980
+#
+# Nearly the same policy targets, **43% more outcomes**. And outcomes are the half that
+# matters here: `configs/train-3h.toml` argued that augmentation "raises the effective sample
+# count without adding a single new outcome" and PLAN.md §4.2 change 7 has the value head as
+# the plateaued one. This is the knob that adds outcomes, so it is set where it adds the
+# most. If the held-out *policy* loss stalls while the value loss improves, 0.4 is the first
+# thing to try.
+#
+# Why this is the right trade *for this project specifically*: PLAN.md §4.2 change 7 has the
+# value head as the plateaued half, and `configs/train-3h.toml` argued at length that
+# augmentation "raises the effective sample count without adding a single new outcome". This
+# adds outcomes — it is the one knob that does — and it buys them with policy targets the
+# run has in surplus.
+#
+# Dirichlet noise rides with the full budget and is off for capped decisions: noise on a
+# 32-simulation search perturbs the prior without buying exploration, and the move actually
+# played is worse for it.
+full_search_fraction = 0.25
+cap_sims = 32
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+device = "auto"
+batch_size = 512
+
+# **Off, and this is a result rather than a default.** `train-3h.toml`'s one change was
+# `lane_augment = true`, and FINDINGS.md F4.5 measured it at +82 Elo — on the *flat* network.
+# On this one the same transform is exactly the identity on the loss: the network satisfies
+# f(sigma.x) = sigma.f(x), so the cross-entropy against a relabelled target is a sum over the
+# same permuted pairs and the value target does not move at all. Same loss, therefore the
+# same gradient, therefore a gather per row for nothing.
+#
+# `test_lane_augmentation_is_a_no_op_on_the_lane_equivariant_network` asserts it — equal
+# losses *and* equal gradients across all six relabellings — rather than leaving it as an
+# argument. ⚠️ If that test ever fails, the architecture is not equivariant and this line is
+# wrong: turn augmentation back on until it passes again.
+lane_augment = false
+
+# Passes over the buffer rather than a fixed step count — the correction generation 1 of
+# runs/fourth paid for, and it matters more here. A from-scratch run's buffer is *empty* at
+# generation 1, so a fixed step count would be a dozen epochs over one shard.
+epochs_per_generation = 0.9
+steps_per_generation = 600
+
+# The rate that produced gen016, gen022 and gen031. Not moved: this run already changes two
+# things, and a from-scratch run is the wrong place to also re-tune the optimiser.
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# Keyed to the generations the run will actually finish, not to the `generations` backstop —
+# the mistake Stage 0 made and PLAN.md §4.2 change 5 recorded.
+#
+# ⚠️ **The third boundary moved 6 → 12 when this run was extended**, and that is the same
+# mistake caught a second time rather than a new decision. The tiers were keyed to the 7–8
+# generations three hours buys; the run was then given two more hours, so a sixteenth rate
+# from generation 6 was decaying on a clock that no longer existed. Generations 6, 7 and 8
+# ran at 1.25e-4 and produced the run's three lowest gate scores — 0.611 / 0.580 / 0.599 —
+# while the training loss was still falling monotonically, which is the learning rate
+# limiting progress and not the data.
+#
+# Only the last boundary moved. Tiers 0 and 4 are untouched, so what generations 1–5 were
+# trained at is unchanged. `runs/sixth/train.toml.used.from-gen009` records the edit against
+# the generation it takes effect from; the original `train.toml.used` is never overwritten.
+lr_schedule = [[0, 1.0], [4, 0.25], [12, 0.0625]]
+
+sample_stride = 2
+
+# A from-scratch run's early generations are played by a network that knows nothing, and
+# `PLAN.md` §4.2 is clear that keeping them forever teaches the current net to imitate a
+# worse one. Six generations at ~85k samples each is ~510k, so `buffer_samples` is headroom
+# — a cap below the window would silently truncate it, which is invisible in the readout.
+#
+# Note what a sample is now: **every** decision is a value target and only a quarter carry a
+# policy target, so the buffer holds ~510k value targets and ~128k policy targets. The
+# trainer masks on `policy_target` and divides the policy loss by the masked count, not the
+# batch size — `Trainer._policy_loss` has the reason, and getting it wrong would scale the
+# policy gradient by 0.25 with nothing to say so.
+buffer_generations = 6
+buffer_samples = 800000
+
+# PLAN.md §4.2 change 7. Carved off this run's generation 1 and never trained on.
+#
+# ⚠️ **It is not comparable float-for-float with runs/fourth's or runs/fifth's.** Different
+# positions, a different architecture, and — new here — the held-out policy loss is now
+# averaged over the rows that *have* a policy target rather than over every row, so that the
+# number does not move when `full_search_fraction` does. Read the shape of the curve.
+holdout_samples = 8000
+
+[gate]
+games = 300
+threshold = 0.52
+min_decisive = 30
+sims = 256
+
+# **A from-scratch panel, so it is shaped like `train-big.toml`'s and not like
+# `train-3h.toml`'s.** gen031 is the progress chart; `random` and `greedy` are a real
+# measurement for the first several generations here rather than the formality they are in a
+# warm-started run — in `runs/third`, also from scratch, `greedy` read
+# 0.36 / 0.47 / 0.68 / 0.81 / 0.89 / 0.95 over its first seven.
+#
+# @64 rather than @256 for the gen031 row, following `train-big`: a from-scratch net spends
+# its whole first few generations far below gen031 at any budget, and @64 is ~40% cheaper.
+# This row is **not** expected to reach 0.5 in three hours. It is the slope that matters.
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen031.d52nn@64"]
+# 100 rather than train-3h's 120: the panel runs at full simulations with no capping, on a
+# trunk that costs ~2.9x gen031's, so it is a bigger share of the generation than it has ever
+# been. Together with the gate it is ~11 of a ~24-minute generation.
+reference_games = 100
+
+# The saturated-row discount, on for the first time in a shipped config. A row whose
+# best-ever reaches 0.99 has stopped being a measurement and become a one-bit check — did the
+# agent fall off a cliff — and a bit does not need 120 games.
+#
+# Keyed to the high-water mark rather than to the opponent's name, which matters *here
+# specifically*: this is the from-scratch run, so `random` and `greedy` pay full rate until
+# they earn the discount and their climb is not thrown away. `train check` prints the
+# false-veto and detection rates for these numbers.
+reference_games_saturated = 40
+reference_saturated_at = 0.99
+
+reference_tolerance = 0.05
+max_consecutive_refusals = 5
+
+[run]
+# `hours` binds; `generations` is a backstop, and the loop stops *before* a generation that
+# would overrun.
+#
+# ⚠️ **`hours` is counted from the start of each invocation, not cumulatively**, so on a
+# `--resume` this is "two more hours" rather than "two hours in total". The first sitting was
+# `hours = 3.0` and produced 8 generations at ~21 minutes each; this is the extension, and
+# `generations` is raised because 12 would have capped the resume at four regardless of the
+# clock.
+generations = 20
+hours = 2.0
+
+# A fresh million. The third run holds 1,000,000+, PLAN.md §4.3 reserves 2,000,000 for the
+# rented box, Stage 0 holds 3,000,000+ and runs/fifth holds 4,000,000+. A collision would
+# silently re-deal games a net has already trained on.
+seed = 5000000
+
+threads = 0                       # 0 = every core
+engine = "./target/release/duel52"

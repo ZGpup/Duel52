@@ -19,9 +19,10 @@ mod common;
 use common::{sample_positions, sub_decision_positions};
 use duel52_engine::encode::{
     action_blocks, action_dim, action_layout_hash, decode_action, encode_action,
-    encode_observation, lane_permutations, legal_mask, obs_dim, obs_layout_hash, slot_features,
+    encode_observation, global_action_len, global_obs_len, lane_action_len, lane_obs_len,
+    lane_permutations, lane_structure, legal_mask, obs_dim, obs_layout_hash, slot_features,
 };
-use duel52_engine::nn::{Arch, Evaluator, MlpEvaluator, Weights};
+use duel52_engine::nn::{Arch, ArchKind, Evaluator, MlpEvaluator, Weights};
 use duel52_engine::testkit::{permute_action, permute_lanes, Position};
 use duel52_engine::{
     Action, AgentSpec, GameConfig, GameState, Player, Rank, Rng, Variant,
@@ -496,17 +497,255 @@ fn phase4_a_lane_relabelling_actually_moves_the_observation() {
     );
 }
 
+// ====================================================================== lane structure ==
+
+/// **The guard on `PLAN.md` §4.2b.** `encode::lane_structure` says which lane owns each
+/// observation float and each policy logit, and the lane-equivariant network shares one
+/// weight matrix across the three lanes on the strength of it. A wrong table is silent in
+/// exactly the way `phase4_lane_permutation_commutes_with_the_encoder` describes: lane 2's
+/// board reaches lane 1's weights and the agent is merely bad.
+///
+/// The check is against `lane_permutations`, which is *already* checked against the encoder
+/// itself — so this closes the triangle without transcribing the layout a third time. The
+/// property: relabelling by σ must carry lane `l`'s k-th index to lane `σ(l)`'s k-th index,
+/// for every k. That is stronger than "the sets correspond", because it pins the per-lane
+/// *order* the shared matrix depends on.
+#[test]
+fn phase4_lane_structure_agrees_with_the_permutations() {
+    for config in [
+        GameConfig::default(),
+        GameConfig::preset(Variant::Base),
+        GameConfig { encoding_slots: 21, ..GameConfig::default() },
+    ] {
+        let s = lane_structure(&config);
+
+        assert_eq!(s.lane_obs.len(), config.lanes);
+        assert_eq!(s.lane_action.len(), config.lanes);
+        for lane in 0..config.lanes {
+            assert_eq!(s.lane_obs[lane].len(), lane_obs_len(&config), "lane {lane} obs width");
+            assert_eq!(
+                s.lane_action[lane].len(),
+                lane_action_len(&config),
+                "lane {lane} action width"
+            );
+        }
+        assert_eq!(s.global_obs.len(), global_obs_len(&config));
+        assert_eq!(s.global_action.len(), global_action_len(&config));
+
+        for sigma in lane_permutations(&config) {
+            for lane in 0..config.lanes {
+                let to = sigma.lanes[lane];
+                for (k, &i) in s.lane_obs[lane].iter().enumerate() {
+                    assert_eq!(
+                        sigma.obs[i as usize], s.lane_obs[to][k],
+                        "obs feature {k} of lane {lane} must relabel to lane {to}'s under {:?}",
+                        sigma.lanes
+                    );
+                }
+                for (k, &i) in s.lane_action[lane].iter().enumerate() {
+                    assert_eq!(
+                        sigma.action[i as usize], s.lane_action[to][k],
+                        "logit {k} of lane {lane} must relabel to lane {to}'s under {:?}",
+                        sigma.lanes
+                    );
+                }
+            }
+            // Anything owned by no lane is a fixed point of every relabelling.
+            for &i in &s.global_obs {
+                assert_eq!(sigma.obs[i as usize], i, "global observation float {i} moved");
+            }
+            for &i in &s.global_action {
+                assert_eq!(sigma.action[i as usize], i, "global logit {i} moved");
+            }
+        }
+    }
+}
+
+/// The widths the network is built from are the widths the tables actually have. Cheap, and
+/// it is what turns a `config` mismatch into a build-time failure rather than a gather that
+/// reads past the end of a row.
+#[test]
+fn phase4_lane_structure_widths_account_for_every_float() {
+    for config in [
+        GameConfig::default(),
+        GameConfig::preset(Variant::Base),
+        GameConfig { encoding_slots: 21, ..GameConfig::default() },
+    ] {
+        assert_eq!(
+            config.lanes * lane_obs_len(&config) + global_obs_len(&config),
+            obs_dim(&config),
+            "lane and global observation widths must sum to obs_dim"
+        );
+        assert_eq!(
+            config.lanes * lane_action_len(&config) + global_action_len(&config),
+            action_dim(&config),
+            "lane and global action widths must sum to action_dim"
+        );
+    }
+}
+
+// =========================================================== the lane-equivariant network ==
+
+/// **The point of `PLAN.md` §4.2b, asserted directly.** `FINDINGS.md` F4.3 measured a lane
+/// preference in the flat network and F4.5 shrank it with augmentation without removing it —
+/// policy TV 0.152 → 0.039, argmax agreement stuck at 114/128. This asserts the property
+/// augmentation could only approach: relabel the lanes of a position and the *same weights*
+/// must produce exactly the relabelled policy and exactly the same value.
+///
+/// It holds for **random** weights, and that is the whole point. A trained flat network could
+/// pass a loose version of this by having learned the symmetry; this passes before a single
+/// gradient step, because no parameter is indexed by a lane.
+///
+/// The tolerance is for f32 reassociation only — permuting the lanes permutes the order the
+/// mean over lanes is summed in. A transcription bug (a lane's slice read through the wrong
+/// weights, a mean taken over the wrong axis) produces `O(1)` differences.
+#[test]
+fn phase4_the_lane_network_is_exactly_equivariant() {
+    let mut checked = 0;
+    for state in sample_positions().into_iter().chain(sub_decision_positions()) {
+        // Each sampled position carries its own config — including `base`, whose deck and
+        // rank count differ — so the network is built for the position rather than the
+        // position forced into one config.
+        let config = state.config;
+        let arch = Arch::lane_for(&config, 32, 2, 24);
+        let evaluator = MlpEvaluator::new(Weights::random(4242, arch), &config);
+        for sigma in lane_permutations(&config) {
+            let moved = permute_lanes(&state, &sigma.lanes);
+            for observer in Player::BOTH {
+                let (before_logits, before_value) = eval_one(&evaluator, &state, observer, &config);
+                let (after_logits, after_value) = eval_one(&evaluator, &moved, observer, &config);
+
+                assert!(
+                    (after_value - before_value).abs() < 1e-4,
+                    "value moved under lane relabelling {:?}: {before_value} -> {after_value}",
+                    sigma.lanes
+                );
+                for (a, logit) in before_logits.iter().enumerate() {
+                    let to = sigma.action[a] as usize;
+                    assert!(
+                        (after_logits[to] - logit).abs() < 1e-3,
+                        "logit {a} -> {to} moved under {:?}: {logit} -> {}",
+                        sigma.lanes,
+                        after_logits[to]
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0, "no position was checked");
+}
+
+/// The masked path and the dense path are the same function.
+///
+/// `net_mcts` only ever calls the masked one — a Duel 52 position offers ~21 of 2194 encoded
+/// actions — so if the two disagreed, every measurement in the project would be of a network
+/// nobody trained. The flat architecture has this property by construction; this checks the
+/// lane one, whose masked path indexes a *shared* per-lane matrix and so has real arithmetic
+/// to get wrong.
+#[test]
+fn phase4_the_lane_networks_masked_and_dense_logits_agree() {
+    let config = GameConfig { encoding_slots: 21, ..GameConfig::default() };
+    let arch = Arch::lane_for(&config, 32, 2, 24);
+    let evaluator = MlpEvaluator::new(Weights::random(7, arch), &config);
+    let mut scratch = evaluator.scratch();
+
+    let mut state = GameState::new(config, 11);
+    let mut rng = Rng::new(5);
+    for _ in 0..40 {
+        let legal = state.legal_actions();
+        if legal.is_empty() {
+            break;
+        }
+        let mut obs = vec![0.0f32; obs_dim(&config)];
+        encode_observation(&state, state.to_move, &mut obs);
+        let mut mask = vec![false; action_dim(&config)];
+        legal_mask(&state, &mut mask);
+
+        let mut dense = vec![0.0f32; action_dim(&config)];
+        let mut masked = vec![f32::NAN; action_dim(&config)];
+        let mut values = [0.0f32];
+        evaluator.eval_batch(&obs, 1, &mut dense, &mut values);
+        let masked_value = evaluator.eval_masked_with(&obs, &mask, &mut masked, &mut scratch);
+
+        assert!((masked_value - values[0]).abs() < 1e-6, "value differs between paths");
+        for (a, &allowed) in mask.iter().enumerate() {
+            if allowed {
+                assert_eq!(masked[a], dense[a], "logit {a} differs between paths");
+            }
+        }
+        let pick = legal[rng.below(legal.len() as u64) as usize].clone();
+        state.apply(pick).expect("a legal action applies");
+    }
+}
+
+/// A lane-equivariant checkpoint round-trips, and the header keeps describing its own shape.
+#[test]
+fn phase4_a_lane_checkpoint_round_trips() {
+    let config = GameConfig { encoding_slots: 21, ..GameConfig::default() };
+    let arch = Arch::lane_for(&config, 24, 2, 16);
+    let weights = Weights::random(3, arch);
+    let bytes = weights.to_bytes(&config);
+    let back = Weights::from_bytes(&bytes, &config).expect("round trip");
+    assert_eq!(back.arch, arch);
+    assert_eq!(back.arch.kind, ArchKind::Lane);
+    assert_eq!(back.params, weights.params);
+}
+
+/// ⚠️ **`CLAUDE.md`'s "all three still load" is a promise.** The `arch` header key was added
+/// after gen016, gen022 and gen031 were written, so it has to be *optional* on read and mean
+/// `mlp` when absent. A version bump would have been the obvious move and would have retired
+/// three shipped checkpoints for nothing.
+#[test]
+fn phase4_a_checkpoint_without_an_arch_key_still_loads_as_the_flat_network() {
+    let config = GameConfig::default();
+    let arch = Arch { width: 16, blocks: 1, value_hidden: 8, ..Arch::default_for(&config) };
+    let weights = Weights::random(9, arch);
+    let bytes = weights.to_bytes(&config);
+
+    // Strip the `arch=mlp` line, reproducing a pre-§4.2b checkpoint exactly.
+    let header_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let header = std::str::from_utf8(&bytes[12..12 + header_len]).expect("utf-8");
+    let stripped: String =
+        header.lines().filter(|l| !l.starts_with("arch=")).map(|l| format!("{l}\n")).collect();
+    assert!(header.contains("arch=mlp"), "this build should stamp an arch key");
+
+    let mut old = Vec::new();
+    old.extend_from_slice(&bytes[..8]);
+    old.extend_from_slice(&(stripped.len() as u32).to_le_bytes());
+    old.extend_from_slice(stripped.as_bytes());
+    old.extend_from_slice(&bytes[12 + header_len..]);
+
+    let back = Weights::from_bytes(&old, &config).expect("a headerless-arch checkpoint must load");
+    assert_eq!(back.arch.kind, ArchKind::Mlp);
+    assert_eq!(back.params, weights.params);
+}
+
+/// One forward pass, as `(logits, value)`.
+fn eval_one(
+    evaluator: &MlpEvaluator,
+    state: &GameState,
+    observer: Player,
+    config: &GameConfig,
+) -> (Vec<f32>, f32) {
+    let mut obs = vec![0.0f32; obs_dim(config)];
+    encode_observation(state, observer, &mut obs);
+    let mut logits = vec![0.0f32; action_dim(config)];
+    let mut value = [0.0f32];
+    evaluator.eval_batch(&obs, 1, &mut logits, &mut value);
+    (logits, value[0])
+}
+
 // ================================================================= the reference network ==
 
 fn test_arch(config: &GameConfig) -> Arch {
     // Small enough for the `opt-level = 1` test profile; the shape, not the capacity, is
     // what these tests are about.
     Arch {
-        obs_dim: obs_dim(config),
-        action_dim: action_dim(config),
         width: 32,
         blocks: 2,
         value_hidden: 16,
+        ..Arch::default_for(config)
     }
 }
 
@@ -518,7 +757,7 @@ fn phase3_forward_pass_is_deterministic() {
     let config = GameConfig::default();
     let arch = test_arch(&config);
     let weights = Weights::random(1234, arch);
-    let evaluator = MlpEvaluator::new(weights);
+    let evaluator = MlpEvaluator::new(weights, &config);
 
     let state = GameState::new(config, 11);
     let obs = encode(&state, Player::P0);
@@ -562,7 +801,7 @@ fn phase3_forward_pass_is_deterministic() {
 fn phase3_batched_evaluation_matches_row_by_row() {
     let config = GameConfig::default();
     let arch = test_arch(&config);
-    let evaluator = MlpEvaluator::new(Weights::random(99, arch));
+    let evaluator = MlpEvaluator::new(Weights::random(99, arch), &config);
 
     let states: Vec<GameState> = (0..5).map(|s| GameState::new(config, s)).collect();
     let rows: Vec<Vec<f32>> = states.iter().map(|s| encode(s, s.acting_player())).collect();
@@ -591,7 +830,7 @@ fn phase3_batched_evaluation_matches_row_by_row() {
 fn phase3_value_head_is_bounded() {
     let config = GameConfig::default();
     let arch = test_arch(&config);
-    let evaluator = MlpEvaluator::new(Weights::random(7, arch));
+    let evaluator = MlpEvaluator::new(Weights::random(7, arch), &config);
     for seed in 0..8u64 {
         let state = GameState::new(config, seed);
         let obs = encode(&state, Player::P0);

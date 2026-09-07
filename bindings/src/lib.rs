@@ -898,6 +898,69 @@ fn lane_permutations<'py>(
     Ok(out)
 }
 
+/// Which lane owns each observation float and each policy logit.
+///
+/// `PLAN.md` §4.2b, and the tables the lane-equivariant network is built on. Returns a dict:
+///
+/// - ``lane_obs`` / ``lane_action``: one flat little-endian ``u32`` buffer per lane, to wrap
+///   with ``numpy.frombuffer``. Position ``k`` of every lane's list is the *same* feature of
+///   a different lane, which is what makes one shared weight matrix meaningful.
+/// - ``global_obs`` / ``global_action``: the indices no lane owns.
+/// - ``lane_obs_len``, ``global_obs_len``, ``lane_action_len``, ``global_action_len``: the
+///   widths, so the PyTorch module can size its layers without recounting.
+///
+/// **Rust computes these too.** `CLAUDE.md`'s encoder rule applies with full force: a table
+/// of "which lane owns this float" is a reading of the feature layout, and a wrong one
+/// silently routes lane 2's board through lane 1's weights. See
+/// `engine/tests/encoding.rs::phase4_lane_structure_agrees_with_the_permutations`, which
+/// checks these against the permutation tables rather than against a second transcription.
+#[pyfunction]
+#[pyo3(signature = (variant="split", encoding_slots=None))]
+fn lane_structure<'py>(
+    py: Python<'py>,
+    variant: &str,
+    encoding_slots: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use pyo3::types::PyBytes;
+
+    let v = Variant::parse(variant)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
+    let mut config = GameConfig::preset(v);
+    if let Some(n) = encoding_slots {
+        config.encoding_slots = n;
+    }
+    config
+        .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+
+    let s = encode::lane_structure(&config);
+    let bytes = |v: &[u32]| {
+        let raw =
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+        PyBytes::new(py, raw)
+    };
+
+    let d = PyDict::new(py);
+    let lane_obs = PyList::empty(py);
+    for list in &s.lane_obs {
+        lane_obs.append(bytes(list))?;
+    }
+    let lane_action = PyList::empty(py);
+    for list in &s.lane_action {
+        lane_action.append(bytes(list))?;
+    }
+    d.set_item("lane_obs", lane_obs)?;
+    d.set_item("lane_action", lane_action)?;
+    d.set_item("global_obs", bytes(&s.global_obs))?;
+    d.set_item("global_action", bytes(&s.global_action))?;
+    d.set_item("lanes", config.lanes)?;
+    d.set_item("lane_obs_len", encode::lane_obs_len(&config))?;
+    d.set_item("global_obs_len", encode::global_obs_len(&config))?;
+    d.set_item("lane_action_len", encode::lane_action_len(&config))?;
+    d.set_item("global_action_len", encode::global_action_len(&config))?;
+    Ok(d)
+}
+
 // ================================================= Phase 3 step 3: the training corpus ==
 
 /// Read a `.d52sp` self-play shard and replay it into training tensors.
@@ -963,6 +1026,7 @@ fn replay_shard<'py>(
     d.set_item("policy_prob", bytes_of(py, &set.policy_prob))?;
     d.set_item("value", bytes_of(py, &set.value))?;
     d.set_item("root_value", bytes_of(py, &set.root_value))?;
+    d.set_item("policy_target", bytes_of(py, &set.policy_target))?;
 
     let header = PyDict::new(py);
     for (k, v) in &shard.header {
@@ -993,6 +1057,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ladder_agents, m)?)?;
     m.add_function(wrap_pyfunction!(encoding_spec, m)?)?;
     m.add_function(wrap_pyfunction!(lane_permutations, m)?)?;
+    m.add_function(wrap_pyfunction!(lane_structure, m)?)?;
     m.add_function(wrap_pyfunction!(replay_shard, m)?)?;
     Ok(())
 }

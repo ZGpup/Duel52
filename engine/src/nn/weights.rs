@@ -43,6 +43,46 @@ use crate::rng::Rng;
 pub const CHECKPOINT_MAGIC: &[u8; 6] = b"D52NN\0";
 pub const CHECKPOINT_VERSION: u16 = 1;
 
+/// Which of the two architectures a checkpoint holds.
+///
+/// `PLAN.md` §4.2b. Both are pure dense layers with the same trunk shape; the difference is
+/// **weight sharing across lanes**, which is why they share [`Arch`] and one evaluator
+/// rather than being two networks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ArchKind {
+    /// `DESIGN.md` §5's flat residual MLP: one `obs_dim → width` projection, one
+    /// `width → action_dim` policy head, and no idea that lanes exist. gen016, gen022 and
+    /// gen031 are all this.
+    ///
+    /// The default, and deliberately so: a checkpoint written before this field existed has
+    /// no `arch` line, and reading it as `Mlp` is what keeps the three shipped checkpoints
+    /// loading.
+    #[default]
+    Mlp,
+    /// The lane-equivariant network. The trunk runs once per lane with shared weights and
+    /// the lanes exchange information only through their mean, so relabelling the lanes
+    /// permutes the policy exactly and leaves the value unchanged — `FINDINGS.md` F4.3's
+    /// bias is not reduced but structurally impossible.
+    Lane,
+}
+
+impl ArchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchKind::Mlp => "mlp",
+            ArchKind::Lane => "lane",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ArchKind> {
+        match s {
+            "mlp" => Some(ArchKind::Mlp),
+            "lane" => Some(ArchKind::Lane),
+            _ => None,
+        }
+    }
+}
+
 /// The architecture, pinned by `PHASE3_STEP1.md` §1.5 and `DESIGN.md` §5.
 ///
 /// Travels in the checkpoint header, so a saved network describes its own shape and a
@@ -58,6 +98,18 @@ pub struct Arch {
     pub blocks: usize,
     /// Hidden width of the value head. 256 in the default configuration.
     pub value_hidden: usize,
+    /// Flat, or lane-equivariant.
+    pub kind: ArchKind,
+    /// Lanes, and the per-lane slice widths. Zero and meaningless under [`ArchKind::Mlp`].
+    ///
+    /// Stored rather than re-derived from `config` so that the checkpoint keeps describing
+    /// its own shape — [`Arch::params`] has no config and the header check is the project's
+    /// whole answer to silent layout drift. [`crate::encode::lane_structure`] is still the
+    /// only place these numbers are *computed*; this is a copy the header can be checked
+    /// against, which is exactly what `expect` does with `obs_dim` already.
+    pub lanes: usize,
+    pub lane_obs: usize,
+    pub lane_action: usize,
 }
 
 impl Arch {
@@ -70,7 +122,39 @@ impl Arch {
             width: 512,
             blocks: 5,
             value_hidden: 256,
+            kind: ArchKind::Mlp,
+            lanes: 0,
+            lane_obs: 0,
+            lane_action: 0,
         }
+    }
+
+    /// A lane-equivariant architecture for a configuration.
+    ///
+    /// The per-lane widths come from [`crate::encode::lane_structure`]'s published lengths,
+    /// never from arithmetic repeated here.
+    pub fn lane_for(config: &GameConfig, width: usize, blocks: usize, value_hidden: usize) -> Arch {
+        Arch {
+            obs_dim: obs_dim(config),
+            action_dim: action_dim(config),
+            width,
+            blocks,
+            value_hidden,
+            kind: ArchKind::Lane,
+            lanes: config.lanes,
+            lane_obs: crate::encode::lane_obs_len(config),
+            lane_action: crate::encode::lane_action_len(config),
+        }
+    }
+
+    /// Observation floats owned by no lane. Meaningless under [`ArchKind::Mlp`].
+    pub fn global_obs(&self) -> usize {
+        self.obs_dim - self.lanes * self.lane_obs
+    }
+
+    /// Policy logits owned by no lane. Meaningless under [`ArchKind::Mlp`].
+    pub fn global_action(&self) -> usize {
+        self.action_dim - self.lanes * self.lane_action
     }
 
     /// Every parameter tensor, in load order, as `(name, len)`.
@@ -79,6 +163,13 @@ impl Arch {
     /// field or dict ordering, so adding a tensor in the middle is a format change that the
     /// header records rather than a silent shift of every array after it.
     pub fn params(&self) -> Vec<(String, usize)> {
+        match self.kind {
+            ArchKind::Mlp => self.mlp_params(),
+            ArchKind::Lane => self.lane_params(),
+        }
+    }
+
+    fn mlp_params(&self) -> Vec<(String, usize)> {
         let (w, b) = (self.width, self.blocks);
         let mut out = vec![
             ("in.weight".to_string(), w * self.obs_dim),
@@ -105,6 +196,45 @@ impl Arch {
         out
     }
 
+    /// The lane-equivariant tensor list.
+    ///
+    /// Two things here are the architecture rather than bookkeeping. **`glob_in` has no
+    /// bias**: its output is added to every lane's, so a second bias would be the same
+    /// parameter twice and the two would only drift. **`fcm` is the mean-mixing matrix**,
+    /// the one term that lets lanes see each other — it reads the mean of the three
+    /// normalised lane states, which is permutation-invariant, so adding it keeps the block
+    /// exactly equivariant.
+    fn lane_params(&self) -> Vec<(String, usize)> {
+        let (w, b) = (self.width, self.blocks);
+        let mut out = vec![
+            ("lane_in.weight".to_string(), w * self.lane_obs),
+            ("lane_in.bias".to_string(), w),
+            ("glob_in.weight".to_string(), w * self.global_obs()),
+            ("ln_in.weight".to_string(), w),
+            ("ln_in.bias".to_string(), w),
+        ];
+        for i in 0..b {
+            out.push((format!("block{i}.ln.weight"), w));
+            out.push((format!("block{i}.ln.bias"), w));
+            out.push((format!("block{i}.fc1.weight"), w * w));
+            out.push((format!("block{i}.fcm.weight"), w * w));
+            out.push((format!("block{i}.fc1.bias"), w));
+            out.push((format!("block{i}.fc2.weight"), w * w));
+            out.push((format!("block{i}.fc2.bias"), w));
+        }
+        out.push(("ln_out.weight".to_string(), w));
+        out.push(("ln_out.bias".to_string(), w));
+        out.push(("policy_lane.weight".to_string(), self.lane_action * w));
+        out.push(("policy_lane.bias".to_string(), self.lane_action));
+        out.push(("policy_glob.weight".to_string(), self.global_action() * w));
+        out.push(("policy_glob.bias".to_string(), self.global_action()));
+        out.push(("value1.weight".to_string(), self.value_hidden * w));
+        out.push(("value1.bias".to_string(), self.value_hidden));
+        out.push(("value2.weight".to_string(), self.value_hidden));
+        out.push(("value2.bias".to_string(), 1));
+        out
+    }
+
     pub fn param_count(&self) -> usize {
         self.params().iter().map(|(_, n)| n).sum()
     }
@@ -118,6 +248,21 @@ impl Arch {
         ] {
             if value == 0 {
                 return Err(format!("{name} must be positive"));
+            }
+        }
+        if self.kind == ArchKind::Lane {
+            for (name, value) in
+                [("lanes", self.lanes), ("lane_obs", self.lane_obs), ("lane_action", self.lane_action)]
+            {
+                if value == 0 {
+                    return Err(format!("a lane-equivariant checkpoint needs a positive {name}"));
+                }
+            }
+            if self.lanes * self.lane_obs > self.obs_dim {
+                return Err("lanes × lane_obs exceeds obs_dim".into());
+            }
+            if self.lanes * self.lane_action > self.action_dim {
+                return Err("lanes × lane_action exceeds action_dim".into());
             }
         }
         Ok(())
@@ -223,6 +368,16 @@ impl Weights {
         let _ = writeln!(s, "width={}", arch.width);
         let _ = writeln!(s, "blocks={}", arch.blocks);
         let _ = writeln!(s, "value_hidden={}", arch.value_hidden);
+        // Appended after the original five, and read back as optional: a checkpoint written
+        // before this field existed has no `arch` line and must still load as `mlp`. That is
+        // what keeps gen016, gen022 and gen031 playable — `CLAUDE.md`'s "all three still
+        // load" is a promise, and a version bump would break it for no gain.
+        let _ = writeln!(s, "arch={}", arch.kind.as_str());
+        if arch.kind == ArchKind::Lane {
+            let _ = writeln!(s, "lanes={}", arch.lanes);
+            let _ = writeln!(s, "lane_obs={}", arch.lane_obs);
+            let _ = writeln!(s, "lane_action={}", arch.lane_action);
+        }
         let _ = writeln!(s, "obs_layout_hash={:016x}", obs_layout_hash(config));
         let _ = writeln!(s, "action_layout_hash={:016x}", action_layout_hash(config));
         let _ = writeln!(s, "param_order={}", names.join(","));
@@ -285,18 +440,51 @@ impl Weights {
                 .map_err(|_| format!("header `{key}` is not a number"))
         };
 
+        // Optional, and absent from every checkpoint written before `PLAN.md` §4.2b: those
+        // are the flat MLP, which is what `ArchKind::default()` is.
+        let opt_num = |key: &str| -> Result<usize, String> {
+            match fields.iter().find(|(k, _)| *k == key) {
+                None => Ok(0),
+                Some((_, v)) => v
+                    .parse::<usize>()
+                    .map_err(|_| format!("header `{key}` is not a number")),
+            }
+        };
+        let kind = match fields.iter().find(|(k, _)| *k == "arch") {
+            None => ArchKind::Mlp,
+            Some((_, v)) => ArchKind::parse(v)
+                .ok_or_else(|| format!("header `arch={v}` is not one of `mlp`, `lane`"))?,
+        };
+
         let arch = Arch {
             obs_dim: num("obs_dim")?,
             action_dim: num("action_dim")?,
             width: num("width")?,
             blocks: num("blocks")?,
             value_hidden: num("value_hidden")?,
+            kind,
+            lanes: opt_num("lanes")?,
+            lane_obs: opt_num("lane_obs")?,
+            lane_action: opt_num("lane_action")?,
         };
         arch.validate()?;
 
         // --- the checks this format exists for ---------------------------------------
         expect(arch.obs_dim, obs_dim(config), "obs_dim")?;
         expect(arch.action_dim, action_dim(config), "action_dim")?;
+        if kind == ArchKind::Lane {
+            // The per-lane widths are a reading of the feature layout, so they get the same
+            // treatment `obs_dim` gets: checked against `encode`, not trusted. A checkpoint
+            // trained at a different `encoding_slots` would otherwise gather past the end of
+            // a lane's slice.
+            expect(arch.lanes, config.lanes, "lanes")?;
+            expect(arch.lane_obs, crate::encode::lane_obs_len(config), "lane_obs")?;
+            expect(
+                arch.lane_action,
+                crate::encode::lane_action_len(config),
+                "lane_action",
+            )?;
+        }
         expect_hash(get("obs_layout_hash")?, obs_layout_hash(config), "obs_layout_hash")?;
         expect_hash(
             get("action_layout_hash")?,
@@ -388,11 +576,19 @@ fn uniform(rng: &mut Rng) -> f32 {
 fn fan_in_of(name: &str, arch: &Arch, len: usize) -> usize {
     if name.starts_with("in.") {
         arch.obs_dim
-    } else if name.starts_with("policy.") || name.starts_with("value1.") {
+    } else if name.starts_with("lane_in.") {
+        arch.lane_obs
+    } else if name.starts_with("glob_in.") {
+        arch.global_obs()
+    } else if name.starts_with("policy.")
+        || name.starts_with("policy_lane.")
+        || name.starts_with("policy_glob.")
+        || name.starts_with("value1.")
+    {
         arch.width
     } else if name.starts_with("value2.") {
         arch.value_hidden
-    } else if name.contains("fc1") || name.contains("fc2") {
+    } else if name.contains("fc1") || name.contains("fc2") || name.contains("fcm") {
         arch.width
     } else {
         len.max(1)
@@ -420,6 +616,10 @@ mod tests {
         let arch = Arch {
             obs_dim: 16,
             action_dim: 8,
+            kind: ArchKind::Mlp,
+            lanes: 0,
+            lane_obs: 0,
+            lane_action: 0,
             width: 8,
             blocks: 2,
             value_hidden: 4,
@@ -435,6 +635,10 @@ mod tests {
         let arch = Arch {
             obs_dim: 16,
             action_dim: 8,
+            kind: ArchKind::Mlp,
+            lanes: 0,
+            lane_obs: 0,
+            lane_action: 0,
             width: 8,
             blocks: 1,
             value_hidden: 4,
@@ -450,13 +654,8 @@ mod tests {
     #[test]
     fn a_truncated_checkpoint_is_rejected_rather_than_read_as_garbage() {
         let config = GameConfig::default();
-        let arch = Arch {
-            obs_dim: obs_dim(&config),
-            action_dim: action_dim(&config),
-            width: 4,
-            blocks: 1,
-            value_hidden: 2,
-        };
+        let arch =
+            Arch { width: 4, blocks: 1, value_hidden: 2, ..Arch::default_for(&config) };
         let bytes = Weights::random(9, arch).to_bytes(&config);
         let short = &bytes[..bytes.len() - 8];
         assert!(Weights::from_bytes(short, &config)

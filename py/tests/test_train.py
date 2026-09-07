@@ -779,3 +779,62 @@ def test_the_holdout_is_never_augmented(shard):
     for row in range(8):
         recorded = gen.obs_index[gen.obs_offset[row] : gen.obs_offset[row + 1]]
         assert np.array_equal(first["obs_cols"][first["obs_rows"] == row], recorded)
+
+
+# ================================================ the lane-equivariant architecture ==
+
+
+def test_lane_augmentation_is_a_no_op_on_the_lane_equivariant_network():
+    """**Why `configs/train-3h-new.toml` sets `lane_augment = false`.**
+
+    ``FINDINGS.md`` F4.5 bought +82 Elo with six-fold lane augmentation on the *flat*
+    network. On the equivariant one the same transform is not merely redundant, it is exactly
+    the identity on the loss: the network satisfies ``f(σ·x) = σ·f(x)``, so the cross-entropy
+    against ``σ·π`` is a sum over the same permuted pairs and the value target does not move
+    at all. Same loss, therefore same gradient — augmenting would cost a gather per row and
+    buy nothing.
+
+    Asserting it rather than reasoning about it, because "it should be equivalent" is how a
+    silently-broken augmentation survives: if this ever fails, the architecture is not
+    equivariant and the config's justification has evaporated.
+    """
+    torch = pytest.importorskip("torch")
+
+    from duel52.nn.model import NetConfig, build_net, lane_spec_for, spec_for
+    from duel52.train.buffer import LaneAugmenter
+
+    spec = spec_for("split", 21)
+    lanes = lane_spec_for("split", 21)
+    config = NetConfig.from_spec(spec, width=16, blocks=2, value_hidden=8, arch="lane")
+    torch.manual_seed(0)
+    model = build_net(config, lanes)
+
+    aug = LaneAugmenter.from_engine("split", 21)
+    rng = np.random.default_rng(0)
+    x = torch.zeros(4, spec["obs_dim"])
+    target = torch.zeros(4, spec["action_dim"])
+    for row in range(4):
+        cols = rng.choice(spec["obs_dim"], size=40, replace=False)
+        x[row, cols] = torch.rand(40)
+        picks = rng.choice(spec["action_dim"], size=5, replace=False)
+        target[row, picks] = torch.softmax(torch.rand(5), dim=0)
+    value = torch.tensor([0.3, -0.7, 1.0, -1.0])
+
+    def loss_for(obs, tgt):
+        model.zero_grad()
+        logits, predicted = model(obs)
+        loss = -(tgt * torch.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+        loss = loss + torch.nn.functional.mse_loss(predicted, value)
+        loss.backward()
+        grads = torch.cat([p.grad.reshape(-1) for p in model.parameters()])
+        return float(loss.detach()), grads
+
+    plain_loss, plain_grad = loss_for(x, target)
+    for sigma in range(aug.count):
+        moved_x = torch.zeros_like(x)
+        moved_t = torch.zeros_like(target)
+        moved_x[:, aug.obs[sigma]] = x
+        moved_t[:, aug.action[sigma]] = target
+        moved_loss, moved_grad = loss_for(moved_x, moved_t)
+        assert moved_loss == pytest.approx(plain_loss, abs=1e-5), f"permutation {sigma}"
+        assert torch.allclose(moved_grad, plain_grad, atol=1e-5), f"permutation {sigma}"

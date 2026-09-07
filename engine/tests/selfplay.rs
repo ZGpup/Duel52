@@ -29,11 +29,10 @@ fn test_checkpoint() -> PathBuf {
     PATH.get_or_init(|| {
         let config = GameConfig::default();
         let arch = duel52_engine::nn::Arch {
-            obs_dim: duel52_engine::encode::obs_dim(&config),
-            action_dim: duel52_engine::encode::action_dim(&config),
             width: 24,
             blocks: 2,
             value_hidden: 12,
+            ..duel52_engine::nn::Arch::default_for(&config)
         };
         let path = std::env::temp_dir().join(format!("duel52-selfplay-{}.d52nn", std::process::id()));
         duel52_engine::nn::Weights::random(20260904, arch)
@@ -476,4 +475,73 @@ fn phase3_a_version_one_shard_is_refused_with_a_reason() {
     let err = selfplay::Shard::read(&downgraded).expect_err("version 1 must be refused");
     assert!(err.contains("version 1"), "unexpected error: {err}");
     assert!(err.contains("F3.6"), "the error should point at the finding: {err}");
+}
+
+// ======================================================= playout cap randomisation ==
+
+/// **The guard on `PLAN.md` §4.2c.** A capped decision must carry a value target and **no**
+/// policy target — that asymmetry is the entire economic argument for the technique, and
+/// getting it backwards costs nothing visible: the run would simply train the policy head on
+/// 32-simulation noise and look like a bad learning rate.
+///
+/// Checked on the replayed `TrainingSet` rather than on the shard, because that is the thing
+/// the trainer actually reads.
+#[test]
+fn phase4_capped_samples_carry_a_value_target_and_no_policy_target() {
+    let sp = SelfPlayConfig {
+        sims: 24,
+        cap_sims: 4,
+        full_search_fraction: 0.5,
+        temperature_decisions: 6,
+        ..SelfPlayConfig::default()
+    };
+    let out = std::env::temp_dir().join(format!("duel52-pcr-{}.d52sp", std::process::id()));
+    selfplay::run(GameConfig::default(), &sp, &test_checkpoint(), 7, 12, 1, 0, &out, false)
+        .expect("self-play should write a shard");
+
+    let shard = selfplay::Shard::read(&out).expect("read the shard back");
+    let set = selfplay::replay(&shard, 1, 1);
+    assert_eq!(set.policy_target.len(), set.samples, "one flag per sample");
+
+    let (mut full, mut capped) = (0, 0);
+    for i in 0..set.samples {
+        let entries = set.policy_offset[i + 1] - set.policy_offset[i];
+        if set.policy_target[i] == 1 {
+            full += 1;
+            assert!(entries > 0, "sample {i} is a policy target but has no policy entries");
+        } else {
+            capped += 1;
+            assert_eq!(entries, 0, "sample {i} is capped but carries {entries} policy entries");
+        }
+        // Either way it is a value target: this is the half that does not depend on search.
+        assert!(set.value[i].abs() <= 1.0, "sample {i} has no usable value target");
+    }
+    assert!(full > 0 && capped > 0, "expected a mix at 0.5, got {full} full and {capped} capped");
+
+    // Roughly the configured fraction. Wide, because 12 games is a small sample and this is
+    // checking that the knob is connected, not that the RNG is uniform.
+    let share = full as f64 / (full + capped) as f64;
+    assert!((0.3..0.7).contains(&share), "full-search share {share:.3} is not near 0.5");
+}
+
+/// Playout cap randomisation must not cost reproducibility: which decisions get the full
+/// budget is drawn from its own stream, so the same seed still plays the same games.
+#[test]
+fn phase4_playout_cap_randomisation_is_still_deterministic() {
+    let sp = SelfPlayConfig {
+        sims: 16,
+        cap_sims: 4,
+        full_search_fraction: 0.4,
+        temperature_decisions: 6,
+        ..SelfPlayConfig::default()
+    };
+    let one = selfplay::play_game(GameConfig::default(), &sp, &test_checkpoint(), 99);
+    let two = selfplay::play_game(GameConfig::default(), &sp, &test_checkpoint(), 99);
+    assert_eq!(one.outcome, two.outcome);
+    assert_eq!(one.samples.len(), two.samples.len());
+    for (a, b) in one.samples.iter().zip(&two.samples) {
+        assert_eq!(a.chosen, b.chosen);
+        assert_eq!(a.policy_target, b.policy_target);
+        assert_eq!(a.policy, b.policy);
+    }
 }

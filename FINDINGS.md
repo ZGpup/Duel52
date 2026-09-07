@@ -302,6 +302,105 @@ about that distinction since the first flip-timing curve and should stay careful
 These are findings about the instrument rather than the game, kept because they decide what to
 do next.
 
+### F4.6: building the lane symmetry into the architecture closes it completely, and playout cap randomisation pays for the cost
+
+`runs/sixth`, `configs/train-3h-new.toml`, split, `encoding_slots = 21`, `run.seed = 5000000`
+so the games span seeds **5,001,400–5,019,600** (1,400 a generation), 13 generations over
+**4.69 hours** on the 8-core laptop, from a random init. Two changes together, for a reason
+given below.
+
+**The symmetry result is unambiguous.** F4.5 got a long way with data augmentation and said
+plainly that it could not finish the job: "nothing in the architecture enforces the symmetry,
+so a data augmentation cannot close the last of it." The lane-equivariant network
+(`PLAN.md` §4.2b) shares one set of weights across the three lanes and lets them interact only
+through their mean, so no parameter is indexed by a lane at all:
+
+| 128 pairs | gen022 | gen031 (augmented) | **runs/sixth gen013** | equivariant |
+|---|---:|---:|---:|---:|
+| opening prior on lane 1 / 2 / 3 | .320 / .277 / .403 | .328 / .331 / .341 | **.333 / .333 / .333** | .333 each |
+| value-head spread (median / max) | 0.068 / 0.178 | 0.034 / 0.088 | **0.000 / 0.000** | 0 |
+| policy TV between lane pairs (median / max) | 0.152 / 0.362 | 0.039 / 0.103 | **0.000 / 0.000** | 0 |
+| top second action agrees across all three lanes | 82/128 | 114/128 | **128/128** | 128/128 |
+
+⚠️ **These zeros are not a training result and must not be read as one.** They hold on a
+*random init*, before any gradient step, and they held unchanged after 13 generations. The
+architecture cannot represent a lane preference, so this row stops being a measurement and
+becomes an assertion the build checks
+(`engine/tests/encoding.rs::phase4_the_lane_network_is_exactly_equivariant`). The corollary is
+that F4.5's `lane_augment` is now an exact no-op: on an equivariant network a relabelled sample
+gives the identical loss *and* the identical gradient, so F4.5's +82 Elo does not carry over
+and `train-3h-new.toml` sets `lane_augment = false`.
+
+**Strength, honestly.** `runs/sixth` generation 13 against gen031, both at 256 simulations, 300
+games, seed 1: **0.3233 ± 0.0527 (W96 L202 D2), which is −128 Elo.** From scratch in 4.69 hours
+against an agent that is the product of three chained runs. That is a good result for the time
+spent and it is **not** a stronger agent; nothing was shipped to `models/`.
+
+⚠️ The run's own `gen031` reference column reached **0.515**, and that number is a trap. The
+panel scores gen031 at **@64** against the candidate's @256 — a deliberate 4:1 search handicap,
+because a from-scratch net would otherwise read 0.00 for most of the run. F3.8 and F4.4 price
+64 → 256 at ~+141 Elo, which is very close to the 128 measured here. Read the slope of that
+column, never its level.
+
+**Playout cap randomisation** (`PLAN.md` §4.2c) is what made the architecture affordable. A
+value target is the game's outcome and costs nothing extra however little search produced the
+position; a policy target is the visit distribution and is worthless if the visits are few. So
+25% of decisions got 256 simulations and a policy target and 75% got 32 and a value target
+only. Measured on 40 games at 256 sims:
+
+| network | games/sec | vs gen031 |
+|---|---:|---:|
+| flat `128x3` (gen031), no capping | 2.0 | 1.00x |
+| lane `128x3` + capping | 2.0 | 1.00x |
+| lane `128x4` + capping | 1.7 | 0.85x |
+| lane `128x6` + capping | 1.2 | 0.60x |
+| lane `128x6`, no capping | 0.5 | 0.25x |
+
+The equivariant trunk runs once per lane and costs ~4x the flat one uncapped; capping hands
+almost exactly that back. **This is why the two changes share a run** and why the usual
+one-change-per-run rule was broken: separately, the first is a run with fewer generations and
+the second is a run whose only change is a speed-up.
+
+The fraction was chosen by measurement, not taste. At a fixed self-play budget the games
+capping buys back partly replace the policy targets it costs:
+
+| `full_search_fraction` | games/sec | games | policy targets | outcomes |
+|---|---:|---:|---:|---:|
+| 0.25 | 2.0 | 1400 | ~21,000 | **1400** |
+| 0.40 | 1.4 | 980 | ~24,000 | 980 |
+
+Nearly the same policy targets, 43% more outcomes — and outcomes are the scarce half.
+
+**Learning speed.** Beat `greedy` (0.98) at **generation 3**. `runs/third`, the only other
+from-scratch run, needed seven. 13 of 13 candidates promoted, zero refusals.
+
+**⚠️ The learning-rate schedule was the binding constraint for three generations, and this is
+the same mistake `PLAN.md` §4.2 change 5 already records.** The tiers were keyed to the 7–8
+generations three hours buys; the run was extended to 4.69 hours, so a sixteenth rate from
+generation 6 was decaying on a clock that no longer existed:
+
+| generations | lr | Δ on the gen031 column |
+|---|---:|---:|
+| 6–8 (throttled) | 1.25e-4 | +0.055 over 3 |
+| 9–11 (re-keyed) | 5.0e-4 | +0.180 over 3 |
+
+Training loss fell monotonically throughout, so the flat stretch was the rate and not the data.
+Moving one boundary tripled the slope. **`configs/train-big.toml`'s schedule is keyed to 50
+generations it may well not reach**, and this is the cheapest mistake on the list to avoid.
+
+**⚠️ The held-out set is broken for a from-scratch run, and this is the most important
+operational finding here.** Held-out value MSE rose monotonically 0.723 → **1.002** while
+training value loss fell 0.780 → 0.469 and external strength climbed the whole way. At 1.002 a
+head that always predicted zero would score the same, so the number is noise. The cause is
+structural: `holdout_samples` is carved from **generation 1**, which a from-scratch run plays
+with a random-init network, and the agent leaves that distribution within a few generations.
+`runs/fourth` and `runs/fifth` never saw it because they were warm-started and their generation
+1 was already strong play.
+
+So this run had **no trustworthy internal diagnostic** and was steered entirely on the gate and
+the reference panel. `train-big` is also from scratch and will hit the same wall. The holdout
+must be carved from a mid-run generation instead — `PLAN.md` §4.3 now says so.
+
 ### F4.5: lane relabelling is worth as much as uncapping the teacher
 
 Duel 52 is invariant under all six permutations of its three lanes. No rule names a lane,

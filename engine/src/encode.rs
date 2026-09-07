@@ -928,6 +928,145 @@ fn action_permutation(config: &GameConfig, sigma: &[usize]) -> Vec<u32> {
     map
 }
 
+// ===================================================================== lane structure ==
+
+/// Floats of the observation that belong to one lane: its board chunk plus its slice of
+/// `lane_counts`.
+pub fn lane_obs_len(config: &GameConfig) -> usize {
+    2 * config.encoding_slots * slot_features(config) + LANE_COUNT_FEATURES
+}
+
+/// Floats of the observation that belong to no lane: the scalar block minus `lane_counts`.
+pub fn global_obs_len(config: &GameConfig) -> usize {
+    obs_dim(config) - config.lanes * lane_obs_len(config)
+}
+
+/// Logits of the policy head that belong to one lane.
+pub fn lane_action_len(config: &GameConfig) -> usize {
+    let s = config.encoding_slots;
+    // PLAY(·, lane) + FLIP + ATTACK + PAIR + CHOOSE_SLOT on both sides.
+    config.rank_count() + s + s * s + pairs_per_lane(s) + 2 * s
+}
+
+/// Logits of the policy head that name no lane: `CHOOSE_RANK`.
+pub fn global_action_len(config: &GameConfig) -> usize {
+    config.rank_count()
+}
+
+/// The lane-structured partition of the observation and policy vectors.
+///
+/// `PLAN.md` §4.2b. [`lane_permutations`] says *how* a relabelling moves an index; this says
+/// **which lane owns it**, which is what an architecture needs in order to share one weight
+/// matrix across the three lanes instead of learning the symmetry from data. The two are the
+/// same reading of the same layout, and `phase4_lane_structure_agrees_with_the_permutations`
+/// checks them against each other rather than against a second transcription.
+///
+/// # The order within a lane is the contract
+///
+/// `lane_obs[l]` and `lane_action[l]` list lane `l`'s indices in an order that is *identical*
+/// for every `l` — position `k` of every list is the same feature of a different lane. That
+/// is what makes one shared matrix meaningful, and it is why these are index lists rather
+/// than ranges: the board is contiguous per lane but `PLAY` is strided (`rank * lanes + lane`)
+/// and `CHOOSE_SLOT` is two chunks, so no single range covers a lane.
+///
+/// # Why it is in Rust
+///
+/// `CLAUDE.md`: there is exactly one encoder and it owns the feature layout. This is a
+/// reading of that layout, so a copy derived in Python would be a second encoder in the only
+/// sense that matters. ⚠️ A wrong table does not crash: the network reads lane 2's board
+/// through lane 1's weights and comes out merely bad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneStructure {
+    /// `lane_obs[l]` — observation indices owned by lane `l`, [`lane_obs_len`] of them.
+    pub lane_obs: Vec<Vec<u32>>,
+    /// Observation indices owned by no lane, [`global_obs_len`] of them.
+    pub global_obs: Vec<u32>,
+    /// `lane_action[l]` — policy indices owned by lane `l`, [`lane_action_len`] of them.
+    pub lane_action: Vec<Vec<u32>>,
+    /// Policy indices owned by no lane, [`global_action_len`] of them.
+    pub global_action: Vec<u32>,
+}
+
+/// Which lane owns each observation float and each policy logit.
+///
+/// Panics if the four lists do not partition `0..obs_dim` and `0..action_dim` exactly. That
+/// is a build-time property of the layout rather than a runtime condition, and the failure it
+/// prevents — a feature reaching no weight, or a logit written twice — is silent.
+pub fn lane_structure(config: &GameConfig) -> LaneStructure {
+    let l = config.lanes;
+    let s = config.encoding_slots;
+    let r = config.rank_count();
+    let board_per_lane = 2 * s * slot_features(config);
+    let lane_counts = board_len(config) + scalar_offset(config, "lane_counts");
+    let o = Offsets::new(config);
+
+    let lane_obs: Vec<Vec<u32>> = (0..l)
+        .map(|lane| {
+            let mut idx = Vec::with_capacity(lane_obs_len(config));
+            let base = lane * board_per_lane;
+            idx.extend((0..board_per_lane).map(|k| (base + k) as u32));
+            let counts = lane_counts + lane * LANE_COUNT_FEATURES;
+            idx.extend((0..LANE_COUNT_FEATURES).map(|k| (counts + k) as u32));
+            idx
+        })
+        .collect();
+
+    // The scalar block, minus the `lane_counts` window the lists above claimed.
+    let scalars = board_len(config)..obs_dim(config);
+    let claimed = lane_counts..lane_counts + l * LANE_COUNT_FEATURES;
+    let global_obs: Vec<u32> = scalars.filter(|i| !claimed.contains(i)).map(|i| i as u32).collect();
+
+    let lane_action: Vec<Vec<u32>> = (0..l)
+        .map(|lane| {
+            let mut idx = Vec::with_capacity(lane_action_len(config));
+            // PLAY is strided: `rank * lanes + lane`.
+            idx.extend((0..r).map(|rank| (o.play + rank * l + lane) as u32));
+            idx.extend((0..s).map(|slot| (o.flip + lane * s + slot) as u32));
+            idx.extend((0..s * s).map(|k| (o.attack + lane * s * s + k) as u32));
+            let p = pairs_per_lane(s);
+            idx.extend((0..p).map(|k| (o.pair + lane * p + k) as u32));
+            // CHOOSE_SLOT is `(side * lanes + lane) * slots + slot` — lane-major per side.
+            for side in 0..2 {
+                let base = o.choose_slot + (side * l + lane) * s;
+                idx.extend((0..s).map(|slot| (base + slot) as u32));
+            }
+            idx
+        })
+        .collect();
+
+    let global_action: Vec<u32> = (o.choose_rank..o.total).map(|i| i as u32).collect();
+
+    let structure = LaneStructure { lane_obs, global_obs, lane_action, global_action };
+    structure.assert_partitions(config);
+    structure
+}
+
+impl LaneStructure {
+    /// Every index of both vectors is claimed exactly once.
+    fn assert_partitions(&self, config: &GameConfig) {
+        let check = |lists: &[&[u32]], total: usize, what: &str| {
+            let mut seen = vec![false; total];
+            for list in lists {
+                for &i in *list {
+                    let i = i as usize;
+                    assert!(i < total, "{what} index {i} is outside 0..{total}");
+                    assert!(!seen[i], "{what} index {i} is claimed twice");
+                    seen[i] = true;
+                }
+            }
+            if let Some(missing) = seen.iter().position(|&s| !s) {
+                panic!("{what} index {missing} is claimed by no lane and by no global list");
+            }
+        };
+        let mut obs: Vec<&[u32]> = self.lane_obs.iter().map(|v| v.as_slice()).collect();
+        obs.push(&self.global_obs);
+        check(&obs, obs_dim(config), "observation");
+        let mut action: Vec<&[u32]> = self.lane_action.iter().map(|v| v.as_slice()).collect();
+        action.push(&self.global_action);
+        check(&action, action_dim(config), "action");
+    }
+}
+
 // ======================================================================= layout hashes ==
 
 /// FNV-1a, 64-bit (Fowler–Noll–Vo, 1991). Chosen for the same reason [`crate::rng`] carries

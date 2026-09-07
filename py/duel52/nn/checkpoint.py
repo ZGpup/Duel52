@@ -53,7 +53,8 @@ __all__ = [
 CHECKPOINT_MAGIC = b"D52NN\0"
 CHECKPOINT_VERSION = 1
 
-#: Header keys, in the order they are written. Fixed so the file is byte-reproducible.
+#: Header keys every checkpoint has, in the order they are written. Fixed so the file is
+#: byte-reproducible, and **required on read** — a file missing one of these is malformed.
 HEADER_KEYS = (
     "obs_dim",
     "action_dim",
@@ -64,6 +65,15 @@ HEADER_KEYS = (
     "action_layout_hash",
     "param_order",
 )
+
+#: Keys added by ``PLAN.md`` §4.2b, written after ``value_hidden`` and read back as optional.
+#:
+#: ⚠️ Optional is the whole point. gen016, gen022 and gen031 were written before ``arch``
+#: existed, and ``CLAUDE.md``'s "all three still load" is a promise. A missing ``arch`` means
+#: ``mlp``; ``lanes``/``lane_obs``/``lane_action`` appear only for ``lane``. Bumping
+#: ``CHECKPOINT_VERSION`` would have been the obvious move and would have retired three
+#: shipped checkpoints for nothing.
+OPTIONAL_HEADER_KEYS = ("arch", "lanes", "lane_obs", "lane_action")
 
 
 @dataclass
@@ -79,6 +89,12 @@ class Checkpoint:
     action_layout_hash: str
     param_order: list[str]
     tensors: list[np.ndarray]
+    #: ``"mlp"`` or ``"lane"``. Defaults to ``"mlp"`` for checkpoints written before the key
+    #: existed — see :data:`OPTIONAL_HEADER_KEYS`.
+    arch: str = "mlp"
+    lanes: int = 0
+    lane_obs: int = 0
+    lane_action: int = 0
 
     def named(self) -> dict[str, np.ndarray]:
         return dict(zip(self.param_order, self.tensors))
@@ -116,18 +132,33 @@ def _header_text(
     obs_layout_hash: str,
     action_layout_hash: str,
     param_order: list[str],
+    arch: str = "mlp",
+    lanes: int = 0,
+    lane_obs: int = 0,
+    lane_action: int = 0,
 ) -> str:
-    values = {
+    """The header, in ``Weights::header_string``'s exact key order.
+
+    The order is not cosmetic: both sides write it and the file is byte-reproducible, so a
+    key in the wrong place is a diff in every checkpoint.
+    """
+    values: dict[str, Any] = {
         "obs_dim": obs_dim,
         "action_dim": action_dim,
         "width": width,
         "blocks": blocks,
         "value_hidden": value_hidden,
+        "arch": arch,
         "obs_layout_hash": obs_layout_hash,
         "action_layout_hash": action_layout_hash,
         "param_order": ",".join(param_order),
     }
-    return "".join(f"{key}={values[key]}\n" for key in HEADER_KEYS)
+    keys = ["obs_dim", "action_dim", "width", "blocks", "value_hidden", "arch"]
+    if arch == "lane":
+        values |= {"lanes": lanes, "lane_obs": lane_obs, "lane_action": lane_action}
+        keys += ["lanes", "lane_obs", "lane_action"]
+    keys += ["obs_layout_hash", "action_layout_hash", "param_order"]
+    return "".join(f"{key}={values[key]}\n" for key in keys)
 
 
 def write_checkpoint(
@@ -148,6 +179,7 @@ def write_checkpoint(
             f"the model has {len(tensors)} tensors but names {len(param_order)}"
         )
 
+    arch = getattr(model.config, "arch", "mlp")
     header = _header_text(
         obs_dim=model.config.obs_dim,
         action_dim=model.config.action_dim,
@@ -157,6 +189,12 @@ def write_checkpoint(
         obs_layout_hash=spec["obs_layout_hash"],
         action_layout_hash=spec["action_layout_hash"],
         param_order=param_order,
+        arch=arch,
+        # Read off the module's own layers rather than recomputed here: they are the widths
+        # the weights actually have, so a header and a payload cannot disagree.
+        lanes=getattr(model, "lanes", 0),
+        lane_obs=model.lane_in.in_features if arch == "lane" else 0,
+        lane_action=model.policy_lane.out_features if arch == "lane" else 0,
     ).encode("utf-8")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +246,13 @@ def read_checkpoint(path: str | Path, *, arch: dict[str, int] | None = None) -> 
     if missing:
         raise ValueError(f"{path}: header is missing {', '.join(missing)}")
 
+    arch = fields.get("arch", "mlp")
+    if arch not in ("mlp", "lane"):
+        raise ValueError(f"{path}: header arch={arch!r} is not one of 'mlp', 'lane'")
+    lanes = int(fields.get("lanes", 0))
+    lane_obs = int(fields.get("lane_obs", 0))
+    lane_action = int(fields.get("lane_action", 0))
+
     param_order = fields["param_order"].split(",")
     lengths = _tensor_lengths(
         param_order,
@@ -215,6 +260,10 @@ def read_checkpoint(path: str | Path, *, arch: dict[str, int] | None = None) -> 
         action_dim=int(fields["action_dim"]),
         width=int(fields["width"]),
         value_hidden=int(fields["value_hidden"]),
+        lane_obs=lane_obs,
+        global_obs=int(fields["obs_dim"]) - lanes * lane_obs,
+        lane_action=lane_action,
+        global_action=int(fields["action_dim"]) - lanes * lane_action,
     )
     payload = np.frombuffer(data, dtype="<f4", offset=header_end)
     if payload.size != sum(lengths):
@@ -238,6 +287,10 @@ def read_checkpoint(path: str | Path, *, arch: dict[str, int] | None = None) -> 
         obs_layout_hash=fields["obs_layout_hash"],
         action_layout_hash=fields["action_layout_hash"],
         param_order=param_order,
+        arch=arch,
+        lanes=lanes,
+        lane_obs=lane_obs,
+        lane_action=lane_action,
         tensors=tensors,
     )
 
@@ -249,6 +302,10 @@ def _tensor_lengths(
     action_dim: int,
     width: int,
     value_hidden: int,
+    lane_obs: int = 0,
+    global_obs: int = 0,
+    lane_action: int = 0,
+    global_action: int = 0,
 ) -> list[int]:
     """Length of each tensor, from its name and the architecture.
 
@@ -260,10 +317,22 @@ def _tensor_lengths(
     for name in param_order:
         if name == "in.weight":
             lengths.append(width * obs_dim)
+        elif name == "lane_in.weight":
+            lengths.append(width * lane_obs)
+        elif name == "glob_in.weight":
+            lengths.append(width * global_obs)
         elif name == "policy.weight":
             lengths.append(action_dim * width)
         elif name == "policy.bias":
             lengths.append(action_dim)
+        elif name == "policy_lane.weight":
+            lengths.append(lane_action * width)
+        elif name == "policy_lane.bias":
+            lengths.append(lane_action)
+        elif name == "policy_glob.weight":
+            lengths.append(global_action * width)
+        elif name == "policy_glob.bias":
+            lengths.append(global_action)
         elif name == "value1.weight":
             lengths.append(value_hidden * width)
         elif name == "value1.bias":
@@ -272,7 +341,7 @@ def _tensor_lengths(
             lengths.append(value_hidden)
         elif name == "value2.bias":
             lengths.append(1)
-        elif name.endswith((".fc1.weight", ".fc2.weight")):
+        elif name.endswith((".fc1.weight", ".fc2.weight", ".fcm.weight")):
             lengths.append(width * width)
         elif name.endswith((".weight", ".bias")):
             # Every remaining tensor is width-shaped: the input bias, the LayerNorm affines,
