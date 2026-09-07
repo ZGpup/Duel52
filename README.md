@@ -4,12 +4,9 @@ An engine and self-play agent for [Duel 52](https://www.juddmadden.com/duel52/in
 the two-player combat card game by Judd Madden and Nina Riddell that uses a standard 52
 card deck.
 
-It exists to answer two questions nobody has published an answer to. **What does optimal play
-actually look like**, and **is the game balanced**? As far as I can tell there is no existing
+It exists to answer two questions. **What does optimal play actually look like**, and **is the game balanced**? As far as I can tell there is no existing
 engine, bot, or strategy analysis for this game, so there is nothing to read and the only way
 to find out is to build a player strong enough to ask.
-
-The insight is the deliverable. The bot is the instrument.
 
 ## Try it
 
@@ -30,7 +27,7 @@ cargo build --release
 # Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
 # size of the observation, and the checkpoint refuses to load against any other value.
 ./target/release/duel52 play --encoding-slots 21 \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+    --opponent netmcts:models/duel52-split-gen031.d52nn@8192
 ```
 
 Every prompt names the rule it is applying, so if you think the engine is wrong you can point
@@ -39,9 +36,7 @@ watches a game play out action by action.
 
 Add `--hint` and the agent you are playing will show you the three moves it would consider
 before each of your decisions, best first — the share of its search each one got, and what it
-thinks your chances are after it. Useful for exactly one thing: make up your own mind, *then*
-look down. It reasons from your side of the table, so it cannot see anything you cannot, and
-it plays the same game whether hints are on or off.
+thinks your chances are after it.
 
 ```bash
 ./target/release/duel52 play --encoding-slots 21 --hint \
@@ -63,8 +58,7 @@ it plays the same game whether hints are on or off.
 
 `--hint 5` lists five instead of three, and `--hint-agent <agent>` asks somebody other than
 your opponent — a bigger budget than you are playing against, say, or anybody at all in a
-hotseat game. A hinted game is marked as such in `--record`, because it is a different kind
-of evidence from one you played on your own.
+hotseat game. 
 
 ## The game, briefly
 
@@ -76,19 +70,16 @@ Three properties make it interesting, and all three shape everything below:
 
 1. **Ten cards are removed unseen at setup**, so uncertainty about hidden cards never fully
    resolves, even at the end of the game.
-2. **Lane wins require an empty draw pile and an empty opposing hand**, so the entire draw
-   phase is positional. Nothing is decided until the deck runs dry.
-3. **Suits do not matter.** Rank is the whole of a card's identity.
+2. **Lane wins require an empty draw pile and an empty opposing hand**, so the draw
+   phase is somewhat positional. Nothing is decided until the deck runs dry.
+3. **The abilities are flexible rules.** The abilities of each of the cards could be changed without changing the core of the game, so there is room to adjust the balance if the agents show that the published powers are not balanced. 
 
 ## Status
 
-There is a trained agent in the repo and you can play it. The engine plays the full game to
-spec, with 332 Rust tests named after the rule sections they check, 94 Python tests, PyO3
-bindings, and a text CLI.
+There is a trained agent in the repo and you can play it.
 
 The AlphaZero style training loop runs end to end. There is exactly one encoder and it lives
-in Rust; a network is defined and trained in PyTorch, evaluated in Rust, and a test asserts
-the two forward passes compute the same function.
+in Rust; a network is defined and trained in PyTorch, evaluated in Rust.
 
 Three runs have gone through it, each on the same laptop, each warm started from the one
 before, and each changing exactly one thing:
@@ -108,20 +99,10 @@ agent pinned at zero:
 | `netmcts:gen022@256` | +91 | 13 | 0.628 |
 | `netmcts:gen016@256` | 0 | 0 | 0.500 |
 
-**gen016 is the floor because the hand-written ladder is saturated.** Five hand-written agents
+**gen016 is the floor of the elo system** Five hand-written agents
 (random, greedy, flat Monte Carlo, PIMC, information set MCTS) were the benchmark for two
 phases. gen031 beats the strongest of them 200 games to 0, and a rung that loses every game
 measures nothing about the winner.
-
-**Every number above is scored against agents written for this project.** The one external
-check is a human, and that series has now started. The owner beat gen016 five games out of
-five, unrecorded. Of the five games recorded since, against the two later agents, **the agent
-has won three**: 2-0 against the owner at gen022, and 1-2 at gen031.
-
-Five games is a pilot rather than a series, and they mix three search budgets. But the question
-the project set for itself was whether the agent could take a game off the one person who had
-played it, and it can. [PLAN.md](PLAN.md) has what is still owed, which is the diagnosis of the
-games it lost rather than the scoreline.
 
 What the agents have taught us about the game is in [FINDINGS.md](FINDINGS.md). That file is
 the point of the project.
@@ -142,11 +123,8 @@ disagree, which is the only place a strategy insight can come from.
 ./target/release/duel52 replay --record games/mine.jsonl --game 1 --node 34   # and the board
 ```
 
-A record is `(config, seed, chosen indices)` and nothing else. The engine is deterministic, so
-those three things replay the game exactly, including the hidden information and the ten cards
-removed unseen. A 158-node game is under a kilobyte, which is why the games are committed to
-the repo. Only finished games are written: a half-played game cannot be checked against an
-outcome, and that check is what makes an old record trustworthy.
+A record is `(config, seed, chosen indices)`. The engine is deterministic, so
+those three things replay the game exactly. 
 
 The walk prints one row per decision you made:
 
@@ -166,16 +144,6 @@ The checkpoint and search budget default to the agent that actually played the g
 scores the same game with a different net, which is how an old game becomes a permanent
 evaluation set for a new one.
 
-A game played under `--hint` is flagged `(hinted)` in the index and carries a warning above
-the table, because the second-opinion column then measures something else: the net's pick was
-already on the screen when the move was chosen, so agreeing with it says nothing about how
-the human plays unassisted.
-
-The footer counts the nodes where the value head was **confident and wrong**: `|v| > 0.6`,
-better than four to one, backing the side that went on to lose. A value head that is uncertain
-is behaving correctly. One that confidently backs a loser is the failure everything past the
-search horizon inherits.
-
 **`node`, `turn` and `round` are three different counters** and the replay prints two of them.
 A node is one decision offered to one player. A turn is one player's turn of three actions
 (two on the opening turn, four after an Ace). A round is both players' turns and nothing counts
@@ -187,16 +155,12 @@ per turn.
 [PLAN.md](PLAN.md) has the detail. In short, the next work is not a bigger training run:
 
 1. **Play and record a human series against gen031.** The only external measurement there is.
-2. **Turn the hand-size result from a correlation into a cause.** The agents hoard cards
-   through the whole draw phase and the side holding more at the seam is the side that wins.
-   If that is causal, the published win condition rewards stalling, which is a balance finding.
-3. **Measure lane commitment after the seam** rather than across the whole game.
-4. **Build a card value table.** Whether the thirteen powers are worth comparable amounts is
+2. **Build a card value table.** Whether the thirteen powers are worth comparable amounts is
    the balance question, and nothing answers it yet.
-5. **First-player advantage across all three variants**, which costs a training run per
+3. **First-player advantage across all three variants**, which costs a training run per
    variant because the observation layout is per-variant.
-6. **Exploitability**, so that "optimal" is a word the project is allowed to use.
-7. **The long from-scratch run on rented cores**, last, because it answers none of the above.
+4. **Exploitability**, so that "optimal" is a word the project is allowed to use.
+5. **The long from-scratch run on rented cores**, last, because it answers none of the above.
 
 ## Docs
 
@@ -233,9 +197,6 @@ claim tagged as either published, resolved by a player, or inferred and pending 
 It also specifies the red and black split deck variant common among regular players, which is
 the default configuration here because symmetric material makes results much cleaner to
 measure.
-
-One ruling is worth knowing before you play: **actions are mandatory and there is no pass.**
-The published rules say "take three actions" and stop, so a player who can act must act.
 
 ## License
 
