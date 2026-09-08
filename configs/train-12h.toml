@@ -1,0 +1,289 @@
+# Phase 4's rented-core run at **12 hours** — PLAN.md §4.3 (item 7), sized down from
+# `configs/train-big.toml`'s 24.
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-12h.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-12h.toml --run-dir runs/seventh
+#   .venv/bin/python -m duel52.train run --config configs/train-12h.toml --run-dir runs/seventh --resume
+#
+# ⚠️ **Three numbers here are Stage-1 measurements on the box, not constants**, and they are
+# marked `[STAGE 1]` where they appear: `net.blocks`, `selfplay.games` and
+# `train.lr_schedule`. Ten minutes of measurement sets all three; starting without it is how
+# `runs/sixth` lost three generations to a schedule keyed to a length it outgrew
+# (FINDINGS.md F4.6).
+#
+# ## What halving the budget changes
+#
+# `train-big.toml` is 15,000 games a generation, which at 24 hours is the 40–50 generation band
+# PLAN.md §4.3 asks for. At 12 hours the same number buys ~20 generations, and 20 generations
+# from a random init is `runs/sixth` with bigger shards — the run would spend its budget making
+# each generation more precise rather than taking more of them, which is the wrong trade for a
+# from-scratch AlphaZero loop that has never once plateaued. So the generation is **smaller and
+# there are more of them**: 8,000 games and ~40 generations at the middle throughput estimate.
+#
+# ## The measured cost model behind the numbers
+#
+# Laptop rates (8-core M2, 4P+4E), from FINDINGS.md F4.6 and one measurement made for this
+# config (40 mirror games in 62 s on `runs/sixth`'s gen013):
+#
+#   self-play, lane 128x3 + capping @256      2.0 games/sec
+#   self-play, lane 128x4 + capping           1.7
+#   self-play, lane 128x6 + capping           1.2
+#   mirror match @256, uncapped, lane 128x3   0.6      <- the gate's rate, ~3.3x a self-play game
+#
+# The gate is uncapped and therefore **3.3x the cost of a self-play game**, which is the number
+# that decides how big a generation has to be to be worth its overhead. In `runs/sixth` self-play
+# was only **53%** of the wall clock, because a 1,400-game generation was gated by 300 mirror
+# games plus a panel. At 8,000 games it is ~55–60%, at 15,000 ~65–70%. Below ~6,000 the run is
+# mostly evaluating itself.
+#
+# Scaling to the box is a single factor `K` = box games/sec ÷ laptop games/sec. `train-big.toml`
+# assumed `K = cores/8`, i.e. 8 for a 64-core box. That is the middle of an honest range of
+# **6–12**, for two reasons the old formula does not carry:
+#
+#   * the laptop's 8 cores are 4 performance + 4 efficiency, and the 40-game mirror match above
+#     ran at 6.0 core-seconds per wall second, so the baseline is nearer 4.5 fast cores than 8;
+#   * `vCPU` usually means a hyperthread. A 64-vCPU instance is often 32 physical cores, and SMT
+#     is worth ~20–40% on this workload, not 2x.
+#
+# And one thing that does *not* help: `-C target-cpu=native` buys close to nothing here.
+# `nn::mlp::matvec` is a strictly ordered scalar f32 accumulation — the order is a contract with
+# the PyTorch side's parity test — so LLVM may not reassociate it and AVX-512 cannot vectorise
+# it. This is a **scalar, clock-bound** workload. Prefer a box with fewer, faster cores over more
+# slow ones, and do not pay for AVX-512.
+
+[game]
+variant = "split"
+encoding_slots = 21               # FINDINGS.md F3.1; also what fixes obs_dim
+stalemate_value = 0.0             # FINDINGS.md F3.6
+
+[net]
+# **The lane-equivariant network** — PLAN.md §4.2b, FINDINGS.md F4.6. The trunk runs once per
+# lane with one shared set of weights and the lanes interact only through their mean, so a lane
+# preference is unrepresentable rather than merely small: policy TV 0.000 and agreement 128/128
+# on a random init, against gen031's augmented 0.039 and 114/128.
+arch = "lane"
+
+# `[STAGE 1]` **`blocks` is a measurement.** Depth is the whole cost on this architecture: the
+# input layer walks only the observation's ~205 non-zeros and the policy head is masked to ~21
+# legal logits, so the trunk — which now runs three times per position — is what self-play pays
+# for. Measured on the laptop, capping on: 3 blocks 1.00x, 4 blocks 0.85x, 6 blocks 0.60x.
+#
+# **4, not `train-big.toml`'s 6, and this is the one place the 12-hour budget changes the
+# answer.** 6 blocks costs 40% of the generations and there is no evidence yet that 3 was
+# capacity-bound: `runs/sixth` promoted 13 of 13 with the training loss falling monotonically
+# and external strength climbing the whole way. Depth buys nothing a run never gets far enough
+# to need. 4 costs 15% and is the hedge; `train-big.toml`'s 6 is right at 24 hours and wrong
+# here unless Stage 1 finds the box faster than `K = 8`.
+#
+# Prefer depth to width if Stage 1 leaves room: width costs the trunk quadratically and the
+# trunk is already tripled.
+width = 128
+blocks = 4
+value_hidden = 128
+
+[selfplay]
+# `[STAGE 1]` **Re-derive from the box's measured throughput.** 8,000 is what `K = 8` and
+# 4 blocks make an ~18-minute generation, which is ~40 generations in 12 hours — 3x
+# `runs/sixth`'s generation count and 17x its games. The rule to re-derive with:
+#
+#   games ≈ (target generation seconds − 600) × 2.0 × K × trunk_factor
+#
+# where the 600 s is the gate, the panel, the fit and the shard replay, and `trunk_factor` is
+# 1.00 / 0.85 / 0.60 for 3 / 4 / 6 blocks. Keep the answer in the 6,000–12,000 band: below it
+# the run spends more than half its clock evaluating itself, above it the generation count
+# falls back to `train-big.toml`'s and the extra precision is not what is scarce.
+games = 8000
+
+# PLAN.md §4.2 change 3. The policy target is the visit distribution, so training at 64 sims
+# teaches the network to imitate a search ~370 Elo weaker than the same weights produce at 4096
+# (F3.8). 256 rather than 1024 because 64 → 256 is the cheapest large gain (+141 Elo) and the
+# return per 4x halves above 1024.
+sims = 256
+c_puct = 1.25
+
+# **Playout cap randomisation** — PLAN.md §4.2c, FINDINGS.md F4.6. A quarter of decisions get
+# the full 256 and a policy target; the rest get 32 and a value target only, which costs nothing
+# extra because one game has one outcome however little search produced the position. Measured
+# 2.9x cheaper search, and it is what makes the equivariant trunk affordable at all. 0.25 rather
+# than 0.40 was measured: nearly the same policy targets, 43% more outcomes, and outcomes are
+# the scarce half.
+full_search_fraction = 0.25
+cap_sims = 32
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+# "auto" resolves to CUDA if the box has a GPU and CPU otherwise, and **CPU is fine**: F3.11
+# measured the gradient step at 1.4x faster on a GPU than on eight CPU cores, against self-play
+# at the great majority of the loop. Rent cores. `run.threads` matters more than this string.
+device = "auto"
+batch_size = 1024
+
+# ⚠️ **Epochs, not a fixed step count, and this is a correction to `train-big.toml`.** That file
+# sets `steps_per_generation = 2800`, which `train check` reports as **3.0 epochs at generation
+# 1** — three passes over a single shard from a random init, which is within a hair of the four
+# passes over a quarter-full buffer that made generation 1 of `runs/fourth` memorise its shard
+# (`loop.py`, `TrainSettings.epochs_per_generation`). A fixed step count is a different number
+# of passes every time the buffer window is a different size, and the window ramps for the first
+# `buffer_generations`.
+#
+# 0.5 is `train-big.toml`'s own target ratio expressed so it holds at every buffer size: it
+# wants 2.8 sample-presentations per new sample, and at 6 generations in the window
+# 2.8 ÷ 6 ≈ 0.47. The second virtue is that it survives `selfplay.games` being re-derived by
+# Stage 1 without anything else having to move.
+epochs_per_generation = 0.5
+steps_per_generation = 1500       # the fallback if `epochs_per_generation` is ever set to 0
+
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# `[STAGE 1]` **Key these to the generations the run will actually finish**, from Stage 1's
+# measured generation time — not to the backstop in `[run]`. The rule is full rate to 40% of the
+# run, a quarter to 75%, a sixteenth after; the numbers below are that rule at 40 generations.
+#
+# FINDINGS.md F4.6 is the clearest price on getting it wrong in the *early* direction:
+# `runs/sixth`'s tiers were keyed to the 7–8 generations three hours buys, the run was extended
+# to 13, and generations 6–8 crawled at a sixteenth rate while the training loss was still
+# falling monotonically — +0.055 on the reference column against +0.180 for the three
+# generations after the boundary was moved. Moving one number tripled the slope.
+#
+# The two errors are not symmetric, which is what decides the guess when Stage 1's estimate has
+# a spread. Keying too early throttles a run that is still learning, and it is measured at 3x.
+# Keying too late merely leaves the tail un-annealed. **So key to the high end of Stage 1's
+# range**, and re-key on `--resume` if the run beats its estimate — `runs/sixth` did exactly
+# that at generation 9 and `train.toml.used.from-gen009` is the record of it.
+#
+# Generation-indexed rather than step-indexed on purpose: `--resume` rebuilds the Trainer and an
+# optimiser step counter does not survive it, which on a preemptible box would silently restart
+# at full learning rate every time the instance is reclaimed.
+lr_schedule = [[0, 1.0], [16, 0.25], [30, 0.0625]]
+
+# 8,000 games is ~544,000 samples a generation after `sample_stride`, so six generations is
+# ~3.3M samples ≈ 4 GB at the 1.2 KB/sample `runs/sixth` measured. Comfortable anywhere.
+# **`buffer_samples` must be raised with `games`** or it silently truncates the window to a
+# fraction of one generation, which is invisible in the readout; 4.5M is 8,000 games with room
+# for Stage 1 to raise the count by a third.
+sample_stride = 2
+buffer_generations = 6
+buffer_samples = 4500000
+
+# PLAN.md §4.2 change 7. Search resolves the next few decisions and everything past its horizon
+# is the value head — and a Duel 52 game is ~140 decisions with the §7 seam at turn 25, so from
+# the mid-draw phase the thing deciding whether a hoard is worth it is far outside any tree. A
+# fixed holdout is what turns "the value head plateaued" from suggestive into testable, and the
+# value head is the half PLAN.md item 4's card-value table needs.
+holdout_samples = 50000
+
+# ⚠️ **Not generation 1** — FINDINGS.md F4.6's most important operational finding. A from-scratch
+# run plays generation 1 with a *random init*, and the agent leaves that distribution within a
+# few generations: in `runs/sixth` held-out value MSE rose monotonically 0.723 → 1.002 while the
+# training value loss fell 0.780 → 0.469 and external strength climbed throughout. At 1.002 a
+# head that always predicted zero scores the same, so the number had become noise and the run
+# was steered entirely on the gate and the panel.
+#
+# 10 rather than `train-big.toml`'s 8 because this run's generations are shorter and there are
+# more of them; 10 is ~25% in, by which point `runs/sixth`'s equivalent had long beaten `greedy`.
+#
+# ⚠️ **This narrows the window, it does not close it.** A holdout carved at generation 10 of a
+# 40-generation run is still 30 generations of distribution shift away by the end, so expect it
+# to drift again in the last third and read the gate and the panel when it does. The permanent
+# fix is PLAN.md item 1's fixed evaluation set built from `games/` — human positions with known
+# outcomes, which never go stale — and that is a separate piece of work, not this run's.
+holdout_generation = 10
+
+[gate]
+# PLAN.md §4.2 change 1. `check` prints the power: at 600 decisive games a true-0.500 candidate
+# passes 16% of the time (harmless — the new weights are as good as the old) and a true-0.540
+# candidate passes 84% (a refused improvement, and five in a row ends the run).
+games = 600
+threshold = 0.52
+min_decisive = 60
+
+# 256, matching the *peak* of `selfplay.sims` rather than its mean of 88. With capping on this
+# is a choice rather than a tautology: the gate decides whether a checkpoint is promoted, and
+# 256 is the budget the agent will be *played* at.
+sims = 256
+
+# A veto, never a target. The third row is the progress chart: rising monotonically means the
+# loop is working, and flat-or-falling while the mirror gate keeps passing is the exploitability
+# signature PLAN.md's tripwire 2 is looking for.
+#
+# ⚠️ **Read the third column's slope, never its level.** It scores gen031 at **@64** against the
+# candidate's @256 — a deliberate 4:1 search handicap, because a from-scratch net reads 0.00
+# against gen031@256 for many generations and a column pinned at zero says nothing. In
+# `runs/sixth` this row reached 0.515 while the honest equal-simulation match was
+# 0.3233 ± 0.0527, i.e. −128 Elo, and F3.8/F4.4 price 64 → 256 at ~+141 Elo, very nearly the
+# whole gap. **The run's real result is an equal-sims match against gen031, run at the end.**
+#
+# Do not add a gen031@256 row to this panel to get that number sooner. The panel is a veto
+# keyed to each row's high-water mark with no confidence interval, and a rising row measured at
+# 300 games near 0.5 has a standard error of 0.029 — so `reference_tolerance` below is under two
+# of them, the high-water mark is itself noise-inflated, and a row that plateaus mid-range would
+# false-veto often enough to trip `max_consecutive_refusals`. The honest number is free to get
+# another way: the checkpoints are on disk, so run the equal-sims match on the laptop against a
+# downloaded `genNNN.d52nn` while the box keeps working.
+reference = ["random", "greedy", "netmcts:models/duel52-split-gen031.d52nn@64"]
+reference_games = 300
+
+# A saturated row is re-run at 60 games, not 300: once a row's best-ever reaches 0.99 it has
+# stopped being a measurement and become a one-bit check — did the agent fall off a cliff — and
+# a bit does not need 300 games. Keyed to the high-water mark rather than to the opponent's
+# name, which matters for a from-scratch config specifically: in `runs/third` `greedy` read
+# 0.36 / 0.47 / 0.68 / 0.81 / 0.89 / 0.95 over seven generations, and trimming it by name would
+# have thrown that away.
+reference_games_saturated = 60
+reference_saturated_at = 0.99
+
+# ⚠️ **0.10, not `train-big.toml`'s 0.05, and this is the correction most likely to decide
+# whether the run finishes at all.** The veto fires when a row scores more than this below its
+# best-ever, with no confidence interval on either side (`loop.py`, `judge`) — and the best-ever
+# is the running maximum of noisy draws, so it is biased upward by roughly its own standard
+# error. At 300 games near 0.5 that error is 0.029, which makes 0.05 under two of them against
+# a target that has already drifted up.
+#
+# Simulated, 40 generations at 300 games, 40,000 trials, veto = observed < best_ever − tol:
+#
+#   trajectory of the gen031@64 row     tol 0.05                tol 0.10
+#   rising fast, 0.10 → 0.50            7.4% of gens,  0.4%     0.2%, 0.0%
+#   rising, 0.30 → 0.50                17.7% of gens,  6.0%     1.0%, 0.0%
+#   nearly flat mid-range at 0.50      29.2% of gens, 20.5%     2.5%, 0.1%
+#   plateaued at 0.60                  45.4% of gens, 52.1%     5.8%, 0.5%
+#
+# The second number in each pair is the chance of five consecutive refusals, which **ends the
+# run**. At 0.05 a run whose third row plateaus mid-range is a coin flip to be killed by its own
+# panel. `runs/sixth` escaped only because it was 13 generations and that row climbed the whole
+# way, and even so it came within 0.03 and 0.01 of the veto twice.
+#
+# The cost of widening is detection power on the *trimmed* rows, and `check` prices it: a fall
+# from 1.000 to 0.900 is caught 39% of the time rather than 86%. That is the right trade — a
+# 0.100 slip against `random` is a wobble, and F3.6's actual collapse, `random` 0.929 → 0.600,
+# is still caught 100% of the time at either setting. Widening also *lowers* the trimmed rows'
+# own false-veto rate, 2.98% → 0.02% of generations for a truly-0.995 row.
+reference_tolerance = 0.10
+
+max_consecutive_refusals = 5
+
+[run]
+generations = 60                  # a backstop; `hours` is what binds
+hours = 12
+
+# The loop advances the seed by `selfplay.games` each generation, so at 8,000 games and 60
+# generations this run spans 2,000,000–2,480,000. The other runs occupy 1,000,000–1,057,000,
+# 3,000,000–3,014,400, 4,000,000–4,019,200 and 5,000,000–5,019,600, so there is no collision
+# even if Stage 1 doubles `games`. A collision would silently re-deal games a net has already
+# trained on.
+seed = 2000000
+
+# `[STAGE 1]` **Set this from the box's measured flattening point.** 0 means every core, which
+# is right when the box is yours alone and wrong when it is shared or throttled. Measure 32 vs
+# 64 explicitly if the instance reports hyperthreads: self-play is statically sharded by game
+# (`selfplay.rs`, `games * t / threads`) with no work stealing, so oversubscribing costs a
+# ragged tail on every generation.
+threads = 0
+
+engine = "./target/release/duel52"

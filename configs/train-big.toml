@@ -121,7 +121,17 @@ batch_size = 1024
 # PLAN.md §4.3: keep the first run's ratio of sample-presentations to new samples
 # (1200 × 512 ÷ 220k ≈ 2.8). At 15,000 games that is 1.02M new samples a generation, so
 # 2.8 × 1.02M ÷ 1024 ≈ 2800 steps — about a minute. Fitting stays under 3% of the loop.
-steps_per_generation = 2800
+#
+# ⚠️ **Expressed as epochs, because a fixed step count is a different number of passes over
+# the data every time the buffer window is a different size — and the window ramps for the
+# first `buffer_generations`.** At `steps_per_generation = 2800` this config did **3.0 epochs
+# over a single random-init shard at generation 1** (`train check` prints it), which is within
+# a hair of the four passes over a quarter-full buffer that made generation 1 of `runs/fourth`
+# memorise its shard — see `TrainSettings.epochs_per_generation` in `py/duel52/train/config.py`.
+# 0.47 is the 2.8 ratio above at six generations in the window, and unlike the step count it
+# survives `selfplay.games` being re-derived from Stage 1 without anything else having to move.
+epochs_per_generation = 0.47
+steps_per_generation = 2800       # the fallback if `epochs_per_generation` is ever set to 0
 
 lr = 2.0e-3
 weight_decay = 1.0e-4
@@ -246,7 +256,32 @@ reference_games = 300
 reference_games_saturated = 60
 reference_saturated_at = 0.99
 
-reference_tolerance = 0.05
+# ⚠️ **0.10, and this is the correction most likely to decide whether the run finishes.** The
+# veto fires when a row scores more than this below its best-ever, with no confidence interval
+# on either side (`loop.py`, `judge`) — and the best-ever is a running maximum of noisy draws,
+# so it is itself biased upward by roughly its own standard error. At 300 games near 0.5 that
+# error is 0.029, which leaves 0.05 under two of them against a target that has already drifted.
+#
+# Simulated over 40 generations at 300 games, 40,000 trials, as P(veto per generation) and
+# P(five in a row, which **ends the run**):
+#
+#   gen031@64 row's trajectory        tol 0.05          tol 0.10
+#   rising fast, 0.10 -> 0.50         7.4%,  0.4%       0.2%, 0.0%
+#   rising, 0.30 -> 0.50             17.7%,  6.0%       1.0%, 0.0%
+#   nearly flat mid-range at 0.50    29.2%, 20.5%       2.5%, 0.1%
+#   plateaued at 0.60                45.4%, 52.1%       5.8%, 0.5%
+#
+# At 0.05 a run whose progress row plateaus mid-range is a coin flip to be killed by its own
+# panel. `runs/sixth` escaped only by being 13 generations with a row that climbed the whole
+# way, and even so it came within 0.03 and 0.01 of the veto twice. A 48-generation run spends
+# far longer in the flat part.
+#
+# The cost of widening is detection power on the *trimmed* rows, and `train check` prices it: a
+# fall from 1.000 to 0.900 is caught 39% of the time rather than 86%. That is the right trade —
+# a 0.100 slip against `random` is a wobble, and F3.6's actual collapse, `random` 0.929 -> 0.600,
+# is still caught 100% of the time either way. Widening also *lowers* the trimmed rows' own
+# false-veto rate, 2.98% -> 0.02% of generations for a truly-0.995 row.
+reference_tolerance = 0.10
 
 max_consecutive_refusals = 5
 

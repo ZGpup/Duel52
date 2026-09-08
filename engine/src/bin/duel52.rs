@@ -170,6 +170,14 @@ OPTIONS
   --out <file>                    where to write the .d52sp shard (required)
   --games <n>                     self-play games in this generation (default 1000)
   --sims <n>                      PUCT simulations per decision (default 128)
+  --full-search-fraction <f>      playout cap randomisation: the share of decisions given
+                                  the full --sims and a policy target. The rest get
+                                  --cap-sims and a value target only, which costs nothing
+                                  extra because one game has one outcome however little
+                                  search produced the position (default 1.0, capping off)
+  --cap-sims <n>                  simulations for a capped decision. Must be smaller than
+                                  --sims, and is ignored when --full-search-fraction is 1
+                                  (default 32)
   --c-puct <f>                    PUCT exploration constant (default 1.25)
   --dirichlet-alpha <f>           root noise concentration (default 0.3)
   --dirichlet-weight <f>          root noise share of the prior (default 0.25)
@@ -1442,6 +1450,12 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         None => "hotseat".to_string(),
         Some(spec) => format!("you are {} vs `{}`", opts.human, spec.name()),
     };
+    // Named on the frame the player waits in front of, so the wait says who it is on.
+    let bot_name = opts
+        .opponent
+        .as_ref()
+        .map(|spec| spec.name())
+        .unwrap_or_default();
     let redraws = !opts.no_clear && io::stdout().is_terminal();
     // Why the live highlight is off, if it is. Checked in the order the conditions are
     // imposed, and the last of them by *doing the thing* — entering character-at-a-time
@@ -1496,6 +1510,21 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
         if let (false, Some(bot)) = (human_turn, bot.as_mut()) {
             let legal = state.legal_actions();
+            // Your move is on the board *before* the bot starts thinking about it. The frame
+            // the human decision loop drew is the position they chose in; without this one,
+            // the action they just committed to is not drawn until the bot has answered,
+            // which at 4096 simulations is seconds spent looking at a stale board. Same
+            // guard as the advisor's thinking frame: under `--no-clear` a superseded frame
+            // is a whole board of noise in the transcript rather than a redraw.
+            if screen.clear {
+                let observer = if opts.reveal { None } else { Some(opts.human) };
+                screen.draw(
+                    &render(&state, observer),
+                    &format!("\n {bot_name} is thinking…\n"),
+                    observer,
+                    "",
+                );
+            }
             let action = bot.choose(&state, &legal);
             record_choice(&mut moves, &legal, action);
             screen.note(&state, format!("-- {acting} (bot): "), action);

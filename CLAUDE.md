@@ -13,6 +13,7 @@ the instrument.
 | `PLAN.md` | What is done, and in detail what is next and why. Update as items close. |
 | `FINDINGS.md` | Strategy insights as they emerge. This is the actual output of the project. |
 | `README.md` | The public front door, and where `duel52 replay` is documented. |
+| `RENTING.md` | How to rent a box and run `PLAN.md` item 7 on it, written for someone who has never rented one. Provider choice, the two ways to lose the run, and the Stage 1 measurements. |
 | `CLAUDE.md` | This file. Commands, architecture, and the traps. |
 | `archive/` | The superseded working docs, frozen 2026-09-05 and not maintained. |
 
@@ -58,10 +59,11 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 - **Config-driven, no hardcoded constants.** Variant selection, deck composition, removal
   count, draw rules, and stalemate threshold all live in config.
 - **Device-agnostic.** Code must run on MPS locally and CUDA on a rented box with no edits
-  beyond a config value. That is the handoff path — but note what it hands off: 87% of the
-  training loop is Rust self-play on CPU cores and 4% is gradient work, and the gradient step
-  is only 1.4× faster on a GPU than on eight CPU cores (`FINDINGS.md` F3.11). `run.threads`
-  matters more than `train.device`.
+  beyond a config value. That is the handoff path — but note what it hands off: **the gradient
+  step is 2–4% of the loop** and is only 1.4× faster on a GPU than on eight CPU cores
+  (`FINDINGS.md` F3.11), against 53–91% spent on Rust self-play and the gate. `run.threads`
+  matters more than `train.device`, and the ranges are measured — see "Training loop" below
+  for why they are ranges and not the single 87% this file used to quote.
 
 ## Working agreements
 
@@ -83,7 +85,7 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 334 tests: rules, determinism, information hiding,
+cargo test                               # 342 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, and
                                          # the training corpus
 
@@ -298,15 +300,24 @@ must match, because `encoding_slots` is what fixes `obs_dim`.
 
 Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
 `split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml`, `train-2h.toml`,
-`train-3h.toml` and `train-big.toml` are *training* configs rather than game configs — they
-carry the loop's knobs and set `encoding_slots = 21`, which every command in that run must
-agree on. `train-fast` is Phase 3's shakedown and produced gen016; `train-2h` is Phase 4 on a
-laptop and **warm-starts from gen016**, which is why its trunk is pinned to `128 × 3`;
-`train-3h` is Stage 0b, warm-starts from **gen022**, is the only config with
-`lane_augment = true` — its one experimental change — and produced gen031, the current
-default; `train-3h-new` is Stage 1, the only config with `arch = "lane"` and playout cap
-randomisation, and the only one that starts **from scratch** on a laptop; `train-big` is the
-24-hour rented-box run. `PLAN.md` §4.5 is the order to run them in.
+`train-3h.toml`, `train-3h-new.toml`, `train-12h.toml` and `train-big.toml` are *training*
+configs rather than game configs — they carry the loop's knobs and set `encoding_slots = 21`,
+which every command in that run must agree on. `train-fast` is Phase 3's shakedown and produced
+gen016; `train-2h` is Phase 4 on a laptop and **warm-starts from gen016**, which is why its
+trunk is pinned to `128 × 3`; `train-3h` is Stage 0b, warm-starts from **gen022**, is the only
+config with `lane_augment = true` — its one experimental change — and produced gen031, the
+current default; `train-3h-new` is Stage 1, the only config with `arch = "lane"` and playout cap
+randomisation, and the only one that starts **from scratch** on a laptop.
+
+`train-12h` and `train-big` are the two sizings of `PLAN.md` item 7, the rented-core run, and
+**`train-12h` is the one to reach for** — it is `train-big` at half the clock with three
+corrections that apply at either length, each documented against its number: a smaller
+generation (the gate is a fixed tax, so 15,000 games at 12 hours buys precision instead of
+generations), `epochs_per_generation` in place of a fixed step count (`train-big`'s 2,800 steps
+are 3.0 epochs over a single random-init shard at generation 1), and a wider
+`reference_tolerance` (0.05 gives a plateaued panel row up to a 52% chance of ending the run on
+five false refusals). `RENTING.md` is how to get the box. `PLAN.md` §4.5 is the order to run
+them in.
 
 **The three shipped checkpoints are one lineage, not a menu.** gen016 → gen022 → **gen031**,
 each warm-started from the one before it and each measured against it at equal simulations:
@@ -358,8 +369,25 @@ from the state it is handed.
 
 **Training loop.** Rust self-play writes `.d52sp` trajectory shards; Python replays them into a
 buffer, fits, and writes a `.d52nn` checkpoint; a gate promotes a candidate only when it beats
-the incumbent over enough games to have an interval. At 256 simulations a generation is about
-two-thirds self-play and one-third evaluation, and the gradient step is roughly 4%.
+the incumbent over enough games to have an interval.
+
+⚠️ **Self-play's share of a generation is a ratio you choose, not a constant of the loop.** This
+file used to quote 87%; that was measured on Phase 3's shape and stopped describing the current
+one when the gate grew and generations shrank. The mechanism is that **a gate game costs ~3.3× a
+self-play game** — the gate is uncapped net-vs-net at `gate.sims` while self-play is capped to a
+mean of 88 (measured 2026-09-07 on lane `128×3`: 0.6 games/sec against self-play's 2.0). So what
+sets the split is `selfplay.games` against `gate.games` + the panel, and every run so far:
+
+| run | self-play games | gate | panel | self-play share of wall clock |
+|---|---:|---:|---:|---:|
+| `first` / `second` / `third` (Phase 3) | 3,000 | 200 | 0–150 | 91% / 86% / 85% |
+| `fourth` / `fifth` (Phase 4, laptop) | 1,200 | 300 | 120 | 67% / 68% |
+| `sixth` (Stage 1, lane + capping) | 1,400 | 300 | 100 | **53%** |
+
+The gradient step is 2–4% throughout and has never been worth optimising — `runs/sixth` spent 30
+seconds of a 21-minute generation on it. **Size a generation so the gate is a tax and not a
+partner**: below ~6,000 self-play games at a 600-game gate the run spends more than half its
+clock evaluating itself. `configs/train-12h.toml` targets 55–60% and says how to re-derive it.
 
 **`duel52 replay`'s verbs**, since the board and the walk both use them:
 

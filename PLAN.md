@@ -348,9 +348,23 @@ needs a value head worth trusting, and the value head is the half that has plate
 run — which is also the half playout cap randomisation is aimed at, so 6b's value curve is
 the thing to look at hardest when this run finishes.
 
-Rent cores, not a GPU. 87 percent of the loop is Rust self play on CPU cores and 4 percent is
-gradient work, and the gradient step is only 1.4 times faster on a GPU than on eight CPU
-cores. `run.threads` matters more than `train.device`.
+Rent cores, not a GPU. The gradient step is 2 to 4 percent of the loop and only 1.4 times
+faster on a GPU than on eight CPU cores, so `run.threads` matters far more than
+`train.device`. `runs/sixth` spent thirty seconds of a twenty one minute generation on it.
+
+Everything else is Rust self play and the gate, and **the split between those two is a ratio
+this run sets rather than a constant of the loop.** An earlier draft of this paragraph said 87
+percent self play. That was correctly measured on Phase 3's shape — 3,000 self play games
+against a 200 game gate — and stopped describing anything once generations shrank to 1,200 and
+the gate grew to 300: the measured share runs from 91 percent in `runs/third` down to **53
+percent in `runs/sixth`**. The mechanism is that a gate game is uncapped and net against net
+while self play is capped to a mean of 88 simulations, so **a gate game costs about 3.3 times a
+self play game**. CLAUDE.md's Architecture section carries the per run table.
+
+The consequence for this item is a sizing rule rather than a fact: pick `selfplay.games` so the
+gate is a tax and not a partner. Below roughly 6,000 games against a 600 game gate the run
+spends more than half its wall clock evaluating itself, which is compute that buys precision on
+a number the gate only needs to get roughly right.
 
 ## Held in reserve
 
