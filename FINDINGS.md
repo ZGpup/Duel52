@@ -344,8 +344,38 @@ change worth 3.26x. And a batched kernel that accumulates into a slice of its ou
 runs at the *unbatched* speed (1.9 GMAC/s against 11.9), because the compiler cannot rule out
 aliasing with the weights; the accumulators have to be a fixed-size stack array.
 
-**What is not covered.** The gate and reference panel still evaluate one position at a time,
-and they are 47% of a `train-3h-new` generation, so the loop-level gain is nearer 1.8x.
+**The gate and panel were done next**, through the same machinery — `probe::MatchGame` is the
+state machine `selfplay::GameRunner` is, and `Agent::begin_decision` lets a `Box<dyn Agent>`
+opt in while every other agent decides inline. A match caps the gain in a way self-play does
+not: its two agents hold two different checkpoints, so each round's suspended games are grouped
+by the network they wait on, and a gate reaches about half self-play's batch.
+
+⚠️ **The gate's end-to-end speed-up is not recorded here because I did not measure it
+cleanly.** Two attempts were contaminated by test suites running on the same eight cores, and
+a third found the `batch_slots` bug below. The unbatched reference is solid — 300 games, two
+lane nets at 256 sims, 8 threads, **381.5 s** — and the identity is asserted by test rather
+than by benchmark, so nothing downstream depends on the missing number. It is worth taking
+properly on an idle machine before it is quoted anywhere.
+
+**Two bugs, both found by measuring rather than by reasoning, and both worth remembering.**
+
+*`min(games, batch)` is worse than not batching.* A worker with 37 games told to keep 32 in
+flight advances all 32 in lockstep — one simulation each per round, so they finish together —
+then drains the last 5 at a batch of 5 for a full game's length. On a 300-game gate that made
+`--eval-batch 32` **slower than `--eval-batch 1`**, at 295% CPU against 712%. `nn::batch_slots`
+spreads a worker's games over the fewest waves instead: 37 games at a batch of 32 runs 19 in
+flight. A smaller batch that stays whole beats a big one that collapses.
+
+*A batched match must absorb its games in game order.* Games finish out of order once several
+are in flight, and `AgentBehaviour::absorb` **pushes** each game's lane and attack concentration
+into a `Vec<f64>` whose mean `probe` reports — so absorbing them as they land shifts that mean's
+last bits and makes the probe tables irreproducible. The gate itself reads only integers and
+would never have shown it. `rule_2_the_ladder_is_eval_batch_independent` now compares the
+per-game f64s, and fails if the sort is removed — verified by removing it.
+
+**And a measurement trap that cost the first three benchmarks.** The batch is clamped by the
+games a worker owns, so a 100-game benchmark over 8 threads caps it at 12 and reports 1.13x for
+a change worth 3.26x. Size the benchmark before believing it.
 
 **The negative result alongside it.** Restricting self-play to the 4 performance cores is
 *slower*, not faster, despite `selfplay.rs` sharding statically with no work stealing: an
