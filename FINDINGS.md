@@ -3,7 +3,7 @@
 What we have actually learned about the game. **This file is the point of the project**; the
 engine and the agents are the instrument that produced it.
 
-Everything here is measured on the three trained agents. The five hand-written agents that
+Everything here is measured on the trained agents. The five hand-written agents that
 came before them (random, greedy, flat Monte Carlo, PIMC, information set MCTS) were the Elo
 benchmark for two phases and are no longer competitive enough to say anything about the game;
 what they measured is in `archive/FINDINGS.md`. `random` still appears in tables below, for one
@@ -39,29 +39,34 @@ Elo here is an internal coordinate. Every agent on it was written for this proje
 rating is a distance between two of our own agents and never an absolute.
 
 **The floor is `gen016`, the first trained agent**, and the ladder was re-anchored on it on
-2026-09-05. Round robin, `split`, `encoding_slots = 21`, 400 games per pairing, seeds from 1,
-1,200 games in 686 s on 8 cores:
+2026-09-05. Refitted 2026-09-09 with `lane-gen032` added — six pairings, `split`,
+`encoding_slots = 21`, 400 games per pairing, seeds from 1:
 
 | agent | Elo | +/- | expected vs. anchor |
 |---|---:|---:|---:|
-| `netmcts:gen031@256` | **+157** | 13 | 0.711 |
-| `netmcts:gen022@256` | +91 | 13 | 0.628 |
+| `netmcts:lane-gen032@256` | **+360** | 13 | 0.888 |
+| `netmcts:gen031@256` | +161 | 11 | 0.717 |
+| `netmcts:gen022@256` | +96 | 11 | 0.634 |
 | `netmcts:gen016@256` | 0 | 0 | 0.500 |
 
-The three pairings the fit is made of, at equal simulations:
+⚠️ **gen031 and gen022 moved by +4 and +5 from the three-agent fit** (+157, +91). Nothing about
+those agents changed: a Bradley–Terry fit is over the whole table at once, so adding a fourth
+agent re-conditions every rating. Quote a rating with the fit it came from, and never mix rows
+across two fits.
 
-| | score | W-L-D |
-|---|---:|---|
-| gen022 vs gen016 | 0.636 | 253-144-3 |
-| gen031 vs gen016 | 0.704 | 281-118-1 |
-| gen031 vs gen022 | 0.603 | 238-156-6 |
+**The last step, two ways.** The fit puts `lane-gen032 − gen031` at +199; measured directly at
+400 games it is **+167** (0.7238 ± 0.0436, W288 L109 D3). +199 lies inside the head-to-head
+interval, so they agree — but they are different estimators. The direct number is the better
+statement about *those two agents*; the fit is the better statement about the scale.
 
 ```bash
 ./target/release/duel52 ladder --games 400 --seed 1 --variant split \
   --encoding-slots 21 --stalemate-value 0.0 \
   --anchor netmcts:models/duel52-split-gen016.d52nn@256 \
   --agents netmcts:models/duel52-split-gen016.d52nn@256,\
-netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.d52nn@256
+netmcts:models/duel52-split-gen022.d52nn@256,\
+netmcts:models/duel52-split-gen031.d52nn@256,\
+netmcts:models/duel52-split-lane-gen032.d52nn@256
 ```
 
 ### Why the floor moved (F4.2, extended)

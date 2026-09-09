@@ -92,7 +92,7 @@ cargo test                               # 342 tests: rules, determinism, inform
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
 ./target/release/duel52 play --encoding-slots 21 \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@4096   # vs the strongest agent
+    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096  # vs the strongest agent
 ./target/release/duel52 play --opponent ismcts:2000        # vs the strongest hand-written rung
 ./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
 ./target/release/duel52 play --opponent human              # hotseat
@@ -112,7 +112,7 @@ cargo test                               # 342 tests: rules, determinism, inform
 # is flagged in `--record` and warned about in `replay`, because the "second opinion" column
 # there stops being evidence about the human once the answer was on screen while they chose.
 ./target/release/duel52 play --encoding-slots 21 --hint \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096
 
 # Record what you played, then ask the net about it (PLAN.md §4.0). A game is
 # (config, seed, chosen indices), so a 153-node game is 918 bytes and replays exactly —
@@ -120,7 +120,7 @@ cargo test                               # 342 tests: rules, determinism, inform
 # and replaying it" reads the output; get the node / turn / round distinction straight first.
 ./target/release/duel52 play --encoding-slots 21 --seed 101 \
     --record games/owner-vs-gen031.jsonl \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096
 ./target/release/duel52 replay --record games/owner-vs-gen031.jsonl            # the index
 ./target/release/duel52 replay --record games/owner-vs-gen031.jsonl --game 1   # walk it
 ./target/release/duel52 replay --record games/owner-vs-gen031.jsonl --game 1 --node 34
@@ -132,7 +132,7 @@ cargo test                               # 342 tests: rules, determinism, inform
 # Rating agents. Budgets are part of the agent name, so a result row names the agent that
 # produced it: random · greedy · flatmc:600 · pimc:32x1 · ismcts:800.
 #
-# ⚠️ THE HAND-WRITTEN LADDER IS RETIRED. gen031 beats ismcts:800, its top rung, 200-0, so a
+# ⚠️ THE HAND-WRITTEN LADDER IS RETIRED. gen031 beat ismcts:800, its top rung, 200-0, so a
 # fit that includes those rungs is an extrapolation off a handful of losses. The live scale is
 # the three trained agents with gen016 pinned at 0 (FINDINGS.md, "The scale"). `--anchor` is
 # what pins it, and it errors rather than falling back if the name is not in --agents, because
@@ -141,8 +141,10 @@ cargo test                               # 342 tests: rules, determinism, inform
     --encoding-slots 21 --stalemate-value 0.0 \
     --anchor netmcts:models/duel52-split-gen016.d52nn@256 \
     --agents netmcts:models/duel52-split-gen016.d52nn@256,\
-netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.d52nn@256
-# ~11 min. Drop --markdown to also get the per-pairing detail the fit was made of.
+netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.d52nn@256,\
+netmcts:models/duel52-split-lane-gen032.d52nn@256
+# ~25 min for four agents (six pairings). Drop --markdown for the per-pairing detail.
+# ⚠️ Do NOT add --eval-batch here: batching a match is a 7% regression (FINDINGS.md F4.8).
 ./target/release/duel52 match --a ismcts:800 --b pimc:32x1 --games 400
 # `--eval-batch N` works here too, and on `ladder` and `probe`. Same guarantee as self-play:
 # the batch is across games, so the score is identical and only arrives sooner. A gate splits
@@ -190,7 +192,7 @@ netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.
 
 # Phase 4 Stage 0b (PLAN.md §4.2a) — three hours, one experimental change: six exact lane
 # relabellings of every training sample. Warm-starts from gen022, which pins the trunk.
-# DONE 2026-09-05: FINDINGS.md F4.5, shipped as gen031, the current default agent.
+# DONE 2026-09-05: FINDINGS.md F4.5, shipped as gen031 — the default until lane-gen032.
 .venv/bin/python -m duel52.train check --config configs/train-3h.toml
 .venv/bin/python -m duel52.train run   --config configs/train-3h.toml --run-dir runs/fifth \
     --init-from models/duel52-split-gen022.d52nn
@@ -202,8 +204,8 @@ netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.
 .venv/bin/python -m duel52.lanes --checkpoint runs/fifth/checkpoints/gen001.d52nn
 ./target/release/duel52 match --a netmcts:models/duel52-split-gen031.d52nn@256 \
     --b netmcts:models/duel52-split-gen022.d52nn@256 --games 400 --encoding-slots 21
-# gen031 IS runs/fifth's generation 9, shipped, and it is the agent to play. gen022 is now
-# the frozen incumbent the next run gets scored against, in the role gen016 played for it.
+# gen031 IS runs/fifth's generation 9, shipped. It ended the flat lineage and is now the
+# agent lane-gen032 is measured against, in the role gen016 played for it.
 
 # Phase 4 Stage 1 (PLAN.md §4.2b, §4.2c) — three hours, from scratch, two changes:
 # the lane-equivariant network and playout cap randomisation. NOT a warm start, and it
@@ -357,14 +359,24 @@ must match, because `encoding_slots` is what fixes `obs_dim`.
 
 Configs live in `configs/`: `split.toml` (the default), `base.toml`, `mirrored.toml`, and
 `split-raw-two.toml` (the control for the §10a house rule). `train-fast.toml`, `train-2h.toml`,
-`train-3h.toml`, `train-3h-new.toml`, `train-12h.toml` and `train-big.toml` are *training*
+`train-3h.toml`, `train-3h-new.toml`, `train-7h.toml`, `train-12h.toml` and `train-big.toml`
+are *training*
 configs rather than game configs — they carry the loop's knobs and set `encoding_slots = 21`,
 which every command in that run must agree on. `train-fast` is Phase 3's shakedown and produced
 gen016; `train-2h` is Phase 4 on a laptop and **warm-starts from gen016**, which is why its
 trunk is pinned to `128 × 3`; `train-3h` is Stage 0b, warm-starts from **gen022**, is the only
 config with `lane_augment = true` — its one experimental change — and produced gen031, the
-current default; `train-3h-new` is Stage 1, the only config with `arch = "lane"` and playout cap
-randomisation, and the only one that starts **from scratch** on a laptop.
+current default; `train-3h-new` is Stage 1, the first config with `arch = "lane"` and playout cap
+randomisation, and the only one that starts **from scratch** on a laptop — it produced
+`runs/sixth`, which was never shipped because it lost to gen031 0.3175.
+
+`train-7h` is Stage 2 and produced **lane-gen032**, the current default. It warm-starts from
+`runs/sixth` and is `train-3h-new` re-sized around batched evaluation (`FINDINGS.md` F4.7):
+4,000 games a generation rather than 1,400, because at 1,400 the now-faster self-play would
+have left the gate as the majority of the clock. ⚠️ It is also the first config with
+`reference_tolerance = 0.10` rather than 0.05 — at generation 9 that difference saved a
+candidate which won its 294-game gate 0.605 and would otherwise have been vetoed on a noisy
+panel row (`FINDINGS.md` F4.8).
 
 `train-12h` and `train-big` are the two sizings of `PLAN.md` item 7, the rented-core run, and
 **`train-12h` is the one to reach for** — it is `train-big` at half the clock with three
@@ -376,13 +388,18 @@ are 3.0 epochs over a single random-init shard at generation 1), and a wider
 five false refusals). `RENTING.md` is how to get the box. `PLAN.md` §4.5 is the order to run
 them in.
 
-**The three shipped checkpoints are one lineage, not a menu.** gen016 → gen022 → **gen031**,
-each warm-started from the one before it and each measured against it at equal simulations:
-+81, then +82, for +189 end to end (`FINDINGS.md` F4.1, F4.5). Play gen031. The other two are
-kept because every Phase 3 finding is measured on gen016 and every Phase 4 number against it,
-and gen022 is now the frozen incumbent for the next run. All three still load — no layout hash
-has moved since gen016, and lane augmentation did not move one either, because it transforms
-training data and nothing else.
+**The four shipped checkpoints are two lineages, not a menu.** `gen016 → gen022 → gen031` is
+the *flat*-trunk chain, each warm-started from the one before and measured against it at equal
+simulations: +81, then +82, for +189 end to end (`FINDINGS.md` F4.1, F4.5).
+**`lane-gen032` is a different root** — the lane-equivariant trunk shares no tensor name with
+the flat one, so `--init-from` refuses across them and its lineage began from a random init
+(`runs/sixth`, unshipped). It beats gen031 by **+167 Elo** at equal simulations, 0.7238 ± 0.044
+over 400 games (`FINDINGS.md` F4.8). The `032` continues the numbering for readability and
+**not** because it is one step past `031`.
+
+**Play `lane-gen032`.** The other three are kept because every Phase 3 finding is measured on
+gen016 and every Phase 4 number against it, and gen031 is the agent `lane-gen032` had to beat.
+All four still load — no layout hash has moved since gen016.
 
 ## Architecture
 

@@ -5,8 +5,10 @@ two layout hashes that pin it to an encoder. `Weights::load` refuses a checkpoin
 hashes do not match the build loading it, so a stale model fails with a one-line error rather
 than by quietly playing badly.
 
-Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to install. They are
-~3.6 MB each, which is what a 949k-parameter fp32 net costs.
+Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to install. The three
+flat-trunk checkpoints are ~3.6 MB each, which is what a 949k-parameter fp32 net costs; the
+lane-equivariant one is 1.7 MB, because sharing one trunk across the three lanes *halves* the
+parameter count while making the network stronger.
 
 > **Note on the citations below.** `PLAN.md` and `FINDINGS.md` were rewritten on 2026-09-05.
 > `PLAN.md` no longer has numbered sections, so a `§4.x` reference here points at
@@ -16,20 +18,91 @@ Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to ins
 
 | File | Variant | Slots | Params | Provenance |
 | --- | --- | --- | --- | --- |
-| **[duel52-split-gen031.d52nn](duel52-split-gen031.d52nn)** — the default | `split` | 21 | 949,267 | Phase 4 `train-3h`, warm-started from gen022, lane augmentation |
+| **[duel52-split-lane-gen032.d52nn](duel52-split-lane-gen032.d52nn)** — the default | `split` | 21 | 455,013 | Phase 4 `train-7h`, warm-started from `runs/sixth`, lane-equivariant trunk |
+| [duel52-split-gen031.d52nn](duel52-split-gen031.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-3h`, warm-started from gen022, lane augmentation |
 | [duel52-split-gen022.d52nn](duel52-split-gen022.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-2h`, warm-started from gen016 |
 | [duel52-split-gen016.d52nn](duel52-split-gen016.d52nn) — superseded | `split` | 21 | 949,267 | Phase 3 `train-fast`, generation 16 |
 
-**Play `gen031`.** The other two are kept as **reference points, not as second options**:
-every Phase 3 finding is measured on `gen016`, every Phase 4 number is measured against it,
-and `gen022` is now the frozen incumbent the next run will be scored against in turn. All
-three load into the same build — the layout hashes have not moved since `gen016`.
+**Play `lane-gen032`.** The other three are kept as **reference points, not as second
+options**: every Phase 3 finding is measured on `gen016` and every Phase 4 number against it,
+and `gen031` is the agent `lane-gen032` had to beat. All four load into the same build — the
+layout hashes have not moved since `gen016`.
+
+⚠️ **These are two lineages, not one chain.** `gen016 → gen022 → gen031` share a *flat* trunk,
+each warm-started from the one before. `lane-gen032` comes from a different root: the
+lane-equivariant architecture shares no tensor name with the flat one, so `--init-from` refuses
+across them and its lineage had to start from a random init (`runs/sixth`, unshipped, which
+lost to gen031 0.3175). The `032` continues the numbering for readability and **not** because
+it is one training step past `031`.
+
+---
+
+## duel52-split-lane-gen032.d52nn
+
+**The strongest Duel 52 agent that exists**, and the first from the second lineage. Two things
+made it, and only one of them is an idea about the game.
+
+**The idea: the lane symmetry is built into the architecture rather than asked for.** Duel 52
+is invariant under all six permutations of its lanes — `game_rules.md` contains no rule that
+names a lane, orders them, or tells one from another. `gen031` chased that with data
+augmentation and got most of the way (`FINDINGS.md` F4.5). This trunk runs **once per lane
+with one shared set of weights**, and the lanes exchange information only through their mean,
+so relabelling them permutes the policy exactly and leaves the value alone. A lane preference
+is not merely small, it is **unrepresentable** — and the parameter count *halves*, because one
+shared trunk replaces three lanes' worth of separate capacity.
+
+**The engineering: self-play got 3.26x faster with bit-identical results.** Profiling found
+94% of self-play CPU in the network's forward pass, running at ~14% of the chip's arithmetic
+width — a dot product is a reduction, so one position cannot fill four-wide f32 units however
+it is written. Evaluating many positions together fixes that, and the batch is taken **across
+concurrent games, never inside a search**, so no game's search is altered and a shard is
+byte-for-byte what an unbatched run would have written. That is what bought 80,000 games in a
+night where the laptop previously managed ~18,000. `FINDINGS.md` F4.7.
+
+### How it was made
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-7h.toml \
+    --run-dir runs/seventh --init-from runs/sixth/checkpoints/best.d52nn
+```
+
+| | |
+| --- | --- |
+| Config | `configs/train-7h.toml` (recorded in the run dir as `train.toml.used`) |
+| Started from | `runs/sixth/checkpoints/best.d52nn`, **not** a random init and **not** a shipped model |
+| Seed | `6000000`, spanning seeds 6,004,000–6,084,000 |
+| Variant | `split`, `two_power = bottom`, `encoding_slots = 21` |
+| Generations | 20 played, 11 promoted; **generation 19 is this file** |
+| Self-play | 80,000 games, 11,172,838 positions, mean 88 PUCT simulations per decision |
+| Wall clock | 6.96 h on an M-series Mac, 8 cores |
+| Network | lane-equivariant, width 128, 3 blocks, value head 128 → 455,013 parameters |
+| `obs_dim` / `action_dim` | 4290 / 2194 |
+| `obs_layout_hash` | `b1355a841a1fdc4a` |
+| `action_layout_hash` | `5169f9461d627b39` |
+| SHA-256 | `a2b5e56a571780acd8d262ef5f568b99a9d220cfbd410c2f8b04eadb3b15a28f` |
+
+### What it is worth
+
+400 games at equal simulations, colour-paired on one seed set:
+
+| opponent | score | record | Elo |
+| --- | ---: | --- | ---: |
+| `gen031@256` | **0.7238 ± 0.0436** | W288 L109 D3 | **+167** |
+| `runs/sixth` best@256 (its own starting point) | 0.8700 ± 0.0328 | W347 L51 D2 | +330 |
+
+It began the run losing to `gen031` 0.3175 (−133 Elo) and finished +167 — **a +300 Elo swing
+in one sitting**, against +189 for the whole of the first lineage across three runs.
+
+⚠️ The two rows do not chain: +330 over its own root, with that root at −133, would predict
++197 rather than +167. Elo is not transitive across a game that is not, and each row carries
+±35–40 Elo of its own. The `gen031` row is the one to quote because it is measured directly
+against the target rather than inferred through a third agent.
 
 ---
 
 ## duel52-split-gen031.d52nn
 
-**The strongest Duel 52 agent that exists.** Produced by `configs/train-3h.toml`, and the
+**Superseded by `lane-gen032`, which beats it 0.7238 at equal simulations.** Produced by `configs/train-3h.toml`, and the
 whole of what it changes is that **every training sample is shown under a random relabelling
 of the three lanes**. Duel 52 is invariant under all six permutations of its lanes —
 `game_rules.md` contains no rule that names a lane, orders them, or tells one from another —

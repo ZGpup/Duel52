@@ -60,53 +60,62 @@ broken checkpoint is broken, not as a scale.
 
 The scale is now anchored on the first trained agent instead. See `FINDINGS.md`.
 
-### The training loop and three agents
+### The training loop and four agents
 
 An AlphaZero style loop over information set MCTS. There is exactly one encoder and it is in
 Rust; the network is defined and trained in PyTorch, evaluated in Rust, and a test asserts the
 two forward passes compute the same function. Self play writes trajectory shards, the trainer
 replays and fits them, and a gate promotes a candidate only when it beats the incumbent.
 
-Three agents have come out of it, each warm started from the one before, each on the same
-laptop, and each changing one thing:
+Four agents have come out of it, all on the same laptop. The first three are one lineage, each
+warm started from the one before and each changing one thing. The fourth is a **second lineage
+from a random init**, because it changed the architecture and the two share no tensor names:
 
-| Agent | The one change | Result |
-|---|---|---|
-| `gen016` | The loop itself, from a random init | The first strong Duel 52 player that exists |
-| `gen022` | Teacher search raised from 64 to 256 simulations | +81 Elo on gen016 |
-| `gen031` | Every training sample relabelled by a random lane permutation | +82 Elo on gen022 |
+| Agent | Trunk | The one change | Result |
+|---|---|---|---|
+| `gen016` | flat | The loop itself, from a random init | The first strong Duel 52 player that exists |
+| `gen022` | flat | Teacher search raised from 64 to 256 simulations | +81 Elo on gen016 |
+| `gen031` | flat | Every training sample relabelled by a random lane permutation | +82 Elo on gen022 |
+| `lane-gen032` | lane | The lane symmetry built into the architecture, and 5x the games per hour from batched self play | **+167 Elo on gen031** |
 
-`gen031` is the current default. The measurements are in `FINDINGS.md`; the provenance of each
-checkpoint is in `models/README.md`.
+`lane-gen032` is the current default. The measurements are in `FINDINGS.md`; the provenance of
+each checkpoint is in `models/README.md`.
 
-**What three runs have established about the method:** the loop works, the gains are steady
-and roughly equal per run, and neither run so far was stopped by running out of ideas. The
-first stopped on a promotion gate with no statistical power, the second and third on their own
-clocks. Nothing yet says the method is near its ceiling.
+**What four runs have established about the method:** the loop works, and the binding
+constraint is games per hour rather than ideas. The first three gained +81, +82 and stopped on
+their own clocks. The fourth gained +167 in one sitting — not because the idea was better, but
+because batching self play's forward passes across concurrent games made 80,000 games in a
+night possible where the laptop had managed 18,200. Nothing yet says the method is near its
+ceiling; what it says is that the laptop was the ceiling.
 
 ## What is next
 
 Ordered by what each answers, not by what is easiest. The first four need no rented hardware
 and none of them is blocked on a stronger agent.
 
-### 1. Play and record a human series against `gen031`
+### 1. Play and record a human series against `lane-gen032`
 
-**Status: under way. Five games recorded, and the agent has started winning them.**
+**Status: under way. Seven games recorded, and the agent now wins more than it loses.**
 
-The corpus in `games/` as of 2026-09-06, all five played without hints:
+The corpus in `games/` as of 2026-09-09, all seven played without hints:
 
 | opponent | budget | owner's record |
 |---|---|---|
 | `gen022` | @4096 | 0 wins, 2 losses |
 | `gen031` | @128 | 1 win |
 | `gen031` | @8192 | 1 win, 1 loss |
+| `lane-gen032` | @8192 | **0 wins, 2 losses** |
 
 **This is the criterion the project set for itself, and it has been met.** The agent has taken
-three of five recorded games off the owner, who beat `gen016` five out of five in the
-unrecorded series. It is not yet a measurement: five games is not a series, the seeds are not
-paired, and two different budgets are mixed together. What it settles is that the agent is no
+five of seven recorded games off the owner, who beat `gen016` five out of five in the
+unrecorded series. It is not yet a measurement: seven games is not a series, the seeds are not
+paired, and three different budgets are mixed together. What it settles is that the agent is no
 longer obviously below the one human who has played it, which is the thing the earlier drafts
 of this file were waiting to find out.
+
+The two `lane-gen032` games are the first against the second lineage, on seeds 18 and 19, and
+the agent won both. That is consistent with its +167 Elo over `gen031` but it is two games, and
+two games is an anecdote — the value in them is the *diagnosis* below, not the scoreline.
 
 What is still owed is the *diagnosis*, which was always the point of recording rather than
 the scoreline.

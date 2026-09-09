@@ -12,8 +12,8 @@ to find out is to build a player strong enough to ask.
 
 A Rust toolchain is all you need to play. The engine has zero dependencies, so the build
 resolves nothing and takes about ten seconds. The trained agent ships with the repo,
-[models/duel52-split-gen031.d52nn](models/duel52-split-gen031.d52nn), 3.6 MB, an ordinary git
-blob with no LFS to install.
+[models/duel52-split-lane-gen032.d52nn](models/duel52-split-lane-gen032.d52nn), 1.7 MB, an
+ordinary git blob with no LFS to install.
 
 ```bash
 # No Rust yet? This is the whole install. On Windows, run the rustup-init.exe from
@@ -27,7 +27,7 @@ cargo build --release
 # Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
 # size of the observation, and the checkpoint refuses to load against any other value.
 ./target/release/duel52 play --encoding-slots 21 \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@8192
+    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@8192
 ```
 
 Every prompt names the rule it is applying, so if you think the engine is wrong you can point
@@ -40,7 +40,7 @@ thinks your chances are after it.
 
 ```bash
 ./target/release/duel52 play --encoding-slots 21 --hint \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096
 ```
 
 ```text
@@ -49,7 +49,7 @@ thinks your chances are after it.
    ATTACK #3
    PAIR    —
 
- netmcts:models/duel52-split-gen031.d52nn@4096 · it puts you at 52% from here
+ netmcts:models/duel52-split-lane-gen032.d52nn@4096 · it puts you at 52% from here
   #  the net would consider                          sims   after
   1  FLIP  lane 2 #1 (7 ²♥) -> reveals 7              41%     61%
   2  ATK   lane 1: your #2 (8 ²♥) -> opp #1           22%     55%
@@ -81,28 +81,46 @@ There is a trained agent in the repo and you can play it.
 The AlphaZero style training loop runs end to end. There is exactly one encoder and it lives
 in Rust; a network is defined and trained in PyTorch, evaluated in Rust.
 
-Three runs have gone through it, each on the same laptop, each warm started from the one
-before, and each changing exactly one thing:
+Five runs have gone through it, all on the same laptop. The first three are one lineage, each
+warm started from the one before and each changing exactly one thing. The fourth started a
+**second lineage from scratch**, because it changed the network architecture and the two share
+no tensor names — there was nothing to warm start from.
 
-| Agent | The one change |
-|---|---|
-| [gen016](models/duel52-split-gen016.d52nn) | The loop itself, from a random init. 57,000 self-play games in 1.94 hours |
-| [gen022](models/duel52-split-gen022.d52nn) | Teacher search raised from 64 simulations to 256 |
-| [gen031](models/duel52-split-gen031.d52nn) | Every training sample relabelled by a random permutation of the three lanes |
+| Agent | Trunk | The one change |
+|---|---|---|
+| [gen016](models/duel52-split-gen016.d52nn) | flat | The loop itself, from a random init. 57,000 self-play games in 1.94 hours |
+| [gen022](models/duel52-split-gen022.d52nn) | flat | Teacher search raised from 64 simulations to 256 |
+| [gen031](models/duel52-split-gen031.d52nn) | flat | Every training sample relabelled by a random permutation of the three lanes |
+| — | lane | A new root. The lane symmetry built into the *architecture* rather than asked for by augmentation: the trunk runs once per lane with shared weights, so a lane preference is unrepresentable rather than merely small |
+| **[lane-gen032](models/duel52-split-lane-gen032.d52nn)** — the default | lane | 80,000 self-play games in 6.96 hours, which is ~5x what the laptop could produce before self-play's network evaluations were batched across games |
+
+The jump at the end is not a better idea than the ones before it; it is the same loop given
+five times the data per hour. Batching the forward pass across concurrent games made self-play
+3.26x faster with **bit-identical** results — the batch is taken across games and never inside
+a search, so no game's search is altered and a shard is byte-for-byte what an unbatched run
+would have written. The detail is in [FINDINGS.md](FINDINGS.md) F4.7 and F4.8.
 
 Rated against each other at equal simulations, 400 games per pairing, with the first trained
 agent pinned at zero:
 
 | agent | Elo | +/- | expected vs. gen016 |
 |---|---:|---:|---:|
-| `netmcts:gen031@256` | **+157** | 13 | 0.711 |
-| `netmcts:gen022@256` | +91 | 13 | 0.628 |
+| `netmcts:lane-gen032@256` | **+360** | 13 | 0.888 |
+| `netmcts:gen031@256` | +161 | 11 | 0.717 |
+| `netmcts:gen022@256` | +96 | 11 | 0.634 |
 | `netmcts:gen016@256` | 0 | 0 | 0.500 |
+
+The fit puts the last step at +199. Measured head-to-head instead — `lane-gen032` against
+`gen031` directly, 400 games — it is **+167** (0.7238 ± 0.0436, W288 L109 D3). The two are
+different estimators of the same quantity and they agree: +199 sits inside the head-to-head
+interval. Elo is not transitive across a game that is not, so where they differ, the direct
+measurement is the one to trust about *those two agents* and the fit is the one to trust about
+the scale as a whole.
 
 **gen016 is the floor of the elo system** Five hand-written agents
 (random, greedy, flat Monte Carlo, PIMC, information set MCTS) were the benchmark for two
-phases. gen031 beats the strongest of them 200 games to 0, and a rung that loses every game
-measures nothing about the winner.
+phases. Already at gen031 the strongest of them lost 200 games to 0, and a rung that loses
+every game measures nothing about the winner.
 
 What the agents have taught us about the game is in [FINDINGS.md](FINDINGS.md). That file is
 the point of the project.
@@ -116,7 +134,7 @@ disagree, which is the only place a strategy insight can come from.
 # Play, and append the finished game to a file.
 ./target/release/duel52 play --encoding-slots 21 --seed 123 \
     --record games/mine.jsonl \
-    --opponent netmcts:models/duel52-split-gen031.d52nn@4096
+    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096
 
 ./target/release/duel52 replay --record games/mine.jsonl            # what is in the file
 ./target/release/duel52 replay --record games/mine.jsonl --game 1   # walk it
@@ -154,7 +172,7 @@ per turn.
 
 [PLAN.md](PLAN.md) has the detail. In short, the next work is not a bigger training run:
 
-1. **Play and record a human series against gen031.** The only external measurement there is.
+1. **Play and record a human series against `lane-gen032`.** The only external measurement there is.
 2. **Build a card value table.** Whether the thirteen powers are worth comparable amounts is
    the balance question, and nothing answers it yet.
 3. **First-player advantage across all three variants**, which costs a training run per
