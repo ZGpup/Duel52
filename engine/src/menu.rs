@@ -8,13 +8,19 @@
 //!
 //! # Which card, then which lane — for the verbs that act on the board
 //!
-//! FLIP and ATTACK ask for a **card** first and a lane only if they have to, because that is
-//! how the move is decided: a player wants to flip *the 7*, and only then has to care that
-//! there are two of them. So the first question lists ranks with their multiplicity, and the
-//! second question — *from which lane* — is asked only when the copies are spread across more
-//! than one lane. Two copies in one lane that differ in nothing but their
+//! FLIP asks for a **card** first and a lane only if it has to, because that is how the move
+//! is decided: a player wants to flip *the 7*, and only then has to care that there are two
+//! of them. So the first question lists ranks with their multiplicity, and the second
+//! question — *from which lane* — is asked only when the copies are spread across more than
+//! one lane. Two copies in one lane that differ in nothing but their
 //! [`CardId`](crate::card::CardId) are one move under two names, so there is nothing to ask
 //! and the first is taken; see [`same_move`].
+//!
+//! ATTACK asks for a card too, but lays every one of them out at once under **lane
+//! headings** rather than folding the copies of a rank into one row — an attack is chosen off
+//! the board, against the column facing it, so the lane is part of the card rather than a
+//! follow-up question about it. Copies in one lane that are [`same_move`] still collapse to a
+//! single row, because which of two identical 7s swings is not a choice. See [`attack_menu`].
 //!
 //! PLAY is unchanged — a card in hand has no lane yet, so *which card, which lane* was always
 //! its shape — and so is PAIR, which is a choice of two cards inside one lane.
@@ -886,36 +892,69 @@ fn flip_menu(state: &GameState, flips: &[Action], observer: Observer) -> Menu {
     )
 }
 
-/// ATTACK: which of your cards, then — only if its copies are in more than one lane — which
-/// lane, then which of theirs.
+/// ATTACK: which of your cards, listed lane by lane, then which of theirs.
+///
+/// The one card-first verb that does **not** go through [`card_first_menu`]. An attack is
+/// picked off the board — *that* card, against the column facing it — so a row reading
+/// `10 ×2   lane 1   lane 3` and then a second question asking which of the two is the shape
+/// of the action list rather than the shape of the decision. Splitting the copies under lane
+/// headings settles the card and its lane in one step, and the list reads down the board.
+///
+/// Copies in one lane that are [`same_move`] are still one row: two 7s that differ in nothing
+/// but their [`CardId`](crate::card::CardId) attack identically, so which of them swings is
+/// not a choice to put to anybody. Anything that *is* a choice — a paired copy beside a loose
+/// one, a damaged one beside a fresh one, an Ace with two attacks left beside one with one —
+/// is a row of its own, exactly as [`settle_in_lane`] keeps them apart for FLIP.
 fn attack_menu(state: &GameState, attacks: &[Action], observer: Observer) -> Menu {
-    let groups = group_by_card(state, observer, attacks, |a| match a {
-        Action::Attack { lane, attacker, .. } => Some((*lane as usize, *attacker as usize)),
-        _ => None,
-    });
-    card_first_menu(
-        state,
-        observer,
-        &groups,
-        &CardFirst {
-            prompt: "ATTACK — using which card?",
-            lane_prompt: &|phrase| format!("ATTACK using {phrase} — from which lane?"),
-            tie_prompt: &|lane| {
-                format!("ATTACK from lane {} — using which card?", lane_label(lane))
-            },
-            leaf: &|lane, slot| {
-                let mine: Vec<Action> = attacks
-                    .iter()
-                    .copied()
-                    .filter(|a| {
-                        matches!(a, Action::Attack { lane: l, attacker, .. }
-                                 if *l as usize == lane && *attacker as usize == slot)
-                    })
-                    .collect();
-                Pick::Open(Box::new(target_menu(state, observer, lane, slot, &mine)))
-            },
-        },
-    )
+    let me = state.acting_player();
+    let mut b = Builder::new("ATTACK — using which card?");
+    for lane in 0..state.lane_count() {
+        b.heading(format!("LANE {}", lane_label(lane)));
+        // The rows already pushed for this lane, so a copy that is the same move as one of
+        // them can be recognised and dropped.
+        let mut shown: Vec<usize> = Vec::new();
+        for slot in column_slots(state, lane, me, observer) {
+            let mine: Vec<Action> = attacks
+                .iter()
+                .copied()
+                .filter(|a| {
+                    matches!(a, Action::Attack { lane: l, attacker, .. }
+                             if *l as usize == lane && *attacker as usize == slot)
+                })
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            if shown
+                .iter()
+                .any(|&other| same_move(state, lane, me, &[other, slot]))
+            {
+                continue;
+            }
+            shown.push(slot);
+            // "paired" rather than [`pair_note`]'s "pair with #2": the numbers down this
+            // list are its own rows, not the board's columns, so a column number here would
+            // point at the wrong thing. Which partner it is does not change the move anyway
+            // — §5 sends both members in together — and naming it as a pair is the whole of
+            // what tells this row apart from a loose card of the same rank beside it.
+            let paired = match state.pair_partner(lane, me, slot) {
+                Some(_) => "paired",
+                None => "",
+            };
+            let note = format!(
+                "{:<6} {:<11} {}",
+                card_token(&state.lanes[lane].side(me)[slot], observer),
+                power_note(state, lane, me, slot, observer),
+                paired,
+            );
+            b.push(
+                "CARD",
+                note.trim_end(),
+                Pick::Open(Box::new(target_menu(state, observer, lane, slot, &mine))),
+            );
+        }
+    }
+    b.done()
 }
 
 fn target_menu(
@@ -1506,14 +1545,12 @@ mod tests {
         let whole_verb = menu.focus(&state, 3);
         assert!(!whole_verb.is_empty(), "ATTACK must point somewhere");
 
-        // Two 10s in two lanes, so the card question is followed by a lane question.
+        // The two 10s are a row each, so picking one is the step down from the verb.
         let Pick::Open(attack) = &menu.picks[2] else {
             panic!("attacking must be on");
         };
-        let Pick::Open(lanes) = &attack.picks[0] else {
-            panic!("the two 10s must ask which lane\n{}", attack.render(false));
-        };
-        let one_lane = lanes.focus(&state, 1);
+        assert_eq!(attack.len(), 2, "one row per 10\n{}", attack.render(false));
+        let one_lane = attack.focus(&state, 1);
         assert!(!one_lane.is_empty());
         assert_ne!(one_lane, whole_verb, "one lane is less than both");
         for id in one_lane.cards() {
@@ -1844,8 +1881,10 @@ mod tests {
     }
 
     /// Attacking with a paired card is a different move from attacking with a loose one of
-    /// the same rank in the same lane — §5 sends both members in together — so the menu says
-    /// so on the card row and asks which one.
+    /// the same rank in the same lane — §5 sends both members in together — so the two get a
+    /// row each, and the pair's row says which one it is.
+    ///
+    /// The two members of the pair are the same move, so they share the one row.
     #[test]
     fn menu_keeps_a_pair_apart_from_a_loose_card_of_the_same_rank() {
         let mut p = Position::new(GameConfig::base());
@@ -1861,16 +1900,88 @@ mod tests {
             panic!("attacking must be on\n{}", menu.render(false));
         };
         let text = attack.render(false);
-        assert_eq!(attack.len(), 1, "three 7s are one row\n{text}");
+        assert_eq!(attack.len(), 2, "the pair is one row, the loose 7 another\n{text}");
+        assert_eq!(attack.rows[0].heading, "LANE 1", "{text}");
+        assert_eq!(attack.rows[1].heading, "LANE 1", "{text}");
         assert!(attack.rows[0].note.contains("paired"), "{text}");
-        let Pick::Open(cards) = &attack.picks[0] else {
-            panic!("the pair and the loose 7 are different moves\n{text}");
+        assert!(!attack.rows[1].note.contains("paired"), "the loose 7\n{text}");
+        // Both rows lead straight to a target list: the card and its lane are settled.
+        for pick in &attack.picks {
+            let Pick::Open(targets) = pick else {
+                panic!("a settled attacker asks for a target next\n{text}");
+            };
+            assert!(targets.prompt.contains("which enemy card"), "{text}");
+        }
+    }
+
+    /// ATTACK lists every card that can attack, under its lane, in board order — no rank
+    /// rows and no follow-up lane question, even for two copies of one rank in two lanes.
+    #[test]
+    fn attack_lists_the_cards_lane_by_lane_without_asking_for_a_lane() {
+        let mut p = Position::new(GameConfig::base());
+        p.face_up(0, Player::P0, Rank::FIVE);
+        p.face_up(0, Player::P0, Rank::TEN);
+        p.face_up(2, Player::P0, Rank::TEN);
+        p.face_up(0, Player::P1, Rank::FOUR);
+        p.face_up(2, Player::P1, Rank::FOUR);
+        let state = p.build();
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on\n{}", menu.render(false));
         };
-        assert_eq!(cards.prompt, "ATTACK from lane 1 — using which card?");
-        assert!(
-            cards.rows[0].note.contains("pair with #2"),
-            "{}",
-            cards.render(false)
+        let text = attack.render(false);
+        assert_eq!(attack.len(), 3, "one row per attacker\n{text}");
+        assert_eq!(
+            attack
+                .rows
+                .iter()
+                .map(|r| r.heading.as_str())
+                .collect::<Vec<_>>(),
+            ["LANE 1", "LANE 1", "LANE 3"],
+            "lane order, and every row says which lane it is in\n{text}"
         );
+        // The two 10s are in different lanes and are still two rows — one each — rather than
+        // one row and a question about which lane.
+        for pick in &attack.picks {
+            assert!(matches!(pick, Pick::Open(_)), "{text}");
+        }
+        let Pick::Open(targets) = &attack.picks[2] else {
+            panic!("{text}");
+        };
+        assert_eq!(targets.prompt, "ATTACK in lane 3 — which enemy card?", "{text}");
+    }
+
+    /// Copies in one lane that are the same move are one row here too, exactly as they are
+    /// for FLIP — two identical 7s attack identically, so there is nothing to ask.
+    #[test]
+    fn attack_shows_interchangeable_copies_in_one_lane_once() {
+        let mut p = Position::new(GameConfig::base());
+        p.face_up(0, Player::P0, Rank::SEVEN);
+        p.face_up(0, Player::P0, Rank::SEVEN);
+        p.face_up(0, Player::P1, Rank::FOUR);
+        let state = p.build();
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on\n{}", menu.render(false));
+        };
+        let text = attack.render(false);
+        assert_eq!(attack.len(), 1, "two interchangeable 7s are one row\n{text}");
+
+        // ...but a damaged copy is a different move, and gets its own row.
+        let mut p = Position::new(GameConfig::base());
+        p.face_up(0, Player::P0, Rank::SEVEN);
+        let hurt = p.face_up(0, Player::P0, Rank::SEVEN);
+        p.damage(0, Player::P0, hurt, 1);
+        p.face_up(0, Player::P1, Rank::FOUR);
+        let state = p.build();
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        let Pick::Open(attack) = &menu.picks[2] else {
+            panic!("attacking must be on\n{}", menu.render(false));
+        };
+        let text = attack.render(false);
+        assert_eq!(attack.len(), 2, "a damaged 7 is a different card\n{text}");
     }
 }
