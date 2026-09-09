@@ -16,6 +16,7 @@ what one generation is expected to cost. Worth running before a two-hour session
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -89,6 +90,23 @@ def _check(args: argparse.Namespace) -> int:
             f"policy targets a generation against "
             f"{sp.games * 136 // tr.sample_stride:,} value targets"
         )
+    if sp.eval_batch > 1:
+        # `selfplay.rs` clamps the batch to the games a worker actually owns, so a small
+        # generation on many cores silently gets a smaller batch than the config asks for.
+        # Say the effective number, because the clamp is invisible in the run's output.
+        workers = config.run.threads or os.cpu_count() or 1
+        per_worker = max(sp.games // max(workers, 1), 1)
+        effective = min(sp.eval_batch, per_worker)
+        line = (
+            f"eval batch:     {sp.eval_batch} games in flight per worker — batched "
+            f"evaluation, and byte-identical to 1"
+        )
+        print(f"                {line}")
+        if effective < sp.eval_batch:
+            print(
+                f"                ⚠️  only {effective} in practice: {sp.games} games over "
+                f"{workers} threads is {per_worker} each"
+            )
     # What a fixed step count actually means depends on how full the buffer is, and the
     # answer at generation 1 is what cost `runs/fourth` its first generation.
     if tr.epochs_per_generation <= 0:

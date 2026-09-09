@@ -70,7 +70,7 @@ use crate::action::Action;
 use crate::agents::Agent;
 use crate::config::GameConfig;
 use crate::encode::{action_dim, encode_action, encode_observation, obs_dim};
-use crate::nn::{MlpEvaluator, Scratch};
+use crate::nn::MlpEvaluator;
 use crate::player::Player;
 use crate::rng::Rng;
 use crate::state::GameState;
@@ -232,144 +232,72 @@ impl NetMctsAgent {
     }
 
     /// Run the search. `legal` must be [`GameState::legal_actions`] for `state`.
+    ///
+    /// A thin driver over [`SearchInProgress`], which owns the only copy of the tree logic.
+    /// Batched self-play runs that same state machine with many games in flight, and two
+    /// transcriptions of PUCT would be two chances to diverge.
     pub fn search(&mut self, state: &GameState, legal: &[Action]) -> SearchResult {
         let config = state.config;
         let evaluator = self.evaluator(&config);
-        let me = state.acting_player();
+        let mut obs = vec![0.0f32; obs_dim(&config)];
+        let mut mask = vec![false; action_dim(&config)];
+        let mut logits = vec![0.0f32; action_dim(&config)];
+        let mut scratch = evaluator.scratch();
 
-        let mut buf = Buffers {
-            obs: vec![0.0; obs_dim(&config)],
-            logits: vec![0.0; action_dim(&config)],
-            mask: vec![false; action_dim(&config)],
-            set: Vec::with_capacity(64),
-            scratch: evaluator.scratch(),
-        };
-
-        let mut tree: Vec<Node> = vec![Node::default()];
-        let mut root_value_total = 0.0f64;
-        let mut root_value_count = 0u32;
-        // (node, edge) pairs traversed, reused across simulations.
-        let mut path: Vec<(usize, usize)> = Vec::with_capacity(16);
-
-        for _ in 0..self.sims {
-            let mut world = state.determinize(me, &mut self.rng);
-            let mut node = 0usize;
-            path.clear();
-
-            let reward = loop {
-                if world.outcome.is_over() {
-                    // `learning_value`, not `value_for`: an engine-declared stalemate is
-                    // worth `config.stalemate_value` to *both* players rather than half a
-                    // point each, so a search cannot treat "neither side attacks" as a safe
-                    // half. `FINDINGS.md` F3.6 is what happens when it can. Not zero-sum,
-                    // which is why each edge banks a reward per player.
-                    break [
-                        config.learning_value(world.outcome, Player::P0) as f64,
-                        config.learning_value(world.outcome, Player::P1) as f64,
-                    ];
-                }
-                let available = world.legal_actions();
-
-                // Availability is credited to every legal action, taken or not, before
-                // selection — so an edge created on this visit is counted for this visit.
-                for &action in &available {
-                    if let Some(i) = tree[node].edge_for(action) {
-                        tree[node].edges[i].availability += 1;
-                    }
-                }
-
-                let missing = available
-                    .iter()
-                    .any(|&a| tree[node].edge_for(a).is_none());
-                if missing {
-                    // Expansion: one forward pass, edges for every action this node has not
-                    // seen before, and the value head in place of a rollout.
-                    let value = evaluate(&evaluator, &world, &available, &mut buf);
-                    for &action in &available {
-                        if tree[node].edge_for(action).is_some() {
-                            continue;
-                        }
-                        let child = tree.len();
-                        tree.push(Node::default());
-                        let logit = buf.logits[encode_action(&action, &world)];
-                        let gamma = match (node, self.noise) {
-                            (0, Some(n)) => self.rng.gamma(n.alpha) as f32,
-                            _ => 0.0,
-                        };
-                        tree[node].edges.push(Edge {
-                            action,
-                            child,
-                            visits: 0,
-                            availability: 1,
-                            logit,
-                            gamma,
-                            reward: [0.0, 0.0],
-                        });
-                    }
-                    let actor = world.acting_player();
-                    if node == 0 {
-                        root_value_total += value as f64;
-                        root_value_count += 1;
-                    }
-                    let mut reward = [0.0f64; 2];
-                    reward[actor.idx()] = value as f64;
-                    reward[actor.other().idx()] = 1.0 - value as f64;
-                    break reward;
-                }
-
-                let mover = world.acting_player();
-                let edge = self.select(&tree[node], &available, mover, node == 0);
-                path.push((node, edge));
-                let action = tree[node].edges[edge].action;
-                node = tree[node].edges[edge].child;
-                world.apply_trusted(action);
-            };
-
-            for &(n, e) in &path {
-                let edge = &mut tree[n].edges[e];
-                edge.visits += 1;
-                edge.reward[0] += reward[0];
-                edge.reward[1] += reward[1];
-            }
+        let mut search = self.begin_search(state, legal);
+        while let SearchStep::NeedsEval = search.advance(self, &mut obs, &mut mask) {
+            let value = evaluator.eval_masked_with(&obs, &mask, &mut logits, &mut scratch);
+            search.supply(self, &logits, value, &mut mask);
         }
+        search.finish()
+    }
 
-        let (visits, values): (Vec<u32>, Vec<Option<f32>>) = legal
-            .iter()
-            .map(|&action| match tree[0].edge_for(action) {
-                Some(i) => {
-                    let edge = &tree[0].edges[i];
-                    let value = (edge.visits > 0)
-                        .then(|| (edge.reward[me.idx()] / edge.visits as f64) as f32);
-                    (edge.visits, value)
-                }
-                None => (0, None),
-            })
-            .unzip();
-
-        // The root's own value, preferring what the tree backed up over the raw net call.
-        let root_value = {
-            let root = &tree[0];
-            let total: f64 = root.edges.iter().map(|e| e.reward[me.idx()]).sum();
-            let n: u32 = root.edges.iter().map(|e| e.visits).sum();
-            if n > 0 {
-                (total / n as f64) as f32
-            } else if root_value_count > 0 {
-                (root_value_total / root_value_count as f64) as f32
-            } else {
-                0.5
-            }
-        };
-
-        SearchResult {
-            visits,
-            values,
-            root_value,
-            nodes: tree.len(),
+    /// Begin a search that suspends wherever it needs a network evaluation.
+    ///
+    /// The budget, exploration constant and root noise are snapshotted here, so
+    /// [`Self::set_budget`] between decisions means what it always meant. The agent stays
+    /// borrowed only for the call — [`SearchInProgress`] takes `&mut NetMctsAgent` back on
+    /// each step, because the search RNG lives on the agent and has to carry across the
+    /// whole game rather than restart per decision.
+    pub fn begin_search(&mut self, state: &GameState, legal: &[Action]) -> SearchInProgress {
+        SearchInProgress {
+            config: state.config,
+            me: state.acting_player(),
+            root: state.clone(),
+            legal: legal.to_vec(),
+            sims: self.sims,
+            c_puct: self.c_puct,
+            noise: self.noise,
+            tree: vec![Node::default()],
+            path: Vec::with_capacity(16),
+            root_value_total: 0.0,
+            root_value_count: 0,
+            sims_done: 0,
+            pending: None,
+            set: Vec::with_capacity(64),
         }
     }
 
     /// PUCT over the edges legal in this determinization.
+    ///
+    /// Delegates to [`puct_select`], which is what the search itself calls — this wrapper
+    /// exists so the unit tests below can state a rule about "the agent's" selection.
+    #[cfg(test)]
     fn select(&self, node: &Node, available: &[Action], mover: Player, is_root: bool) -> usize {
+        puct_select(node, available, mover, is_root, self.c_puct, self.noise)
+    }
+}
+
+/// PUCT over the edges legal in this determinization.
+fn puct_select(
+    node: &Node,
+    available: &[Action],
+    mover: Player,
+    is_root: bool,
+    c_puct: f32,
+    agent_noise: Option<RootNoise>,
+) -> usize {
+    {
         // Softmax over the available edges' logits: the prior, normalised over the support
         // that actually exists in this world.
         let mut max_logit = f32::NEG_INFINITY;
@@ -386,7 +314,7 @@ impl NetMctsAgent {
                 gamma_sum += edge.gamma;
             }
         }
-        let noise = if is_root { self.noise } else { None };
+        let noise = if is_root { agent_noise } else { None };
 
         let mut best = usize::MAX;
         let mut best_score = f32::NEG_INFINITY;
@@ -411,7 +339,7 @@ impl NetMctsAgent {
                 (edge.reward[mover.idx()] / edge.visits as f64) as f32
             };
             let score =
-                q + self.c_puct * prior * (edge.availability as f32).sqrt() / (1.0 + edge.visits as f32);
+                q + c_puct * prior * (edge.availability as f32).sqrt() / (1.0 + edge.visits as f32);
             if score > best_score {
                 best_score = score;
                 best = i;
@@ -425,44 +353,268 @@ impl NetMctsAgent {
     }
 }
 
-/// Per-decision working buffers. Allocated once per search, not once per simulation.
-struct Buffers {
-    obs: Vec<f32>,
-    logits: Vec<f32>,
-    mask: Vec<bool>,
-    /// The indices set in `mask`, so clearing it costs the same as setting it rather than a
-    /// pass over all `action_dim` entries — and `encode_action` runs once per action per
-    /// evaluation rather than twice.
-    set: Vec<usize>,
-    scratch: Scratch,
+/// Where a suspended search left off: the determinized world it was about to expand.
+struct Pending {
+    world: GameState,
+    available: Vec<Action>,
+    node: usize,
 }
 
-/// One forward pass on `world`, writing the logits of exactly `available` into `buf.logits`.
+/// What [`SearchInProgress::advance`] wants next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchStep {
+    /// An observation is waiting in the caller's buffer. Evaluate it and call
+    /// [`SearchInProgress::supply`].
+    NeedsEval,
+    /// The budget is spent; call [`SearchInProgress::finish`].
+    Done,
+}
+
+/// One decision's search, suspended wherever it needs a network evaluation.
 ///
-/// Returns the value head's output rescaled from the network's `(-1, 1)` to the engine's
-/// `0.0..=1.0` outcome convention ([`crate::Outcome::value_for`]), so a backed-up net value
-/// and a backed-up terminal result are the same quantity.
-fn evaluate(
-    evaluator: &MlpEvaluator,
-    world: &GameState,
-    available: &[Action],
-    buf: &mut Buffers,
-) -> f32 {
-    encode_observation(world, world.acting_player(), &mut buf.obs);
-    // Set the mask from the actions we already have rather than through `legal_mask`, which
-    // would re-enumerate them and clear all `action_dim` entries. Cleared by index
-    // afterwards, so the buffer is all-false again for the next simulation.
-    buf.set.clear();
-    for &action in available {
-        let index = encode_action(&action, world);
-        buf.mask[index] = true;
-        buf.set.push(index);
+/// # Why the search can be paused
+///
+/// `PLAN.md` §4.2d. The trunk is ~89% of self-play and runs at ~14% of the chip's width at
+/// one position per call, so self-play wants to evaluate many positions together. The batch
+/// is taken from **different games**, never from within one search: a worker keeps `G` games
+/// in flight, advances each to the point it needs the network, and evaluates the round in
+/// one call. Nothing about any individual search changes — it sees the same determinizations
+/// in the same order and the same logits, bit for bit — so a game played in a batch of 64 is
+/// the same game played alone, and every Elo number already measured still means what it
+/// meant. `nn/mod.rs`'s [`Evaluator`](crate::nn) header specified this shape before there
+/// was a consumer for it.
+///
+/// The alternative — leaf parallelism with virtual loss, batching *inside* one search — was
+/// rejected: it changes the visit distribution, by an amount that depends on how peaked the
+/// prior is, so it would distort the *differences* between agents rather than offsetting
+/// them, and it cannot fill a batch at `cap_sims = 32` anyway.
+///
+/// # Using it
+///
+/// [`NetMctsAgent::begin_search`], then [`Self::advance`] until it returns
+/// [`SearchStep::Done`], answering each [`SearchStep::NeedsEval`] with [`Self::supply`],
+/// then [`Self::finish`]. The agent comes back on every call because the search RNG lives on
+/// it and must carry across a whole game.
+pub struct SearchInProgress {
+    config: GameConfig,
+    me: Player,
+    /// The real state, determinized afresh each simulation.
+    root: GameState,
+    legal: Vec<Action>,
+    sims: usize,
+    c_puct: f32,
+    noise: Option<RootNoise>,
+    tree: Vec<Node>,
+    /// (node, edge) pairs traversed, reused across simulations.
+    path: Vec<(usize, usize)>,
+    root_value_total: f64,
+    root_value_count: u32,
+    sims_done: usize,
+    pending: Option<Pending>,
+    /// The indices `advance` set in the caller's mask, so `supply` clears exactly those
+    /// rather than making a pass over all `action_dim` entries.
+    set: Vec<usize>,
+}
+
+impl SearchInProgress {
+    /// Run simulations until one needs a network evaluation, or the budget is spent.
+    ///
+    /// On [`SearchStep::NeedsEval`] the observation is written into `obs` and the legal
+    /// actions are set in `mask`; both must still hold those values when [`Self::supply`] is
+    /// called. On [`SearchStep::Done`] neither buffer is touched.
+    pub fn advance(
+        &mut self,
+        agent: &mut NetMctsAgent,
+        obs: &mut [f32],
+        mask: &mut [bool],
+    ) -> SearchStep {
+        debug_assert!(
+            self.pending.is_none(),
+            "advance while an evaluation is outstanding"
+        );
+        while self.sims_done < self.sims {
+            let mut world = self.root.determinize(self.me, &mut agent.rng);
+            let mut node = 0usize;
+            self.path.clear();
+
+            let reward = loop {
+                if world.outcome.is_over() {
+                    // `learning_value`, not `value_for`: an engine-declared stalemate is
+                    // worth `config.stalemate_value` to *both* players rather than half a
+                    // point each, so a search cannot treat "neither side attacks" as a safe
+                    // half. `FINDINGS.md` F3.6 is what happens when it can. Not zero-sum,
+                    // which is why each edge banks a reward per player.
+                    break [
+                        self.config.learning_value(world.outcome, Player::P0) as f64,
+                        self.config.learning_value(world.outcome, Player::P1) as f64,
+                    ];
+                }
+                let available = world.legal_actions();
+
+                // Availability is credited to every legal action, taken or not, before
+                // selection — so an edge created on this visit is counted for this visit.
+                for &action in &available {
+                    if let Some(i) = self.tree[node].edge_for(action) {
+                        self.tree[node].edges[i].availability += 1;
+                    }
+                }
+
+                let missing = available
+                    .iter()
+                    .any(|&a| self.tree[node].edge_for(a).is_none());
+                if missing {
+                    // Expansion needs one forward pass. Suspend here: the caller evaluates,
+                    // possibly alongside other games, and `supply` resumes.
+                    //
+                    // The mask is set from the actions we already have rather than through
+                    // `legal_mask`, which would re-enumerate them and clear all `action_dim`
+                    // entries. `supply` clears it by index, so the buffer is all-false again
+                    // for the next round.
+                    encode_observation(&world, world.acting_player(), obs);
+                    self.set.clear();
+                    for &action in &available {
+                        let index = encode_action(&action, &world);
+                        mask[index] = true;
+                        self.set.push(index);
+                    }
+                    self.pending = Some(Pending {
+                        world,
+                        available,
+                        node,
+                    });
+                    return SearchStep::NeedsEval;
+                }
+
+                let mover = world.acting_player();
+                let edge = puct_select(
+                    &self.tree[node],
+                    &available,
+                    mover,
+                    node == 0,
+                    self.c_puct,
+                    self.noise,
+                );
+                self.path.push((node, edge));
+                let action = self.tree[node].edges[edge].action;
+                node = self.tree[node].edges[edge].child;
+                world.apply_trusted(action);
+            };
+
+            self.backup(reward);
+            self.sims_done += 1;
+        }
+        SearchStep::Done
     }
-    let value = evaluator.eval_masked_with(&buf.obs, &buf.mask, &mut buf.logits, &mut buf.scratch);
-    for &index in &buf.set {
-        buf.mask[index] = false;
+
+    /// Resume the simulation [`Self::advance`] suspended, given the network's answer.
+    ///
+    /// `logits` are the raw masked logits and `value` is the value head's own `(-1, 1)`
+    /// output; the rescale to the engine's `0.0..=1.0` outcome convention
+    /// ([`crate::Outcome::value_for`]) happens here, in one place, so a backed-up net value
+    /// and a backed-up terminal result are the same quantity. `mask` must be the buffer
+    /// `advance` filled; it is left all-false.
+    pub fn supply(
+        &mut self,
+        agent: &mut NetMctsAgent,
+        logits: &[f32],
+        value: f32,
+        mask: &mut [bool],
+    ) {
+        let Pending {
+            world,
+            available,
+            node,
+        } = self
+            .pending
+            .take()
+            .expect("supply without a pending evaluation");
+        for &index in &self.set {
+            mask[index] = false;
+        }
+        let value = 0.5 * (value + 1.0);
+
+        for &action in &available {
+            if self.tree[node].edge_for(action).is_some() {
+                continue;
+            }
+            let child = self.tree.len();
+            self.tree.push(Node::default());
+            let logit = logits[encode_action(&action, &world)];
+            let gamma = match (node, self.noise) {
+                (0, Some(n)) => agent.rng.gamma(n.alpha) as f32,
+                _ => 0.0,
+            };
+            self.tree[node].edges.push(Edge {
+                action,
+                child,
+                visits: 0,
+                availability: 1,
+                logit,
+                gamma,
+                reward: [0.0, 0.0],
+            });
+        }
+        let actor = world.acting_player();
+        if node == 0 {
+            self.root_value_total += value as f64;
+            self.root_value_count += 1;
+        }
+        let mut reward = [0.0f64; 2];
+        reward[actor.idx()] = value as f64;
+        reward[actor.other().idx()] = 1.0 - value as f64;
+
+        self.backup(reward);
+        self.sims_done += 1;
     }
-    0.5 * (value + 1.0)
+
+    fn backup(&mut self, reward: [f64; 2]) {
+        for &(n, e) in &self.path {
+            let edge = &mut self.tree[n].edges[e];
+            edge.visits += 1;
+            edge.reward[0] += reward[0];
+            edge.reward[1] += reward[1];
+        }
+    }
+
+    /// The finished search, as [`NetMctsAgent::search`] would have returned it.
+    pub fn finish(self) -> SearchResult {
+        let me = self.me;
+        let tree = &self.tree;
+        let (visits, values): (Vec<u32>, Vec<Option<f32>>) = self
+            .legal
+            .iter()
+            .map(|&action| match tree[0].edge_for(action) {
+                Some(i) => {
+                    let edge = &tree[0].edges[i];
+                    let value = (edge.visits > 0)
+                        .then(|| (edge.reward[me.idx()] / edge.visits as f64) as f32);
+                    (edge.visits, value)
+                }
+                None => (0, None),
+            })
+            .unzip();
+
+        // The root's own value, preferring what the tree backed up over the raw net call.
+        let root_value = {
+            let root = &tree[0];
+            let total: f64 = root.edges.iter().map(|e| e.reward[me.idx()]).sum();
+            let n: u32 = root.edges.iter().map(|e| e.visits).sum();
+            if n > 0 {
+                (total / n as f64) as f32
+            } else if self.root_value_count > 0 {
+                (self.root_value_total / self.root_value_count as f64) as f32
+            } else {
+                0.5
+            }
+        };
+
+        SearchResult {
+            visits,
+            values,
+            root_value,
+            nodes: tree.len(),
+        }
+    }
 }
 
 impl Agent for NetMctsAgent {

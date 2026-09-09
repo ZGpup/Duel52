@@ -43,7 +43,7 @@ use crate::state::GameState;
 pub use flat_mc::FlatMcAgent;
 pub use greedy::GreedyAgent;
 pub use ismcts::IsmctsAgent;
-pub use net_mcts::{NetMctsAgent, RootNoise, SearchResult};
+pub use net_mcts::{NetMctsAgent, RootNoise, SearchInProgress, SearchResult, SearchStep};
 pub use net_policy::NetPolicyAgent;
 pub use pimc::PimcAgent;
 

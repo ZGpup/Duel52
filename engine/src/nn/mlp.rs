@@ -42,14 +42,14 @@
 //! weight, a swapped gamma and beta, a missing residual — fails immediately, because those
 //! produce `O(1)` differences rather than `O(1e-6)` ones.
 
-use super::lane::{LaneBody, LaneScratch};
+use super::lane::{LaneBatchScratch, LaneBody, LaneScratch};
 use super::weights::{Arch, ArchKind, Weights};
 use super::Evaluator;
 use crate::config::GameConfig;
 
 /// LayerNorm epsilon. Matches PyTorch's `nn.LayerNorm` default; the parity test is sensitive
 /// to this, because a different epsilon shifts every activation slightly.
-const LN_EPS: f32 = 1e-5;
+pub(super) const LN_EPS: f32 = 1e-5;
 
 /// The reference [`Evaluator`]: plain loops over [`Weights`].
 pub struct MlpEvaluator {
@@ -281,6 +281,85 @@ impl MlpEvaluator {
 
         self.value_head(scratch)
     }
+
+    /// `n` rows of [`Self::eval_masked_with`] in one call.
+    ///
+    /// `xs` is `n × obs_dim` and `masks` is `n × action_dim`, both row-major; `logits` and
+    /// `values` receive `n × action_dim` and `n`. Every row's result is **bit-identical** to
+    /// what [`Self::eval_masked_with`] would have produced for that row alone — see
+    /// [`super::lane::LaneBody::trunk_batch`] for why, and
+    /// `phase4_batched_evaluation_is_bit_identical` for the guard.
+    ///
+    /// Only [`ArchKind::Lane`] has a batched trunk. The flat network falls back to a loop:
+    /// it is the shipped-checkpoint architecture rather than the one being trained, and a
+    /// second batched kernel would be a second place for the two paths to disagree for no
+    /// measured benefit. The fallback is correct, just not faster.
+    pub fn eval_masked_batch(
+        &self,
+        xs: &[f32],
+        n: usize,
+        masks: &[bool],
+        logits: &mut [f32],
+        values: &mut [f32],
+        scratch: &mut BatchScratch,
+    ) {
+        let arch = &self.weights.arch;
+        assert_eq!(xs.len(), n * arch.obs_dim, "observation batch is the wrong length");
+        assert_eq!(masks.len(), n * arch.action_dim, "mask batch is the wrong length");
+        assert_eq!(logits.len(), n * arch.action_dim, "logit batch is the wrong length");
+        assert_eq!(values.len(), n, "value batch is the wrong length");
+        if n == 0 {
+            return;
+        }
+
+        let (Some(lane), Some(batch)) = (&self.lane, scratch.lane.as_mut()) else {
+            for row in 0..n {
+                let x = &xs[row * arch.obs_dim..(row + 1) * arch.obs_dim];
+                let mask = &masks[row * arch.action_dim..(row + 1) * arch.action_dim];
+                let out = &mut logits[row * arch.action_dim..(row + 1) * arch.action_dim];
+                values[row] = self.eval_masked_with(x, mask, out, &mut scratch.row);
+            }
+            return;
+        };
+
+        lane.trunk_batch(&self.weights, xs, n, batch);
+        lane.value_batch(&self.weights, batch, values);
+        // The policy head stays per-row: every position has a different legal mask, so there
+        // is no shared work to batch — ~21 of `action_dim` logits each.
+        let row_scratch = scratch
+            .row
+            .lane
+            .as_mut()
+            .expect("a lane evaluator builds a lane scratch");
+        for row in 0..n {
+            lane.unpack_row(&self.weights, batch, row, row_scratch);
+            let mask = &masks[row * arch.action_dim..(row + 1) * arch.action_dim];
+            let out = &mut logits[row * arch.action_dim..(row + 1) * arch.action_dim];
+            lane.policy_masked(&self.weights, mask, out, row_scratch);
+        }
+    }
+
+    /// Buffers for [`Self::eval_masked_batch`] at up to `cap` rows per call.
+    pub fn batch_scratch(&self, cap: usize) -> BatchScratch {
+        let arch = &self.weights.arch;
+        BatchScratch {
+            lane: self
+                .lane
+                .is_some()
+                .then(|| LaneBatchScratch::new(arch, cap.max(1))),
+            row: Scratch::new(arch),
+        }
+    }
+}
+
+/// Working buffers for [`MlpEvaluator::eval_masked_batch`].
+///
+/// Holds the batched trunk's buffers plus one single-row scratch the heads reuse. Get one
+/// from [`MlpEvaluator::batch_scratch`] and keep it for the life of the loop — a self-play
+/// worker allocates exactly one.
+pub struct BatchScratch {
+    lane: Option<LaneBatchScratch>,
+    row: Scratch,
 }
 
 impl Evaluator for MlpEvaluator {

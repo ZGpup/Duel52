@@ -302,6 +302,69 @@ about that distinction since the first flip-timing curve and should stay careful
 These are findings about the instrument rather than the game, kept because they decide what to
 do next.
 
+### F4.7: self-play is 94% neural network, and 3.26x of it was free
+
+Measured 2026-09-09 on the 8-core M2 laptop (Mac14,7, 4 performance + 4 efficiency cores),
+`runs/sixth/checkpoints/best.d52nn` (lane 128×3), split, `encoding_slots = 21`, 512 games from
+seed 1 at `--sims 256 --cap-sims 32 --full-search-fraction 0.25`.
+
+**Where the time goes.** A `sample` profile of self-play, discounting the main thread parked
+in `pthread_join`, puts **89.3% of worker CPU in `LaneBody::trunk`** and 94.2% in the forward
+pass as a whole. Determinization, legal-action enumeration, encoding and the game logic
+together are under 5%. Any statement of the form "self-play is slow because of X" where X is
+not the network is wrong on this architecture.
+
+**Why one position at a time is slow.** The trunk runs at **1.95 GMAC/s, about 14% of the
+chip's four-wide f32 throughput**. Not a coding defect: a dot product is a reduction, each
+step needing the previous accumulator, and the standard escape — several accumulators — is
+the reassociation `nn/mlp.rs`'s determinism contract forbids. Its whole value is 1.7x
+(2.22 → 3.87 GMAC/s), which is not worth the contract. Note that this is *not* a bandwidth
+wall, which was the first hypothesis and was wrong: a 64 KB L1-resident weight set runs at
+2.22 GMAC/s and a 576 KB one at 1.95, near enough the same.
+
+**Batching across games.** With activations laid out `[feature][batch]` the batch index goes
+in the inner loop, which vectorises without touching the summation order, so each row still
+sums ascending `j` from the same bias and is **bit-identical**. Trunk alone: 1.95 GMAC/s at
+one position, 3.80 at 16, 7.56 at 32, **11.93 at 64** (~85% of the ceiling). End to end, 512
+games on 8 threads:
+
+| `--eval-batch` | wall clock | speed-up |
+|---:|---:|---:|
+| 1 | 225.5 s | 1.00x |
+| 32 | 88.6 s | 2.54x |
+| 64 | 69.3 s | **3.26x** |
+
+Every one of those shards is byte-identical to the `--eval-batch 1` shard, and to the shard
+the pre-change binary wrote. That is the finding: it is a speed result with **no accompanying
+strength claim to verify**, because the games are the same games.
+
+⚠️ **Two ways to measure this wrong, both of which I did first.** The batch is clamped to
+`games / threads`, so a 100-game benchmark on 8 threads caps it at 12 and reports 1.13x for a
+change worth 3.26x. And a batched kernel that accumulates into a slice of its output buffer
+runs at the *unbatched* speed (1.9 GMAC/s against 11.9), because the compiler cannot rule out
+aliasing with the weights; the accumulators have to be a fixed-size stack array.
+
+**What is not covered.** The gate and reference panel still evaluate one position at a time,
+and they are 47% of a `train-3h-new` generation, so the loop-level gain is nearer 1.8x.
+
+**The negative result alongside it.** Restricting self-play to the 4 performance cores is
+*slower*, not faster, despite `selfplay.rs` sharding statically with no work stealing: an
+efficiency core is 3.79x slower than a performance core (88.3 s against 23.3 s for the same 10
+games) but still contributes, and macOS migrates the stragglers onto performance cores as the
+fast shards drain. 100 games, median of three: 8 threads 52.6 s, 4 threads 70.0 s, 6 threads
+~59 s equivalent. Oversubscribing to 12/16/32 threads to recover the remaining tail does not
+pay either. `threads = 0` is right and needs no change.
+
+**And the GPU, assessed and declined.** The 10-core GPU is already used — `train.device =
+"auto"` resolves to MPS — for the gradient step, which is 2–4% of the loop; MPS is 1.82x
+faster there (13.27 → 7.28 ms/step at batch 512), worth about four seconds of a 21-minute
+generation. It cannot take the inference, which is the 94%, because at batch 1 **MPS is
+slower than the CPU** (617 µs against 322 µs per evaluation) and only overtakes above batch
+~128. Batched, MPS reaches ~303k evals/sec against a batched CPU's ~120–150k — so the GPU is
+worth perhaps 1.7x *on top of* batching, for a rewrite of the engine's inference path in a
+framework the engine deliberately has no dependency on. Batching was the whole prize; the GPU
+is not worth it on this machine.
+
 ### F4.6: building the lane symmetry into the architecture closes it completely, and playout cap randomisation pays for the cost
 
 `runs/sixth`, `configs/train-3h-new.toml`, split, `encoding_slots = 21`, `run.seed = 5000000`

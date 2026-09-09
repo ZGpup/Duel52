@@ -51,7 +51,7 @@
 //! `obs_dim × width`. The policy head *shrinks* by a factor of `lanes`, because one shared
 //! `width × lane_action` matrix replaces `width × action_dim`.
 
-use super::mlp::{layer_norm, matvec, matvec_add, relu};
+use super::mlp::{layer_norm, matvec, matvec_add, relu, LN_EPS};
 use super::weights::{Arch, Weights};
 use crate::config::GameConfig;
 use crate::encode::lane_structure;
@@ -172,20 +172,25 @@ impl LaneBody {
         }
     }
 
-    /// `h_l` for every lane, then `p`, left in `scratch`.
-    pub(super) fn trunk(&self, weights: &Weights, x: &[f32], scratch: &mut LaneScratch) {
+    /// The input projection for one observation: `h` holds `lanes × width`, normalised and
+    /// rectified, ready for the blocks.
+    ///
+    /// Split out of [`Self::trunk`] so that [`Self::trunk_batch`] runs **exactly this code**
+    /// per row before it transposes into the batched layout. The input layer is the one part
+    /// of the trunk that does not batch — it walks each observation's own ~205 non-zeros
+    /// (`FINDINGS.md` F3.3) — and sharing the function is what stops the two paths drifting.
+    fn input_row(&self, weights: &Weights, x: &[f32], h: &mut [f32], g: &mut [f32]) {
         let arch = &weights.arch;
         let w = &weights.params;
         let i = &self.idx;
         let (width, lanes) = (arch.width, arch.lanes);
 
-        // --- input ------------------------------------------------------------------
         // Each lane starts at the shared bias; the global projection accumulates separately
         // and is added to every lane afterwards, so `glob_in` needs no bias of its own.
         for l in 0..lanes {
-            scratch.h[l * width..(l + 1) * width].copy_from_slice(&w[i.lane_in_b]);
+            h[l * width..(l + 1) * width].copy_from_slice(&w[i.lane_in_b]);
         }
-        scratch.g.iter_mut().for_each(|v| *v = 0.0);
+        g.iter_mut().for_each(|v| *v = 0.0);
 
         // One ascending pass over the observation. Ascending because the accumulation order
         // is part of the contract (`mlp.rs`'s module header): every accumulator here is
@@ -197,26 +202,37 @@ impl LaneBody {
             let owner = self.obs_owner[index];
             if owner.lane == GLOBAL {
                 let row = &self.glob_in_wt[owner.k as usize * width..][..width];
-                for (acc, &wj) in scratch.g.iter_mut().zip(row) {
+                for (acc, &wj) in g.iter_mut().zip(row) {
                     *acc += value * wj;
                 }
             } else {
                 let row = &self.lane_in_wt[owner.k as usize * width..][..width];
-                let h = &mut scratch.h[owner.lane as usize * width..][..width];
-                for (acc, &wj) in h.iter_mut().zip(row) {
+                let hl = &mut h[owner.lane as usize * width..][..width];
+                for (acc, &wj) in hl.iter_mut().zip(row) {
                     *acc += value * wj;
                 }
             }
         }
 
         for l in 0..lanes {
-            let h = &mut scratch.h[l * width..(l + 1) * width];
-            for (acc, &gj) in h.iter_mut().zip(scratch.g.iter()) {
+            let hl = &mut h[l * width..(l + 1) * width];
+            for (acc, &gj) in hl.iter_mut().zip(g.iter()) {
                 *acc += gj;
             }
-            layer_norm(h, &w[i.ln_in], &w[i.ln_in + 1]);
-            relu(h);
+            layer_norm(hl, &w[i.ln_in], &w[i.ln_in + 1]);
+            relu(hl);
         }
+    }
+
+    /// `h_l` for every lane, then `p`, left in `scratch`.
+    pub(super) fn trunk(&self, weights: &Weights, x: &[f32], scratch: &mut LaneScratch) {
+        let arch = &weights.arch;
+        let w = &weights.params;
+        let i = &self.idx;
+        let (width, lanes) = (arch.width, arch.lanes);
+
+        // --- input ------------------------------------------------------------------
+        self.input_row(weights, x, &mut scratch.h, &mut scratch.g);
 
         // --- blocks -----------------------------------------------------------------
         let scale = 1.0 / lanes as f32;
@@ -337,6 +353,308 @@ impl LaneBody {
         }
         acc.tanh()
     }
+
+    /// The trunk for `bs` observations at once.
+    ///
+    /// # Why this exists
+    ///
+    /// The trunk is ~89% of self-play's CPU time, and at one position per call it runs at
+    /// about 14% of what the chip can do. The reason is the shape of [`matvec`]: a dot
+    /// product is a *reduction*, every step needing the previous step's accumulator, so a
+    /// single position cannot fill the machine's four-wide f32 units however it is written.
+    /// Breaking the reduction into several accumulators would change the summation order,
+    /// which `mlp.rs`'s module header makes a contract.
+    ///
+    /// The batch index does not have that problem. `out[i][b]` for different `b` are
+    /// completely independent, so laying the activations out `[feature][batch]` and putting
+    /// the batch in the inner loop fills the units without touching the reduction at all.
+    ///
+    /// # Why it is bit-identical
+    ///
+    /// **This is the property the whole design rests on.** [`matmat`] accumulates over `j`
+    /// in the same ascending order as [`matvec`], starting from the same bias, so every
+    /// `(i, b)` sees the identical sequence of f32 operations it would have seen alone.
+    /// Nothing here depends on `bs` or on which other positions share the batch — so a game
+    /// evaluated in a batch of 64 produces the same bits as the same game evaluated alone,
+    /// and self-play stays reproducible from its seed whatever `--eval-batch` is set to.
+    /// `phase4_batched_trunk_is_bit_identical_to_the_single_row_trunk` is the guard.
+    pub(super) fn trunk_batch(
+        &self,
+        weights: &Weights,
+        xs: &[f32],
+        bs: usize,
+        scratch: &mut LaneBatchScratch,
+    ) {
+        let arch = &weights.arch;
+        let w = &weights.params;
+        let i = &self.idx;
+        let (width, lanes) = (arch.width, arch.lanes);
+        assert!(bs > 0, "an empty batch has nothing to evaluate");
+        assert!(bs <= scratch.cap, "batch is larger than the scratch was built for");
+        assert_eq!(
+            xs.len(),
+            bs * arch.obs_dim,
+            "observation batch is the wrong length"
+        );
+        scratch.rows = bs;
+        let ls = width * bs;
+
+        // --- input ------------------------------------------------------------------
+        // Per row, through the same `input_row` the unbatched path uses, then transposed
+        // into `[feature][batch]`. The input layer is sparse per observation and does not
+        // batch; it is ~6% of the trunk, so it is not worth contorting.
+        for b in 0..bs {
+            let x = &xs[b * arch.obs_dim..(b + 1) * arch.obs_dim];
+            self.input_row(weights, x, &mut scratch.row_h, &mut scratch.row_g);
+            for (j, &v) in scratch.row_h.iter().enumerate() {
+                scratch.h[j * bs + b] = v;
+            }
+        }
+
+        // --- blocks -----------------------------------------------------------------
+        let scale = 1.0 / lanes as f32;
+        for blk in 0..arch.blocks {
+            let at = i.blocks_at + blk * 7;
+
+            scratch.n[..lanes * ls].copy_from_slice(&scratch.h[..lanes * ls]);
+            for l in 0..lanes {
+                layer_norm_batch(
+                    &mut scratch.n[l * ls..l * ls + ls],
+                    &w[at],
+                    &w[at + 1],
+                    bs,
+                    width,
+                    &mut scratch.mean,
+                    &mut scratch.inv,
+                );
+            }
+            scratch.m[..ls].iter_mut().for_each(|v| *v = 0.0);
+            for l in 0..lanes {
+                let src = &scratch.n[l * ls..l * ls + ls];
+                for (acc, &nj) in scratch.m[..ls].iter_mut().zip(src) {
+                    *acc += nj;
+                }
+            }
+            scratch.m[..ls].iter_mut().for_each(|v| *v *= scale);
+
+            matmat(&w[at + 3], None, &scratch.m, width, width, &mut scratch.mix, bs);
+
+            for l in 0..lanes {
+                let src = &scratch.n[l * ls..l * ls + ls];
+                matmat(&w[at + 2], Some(&w[at + 4]), src, width, width, &mut scratch.t, bs);
+                for k in 0..ls {
+                    let v = scratch.t[k] + scratch.mix[k];
+                    scratch.t[k] = if v < 0.0 { 0.0 } else { v };
+                }
+                matmat(
+                    &w[at + 5],
+                    Some(&w[at + 6]),
+                    &scratch.t,
+                    width,
+                    width,
+                    &mut scratch.r,
+                    bs,
+                );
+                let dst = &mut scratch.h[l * ls..l * ls + ls];
+                for (acc, &rj) in dst.iter_mut().zip(scratch.r[..ls].iter()) {
+                    *acc += rj;
+                }
+            }
+        }
+
+        // --- output norm and the invariant pooled state ------------------------------
+        for l in 0..lanes {
+            layer_norm_batch(
+                &mut scratch.h[l * ls..l * ls + ls],
+                &w[i.ln_out],
+                &w[i.ln_out + 1],
+                bs,
+                width,
+                &mut scratch.mean,
+                &mut scratch.inv,
+            );
+        }
+        scratch.p[..ls].iter_mut().for_each(|v| *v = 0.0);
+        for l in 0..lanes {
+            let src = &scratch.h[l * ls..l * ls + ls];
+            for (acc, &hj) in scratch.p[..ls].iter_mut().zip(src) {
+                *acc += hj;
+            }
+        }
+        scratch.p[..ls].iter_mut().for_each(|v| *v *= scale);
+    }
+
+    /// The value head for every row of a finished [`Self::trunk_batch`].
+    ///
+    /// Batched for the same reason the trunk is, and it became worth doing only once the
+    /// trunk was: at one position per call it is ~4% of self-play, and with the trunk 2×
+    /// faster it is ~11% of what is left. Same arithmetic as [`Self::value`], so the same
+    /// bits — `out` receives the network's own `(-1, 1)` output, rescaling is the caller's.
+    pub(super) fn value_batch(
+        &self,
+        weights: &Weights,
+        scratch: &mut LaneBatchScratch,
+        out: &mut [f32],
+    ) {
+        let arch = &weights.arch;
+        let w = &weights.params;
+        let i = &self.idx;
+        let bs = scratch.rows;
+        debug_assert!(out.len() >= bs);
+
+        matmat(
+            &w[i.value1_w],
+            Some(&w[i.value1_b]),
+            &scratch.p,
+            arch.width,
+            arch.value_hidden,
+            &mut scratch.v,
+            bs,
+        );
+        for x in scratch.v[..arch.value_hidden * bs].iter_mut() {
+            if *x < 0.0 {
+                *x = 0.0;
+            }
+        }
+        // One output row: the same `bias + Σⱼ w·v` the single-row head runs.
+        matmat(
+            &w[i.value2_w],
+            Some(&w[i.value2_b]),
+            &scratch.v,
+            arch.value_hidden,
+            1,
+            out,
+            bs,
+        );
+        for x in out[..bs].iter_mut() {
+            *x = x.tanh();
+        }
+    }
+
+    /// Lift row `b` of a finished [`Self::trunk_batch`] into a single-row [`LaneScratch`].
+    ///
+    /// The heads then run through [`Self::policy_masked`] and [`Self::value`] unchanged,
+    /// which is deliberate: they are ~4% of the cost and every position has a different
+    /// legal mask, so batching them would buy nothing and give the two paths a second place
+    /// to disagree.
+    pub(super) fn unpack_row(
+        &self,
+        weights: &Weights,
+        batch: &LaneBatchScratch,
+        b: usize,
+        out: &mut LaneScratch,
+    ) {
+        let arch = &weights.arch;
+        let (width, lanes) = (arch.width, arch.lanes);
+        let bs = batch.rows;
+        debug_assert!(b < bs, "row {b} is not in a batch of {bs}");
+        for j in 0..lanes * width {
+            out.h[j] = batch.h[j * bs + b];
+        }
+        for j in 0..width {
+            out.p[j] = batch.p[j * bs + b];
+        }
+    }
+}
+
+/// `out[i][b] = bias[i] + Σⱼ w[i][j] · x[j][b]`, with `x` and `out` laid out
+/// `[feature][batch]`.
+///
+/// The batched twin of [`matvec`], and deliberately the same arithmetic: the accumulator
+/// starts at the bias and takes `j` in ascending order, so each `(i, b)` gets bit-for-bit
+/// what [`matvec`] would have given it. The inner loop is over the batch, which is the
+/// dimension that carries no dependency and therefore vectorises.
+/// Batch columns accumulated in one pass, and the reason it is a fixed-size array.
+///
+/// ⚠️ **The accumulators must live in a stack array of compile-time size, not in a slice of
+/// `out`.** Written the obvious way — accumulating straight into `out[i*bs..]` — the compiler
+/// cannot prove the output does not alias `w` or `x`, so it reloads and restores the
+/// accumulator on every one of the `in_dim` iterations and the kernel runs at roughly the
+/// speed of the unbatched one. Measured on an M2 at width 128: 1.9 GMAC/s accumulating into
+/// the output slice against 11.9 GMAC/s into a stack array. A local array cannot alias
+/// anything, so it stays in vector registers for the whole reduction.
+///
+/// 64 f32 is 16 NEON registers of the 32 an ARM64 core has, which leaves room for the
+/// weight broadcast and the activation loads.
+const TILE: usize = 64;
+
+fn matmat(
+    w: &[f32],
+    bias: Option<&[f32]>,
+    x: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    out: &mut [f32],
+    bs: usize,
+) {
+    debug_assert_eq!(w.len(), out_dim * in_dim);
+    debug_assert!(x.len() >= in_dim * bs);
+    debug_assert!(out.len() >= out_dim * bs);
+    for i in 0..out_dim {
+        let row = &w[i * in_dim..(i + 1) * in_dim];
+        let start = bias.map_or(0.0, |b| b[i]);
+        let mut lo = 0usize;
+        while lo < bs {
+            let n = TILE.min(bs - lo);
+            let mut acc = [start; TILE];
+            let a = &mut acc[..n];
+            for (j, &wj) in row.iter().enumerate() {
+                let xr = &x[j * bs + lo..j * bs + lo + n];
+                for (v, &xb) in a.iter_mut().zip(xr) {
+                    *v += wj * xb;
+                }
+            }
+            out[i * bs + lo..i * bs + lo + n].copy_from_slice(a);
+            lo += n;
+        }
+    }
+}
+
+/// [`layer_norm`] over `width` features for each of `bs` rows laid out `[feature][batch]`.
+///
+/// Same order as the single-row version — mean over ascending `j`, then the biased variance,
+/// then `1/√(var + ε)` — so the result is bit-identical per row. `mean` and `inv` are
+/// caller-owned so nothing allocates in the hot loop.
+fn layer_norm_batch(
+    x: &mut [f32],
+    gamma: &[f32],
+    beta: &[f32],
+    bs: usize,
+    width: usize,
+    mean: &mut [f32],
+    inv: &mut [f32],
+) {
+    let n = width as f32;
+    let mean = &mut mean[..bs];
+    let inv = &mut inv[..bs];
+
+    mean.iter_mut().for_each(|v| *v = 0.0);
+    for j in 0..width {
+        let xr = &x[j * bs..(j + 1) * bs];
+        for (acc, &v) in mean.iter_mut().zip(xr) {
+            *acc += v;
+        }
+    }
+    mean.iter_mut().for_each(|v| *v /= n);
+
+    inv.iter_mut().for_each(|v| *v = 0.0);
+    for j in 0..width {
+        let xr = &x[j * bs..(j + 1) * bs];
+        for ((acc, &v), &mu) in inv.iter_mut().zip(xr).zip(mean.iter()) {
+            let d = v - mu;
+            *acc += d * d;
+        }
+    }
+    inv.iter_mut()
+        .for_each(|v| *v = 1.0 / (*v / n + LN_EPS).sqrt());
+
+    for j in 0..width {
+        let (g, be) = (gamma[j], beta[j]);
+        let xr = &mut x[j * bs..(j + 1) * bs];
+        for ((v, &mu), &iv) in xr.iter_mut().zip(mean.iter()).zip(inv.iter()) {
+            *v = (*v - mu) * iv * g + be;
+        }
+    }
 }
 
 /// Working buffers for the lane forward pass.
@@ -356,6 +674,54 @@ pub(super) struct LaneScratch {
     /// `width` — the pooled, lane-invariant state the value head and `CHOOSE_RANK` read.
     p: Vec<f32>,
     v: Vec<f32>,
+}
+
+/// Working buffers for [`LaneBody::trunk_batch`], sized for a batch of `cap` rows.
+///
+/// Everything from `h` down to `p` is laid out `[feature][batch]` with a stride of the
+/// batch's *current* size, so a short final batch does no work on unused columns. `row_h`
+/// and `row_g` are the single-row buffers the input projection fills before the transpose.
+pub(super) struct LaneBatchScratch {
+    /// Rows this was allocated for.
+    cap: usize,
+    /// Rows the last [`LaneBody::trunk_batch`] filled — the stride `unpack_row` reads with.
+    rows: usize,
+    h: Vec<f32>,
+    n: Vec<f32>,
+    m: Vec<f32>,
+    mix: Vec<f32>,
+    t: Vec<f32>,
+    r: Vec<f32>,
+    p: Vec<f32>,
+    /// `value_hidden × batch` — the value head's hidden layer.
+    v: Vec<f32>,
+    row_h: Vec<f32>,
+    row_g: Vec<f32>,
+    /// Per-row LayerNorm intermediates, `cap` long.
+    mean: Vec<f32>,
+    inv: Vec<f32>,
+}
+
+impl LaneBatchScratch {
+    pub(super) fn new(arch: &Arch, cap: usize) -> LaneBatchScratch {
+        let w = arch.width;
+        LaneBatchScratch {
+            cap,
+            rows: 0,
+            h: vec![0.0; arch.lanes * w * cap],
+            n: vec![0.0; arch.lanes * w * cap],
+            m: vec![0.0; w * cap],
+            mix: vec![0.0; w * cap],
+            t: vec![0.0; w * cap],
+            r: vec![0.0; w * cap],
+            p: vec![0.0; w * cap],
+            v: vec![0.0; arch.value_hidden * cap],
+            row_h: vec![0.0; arch.lanes * w],
+            row_g: vec![0.0; w],
+            mean: vec![0.0; cap],
+            inv: vec![0.0; cap],
+        }
+    }
 }
 
 impl LaneScratch {

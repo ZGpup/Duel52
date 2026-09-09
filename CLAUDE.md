@@ -220,6 +220,12 @@ netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.
 # The pieces, runnable on their own when something looks wrong.
 ./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \
     --out /tmp/gen.d52sp --games 200 --sims 64 --encoding-slots 21
+# `--eval-batch N` keeps N games in flight per thread so their forward passes batch
+# (PLAN.md §4.2d). 3.26x at 64 on the laptop, and the shard is byte-identical to
+# `--eval-batch 1` — it is a speed knob and nothing else. Clamped to games/threads.
+./target/release/duel52 selfplay --checkpoint runs/sixth/checkpoints/best.d52nn \
+    --out /tmp/gen.d52sp --games 512 --sims 256 --cap-sims 32 \
+    --full-search-fraction 0.25 --encoding-slots 21 --eval-batch 64
 ./target/release/duel52 shard /tmp/gen.d52sp                      # header + replay check
 ./target/release/duel52 match --a netmcts:runs/first/checkpoints/best.d52nn@64 \
     --b ismcts:800 --games 200 --encoding-slots 21
@@ -288,6 +294,30 @@ versioned. And **`lane_augment` is pointless on `arch = "lane"`**: the network s
 `f(σ·x) = σ·f(x)`, so a relabelled sample gives the identical loss *and* the identical gradient
 (`test_lane_augmentation_is_a_no_op_on_the_lane_equivariant_network`). F4.5's +82 Elo was an
 augmentation result on the *flat* net and does not carry over.
+
+⚠️ **`--eval-batch` is a pure speed knob, and it is the only one — do not treat it as a
+hyperparameter.** `PLAN.md` §4.2d. Self-play keeps N games in flight per thread and evaluates
+their positions together; **the batch is taken across games, never inside a search**, so no
+game's search is altered and `LaneBody::trunk_batch` is bit-identical per row. The shard is
+therefore byte-identical whatever N is, which
+`phase4_a_shard_does_not_depend_on_the_evaluation_batch` and
+`phase4_batched_evaluation_is_bit_identical` assert — the latter on `to_bits`, deliberately,
+because a tolerance would pass exactly the reassociation the determinism contract forbids.
+3.26x at 64 on the laptop; `configs/train-3h-new.toml` sets it.
+
+Three things to keep straight. **The batch is clamped to `selfplay.games / run.threads`** —
+1400 over 8 is 175, fine, but a 200-game generation on 8 cores gets 25 and the config's 64 is
+silently a lie; `train check` prints the effective number. **It costs ~400 KB of live search
+tree per game in flight**, so 64 × 8 threads is ~200 MB. And **the gate does not have it
+yet**: `ladder.rs` still evaluates one position at a time, and the gate plus panel is 47% of a
+`train-3h-new` generation, so the loop-level gain is nearer 1.8x than 3.26x.
+
+⚠️ **If you write a batched kernel, the accumulators must be a fixed-size stack array.**
+Accumulating straight into a slice of the output — the obvious way — leaves the compiler
+unable to prove the output does not alias the weights, so it reloads and restores on every
+step of the reduction and the batched kernel runs at *the speed of the unbatched one*: 1.9
+GMAC/s against 11.9 for the same arithmetic. This was measured the hard way. `matmat`'s
+`TILE` and its comment are the record.
 
 ⚠️ **A `.d52sp` shard is version 3 as of Stage 1, and version 2 shards are refused.** The
 per-sample `policy_target` byte is not optional the way the checkpoint's `arch` key is: it sits

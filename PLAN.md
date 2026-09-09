@@ -297,6 +297,47 @@ and the second is a run whose only change is a speed up. Attribution survives be
 its own specific readout — `duel52.lanes` for the first, the policy target count for the
 second.
 
+**§4.2d, batched evaluation.** Done 2026-09-09, and the only change in this project so far
+that is provably free. Profiling self-play found the lane trunk at **89% of worker CPU** —
+determinization, legality and encoding together are under 5% — running at about **14% of the
+chip's arithmetic width**. The cause is structural rather than sloppy: a dot product is a
+reduction, every step needing the previous step's accumulator, so one position cannot fill
+four-wide f32 units however the loop is written, and the escape that would work — several
+accumulators — is precisely the reassociation `nn/mlp.rs`'s determinism contract forbids
+(measured at 1.7x for the whole cost of breaking the contract).
+
+The batch index has no such dependency. Evaluating `B` positions with the activations laid
+out `[feature][batch]` puts the batch in the inner loop, which vectorises **without touching
+the summation order**, so each row still sums ascending `j` from the same bias and comes out
+bit-for-bit identical. Measured on the trunk alone: 1.95 GMAC/s at one position, 11.93 at 64.
+
+The batch is taken **across games, never inside a search**. A worker keeps `G` games in
+flight, advances each to the point it needs the network, and evaluates the round in one call;
+no game's search is altered, so every game is still reproducible from its own seed. This is
+the design `engine/src/nn/mod.rs`'s `Evaluator` header specified before there was a consumer
+for it. The alternative — leaf parallelism with virtual loss — was rejected on measurement
+grounds, not taste: it changes the visit distribution by an amount that depends on how peaked
+the prior is, so it distorts the *differences* between agents rather than offsetting them,
+which would invalidate F4.1's +81 and F4.5's +82 and unfreeze the gen031 reference row. It
+also cannot fill a batch at `cap_sims = 32`.
+
+Cost, on the 8-core laptop at 512 games, lane 128x3, 256 sims with capping:
+
+| `--eval-batch` | wall clock | speed-up |
+|---:|---:|---:|
+| 1 | 225.5 s | 1.00x |
+| 32 | 88.6 s | 2.54x |
+| 64 | 69.3 s | **3.26x** |
+
+⚠️ The batch is clamped to `selfplay.games / run.threads`, so a small generation on many
+cores silently gets a smaller one — `train check` prints the effective number. It costs about
+400 KB of live search tree per game in flight.
+
+**What it does not cover: the gate.** `ladder.rs` still plays one position at a time, and for
+`train-3h-new` the gate and panel are 47% of a generation. So the loop-level gain is nearer
+1.8x than 3.26x until the same treatment reaches `run_match`. That is the obvious next piece
+and it is not done.
+
 **The trap this uncovered, which item 7 must not walk into.** Depth on the equivariant net
 costs far more than the parameter count suggests, because in the search path the input layer
 is sparse and the policy head is masked, so the trunk is the whole cost. `lane 128 x 6` runs at

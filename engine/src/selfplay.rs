@@ -35,9 +35,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::agents::{NetMctsAgent, RootNoise};
+use crate::action::Action;
+use crate::agents::{NetMctsAgent, RootNoise, SearchInProgress, SearchResult, SearchStep};
 use crate::config::GameConfig;
-use crate::encode::{action_layout_hash, obs_layout_hash};
+use crate::encode::{action_dim, action_layout_hash, obs_dim, obs_layout_hash};
 use crate::outcome::{DrawReason, Outcome};
 use crate::player::Player;
 use crate::rng::Rng;
@@ -204,42 +205,143 @@ pub fn play_game(
     checkpoint: &Path,
     seed: u64,
 ) -> GameRecord {
-    let mut state = GameState::new(config, seed);
-    let mut agent = NetMctsAgent::derived(checkpoint, seed, SEARCH_STREAM, sp.sims)
-        .with_c_puct(sp.c_puct)
-        .with_root_noise(Some(sp.noise));
-    let mut rng = Rng::derive(seed, PICK_STREAM);
-    // Its own stream, so which decisions get the full budget is reproducible from the seed
-    // and independent of how many random draws the move sampling happens to make.
-    let mut cap_rng = Rng::derive(seed, CAP_STREAM);
-    let capping = sp.full_search_fraction < 1.0;
-    let mut samples: Vec<Sample> = Vec::new();
+    let evaluator = crate::nn::evaluator_for(checkpoint, &config)
+        .unwrap_or_else(|e| panic!("netmcts: {e}"));
+    let (od, ad) = (obs_dim(&config), action_dim(&config));
+    let mut obs = vec![0.0f32; od];
+    let mut mask = vec![false; ad];
+    let mut logits = vec![0.0f32; ad];
+    let mut scratch = evaluator.scratch();
 
-    while !state.outcome.is_over() {
-        let legal = state.legal_actions();
-        if legal.len() == 1 {
-            // Forced. No search, no sample — and the replay skips it by the same rule.
-            state.apply_trusted(legal[0]);
-            continue;
+    let mut runner = GameRunner::new(config, sp, checkpoint, seed);
+    while runner.advance(sp, &mut obs, &mut mask) == SearchStep::NeedsEval {
+        let value = evaluator.eval_masked_with(&obs, &mask, &mut logits, &mut scratch);
+        runner.supply(&logits, value, &mut mask);
+    }
+    runner.take_record().expect("a finished game has a record")
+}
+
+/// One self-play game, driven a network evaluation at a time.
+///
+/// The same loop [`play_game`] always ran, turned inside out so the caller owns it. That is
+/// what lets a worker keep `G` games in flight and evaluate the round in one batch
+/// (`PLAN.md` §4.2d) — the batch is taken across *games*, so no individual game's search is
+/// altered and every one of them stays reproducible from its own seed.
+///
+/// There is exactly one implementation: [`play_game`] is this type driven one row at a time.
+struct GameRunner {
+    seed: u64,
+    state: GameState,
+    agent: NetMctsAgent,
+    rng: Rng,
+    cap_rng: Rng,
+    capping: bool,
+    samples: Vec<Sample>,
+    /// The legal actions of the decision being searched — the index `chosen` refers to.
+    legal: Vec<Action>,
+    policy_target: bool,
+    search: Option<SearchInProgress>,
+    record: Option<GameRecord>,
+}
+
+impl GameRunner {
+    fn new(config: GameConfig, sp: &SelfPlayConfig, checkpoint: &Path, seed: u64) -> GameRunner {
+        GameRunner {
+            seed,
+            state: GameState::new(config, seed),
+            agent: NetMctsAgent::derived(checkpoint, seed, SEARCH_STREAM, sp.sims)
+                .with_c_puct(sp.c_puct)
+                .with_root_noise(Some(sp.noise)),
+            rng: Rng::derive(seed, PICK_STREAM),
+            // Its own stream, so which decisions get the full budget is reproducible from
+            // the seed and independent of how many random draws the move sampling makes.
+            cap_rng: Rng::derive(seed, CAP_STREAM),
+            capping: sp.full_search_fraction < 1.0,
+            samples: Vec::new(),
+            legal: Vec::new(),
+            policy_target: true,
+            search: None,
+            record: None,
+        }
+    }
+
+    /// Play on until the game needs a network evaluation, or it is over.
+    ///
+    /// On [`SearchStep::NeedsEval`] the observation is in `obs` and the legal mask in
+    /// `mask`; answer with [`Self::supply`] passing the same `mask`.
+    fn advance(&mut self, sp: &SelfPlayConfig, obs: &mut [f32], mask: &mut [bool]) -> SearchStep {
+        loop {
+            if let Some(search) = &mut self.search {
+                match search.advance(&mut self.agent, obs, mask) {
+                    SearchStep::NeedsEval => return SearchStep::NeedsEval,
+                    SearchStep::Done => {
+                        let result = self.search.take().expect("just matched").finish();
+                        self.finish_decision(sp, result);
+                    }
+                }
+            } else if self.record.is_some() {
+                return SearchStep::Done;
+            } else {
+                self.begin_decision(sp);
+            }
+        }
+    }
+
+    fn supply(&mut self, logits: &[f32], value: f32, mask: &mut [bool]) {
+        let search = self
+            .search
+            .as_mut()
+            .expect("supply without a search in progress");
+        search.supply(&mut self.agent, logits, value, mask);
+    }
+
+    fn take_record(&mut self) -> Option<GameRecord> {
+        self.record.take()
+    }
+
+    /// Skip forced moves, pick this decision's budget, and open a search — or finish the
+    /// game if there is nothing left to decide.
+    fn begin_decision(&mut self, sp: &SelfPlayConfig) {
+        while !self.state.outcome.is_over() {
+            let legal = self.state.legal_actions();
+            if legal.len() == 1 {
+                // Forced. No search, no sample — and the replay skips it by the same rule.
+                self.state.apply_trusted(legal[0]);
+                continue;
+            }
+
+            // Playout cap randomisation. Noise rides with the full budget: Dirichlet noise
+            // on a 32-simulation search perturbs the prior without buying exploration, and
+            // the move actually played is worse for it.
+            let policy_target =
+                !self.capping || self.cap_rng.unit() < sp.full_search_fraction as f64;
+            if self.capping {
+                let sims = if policy_target { sp.sims } else { sp.cap_sims };
+                self.agent
+                    .set_budget(sims, policy_target.then_some(sp.noise));
+            }
+            self.policy_target = policy_target;
+            self.search = Some(self.agent.begin_search(&self.state, &legal));
+            self.legal = legal;
+            return;
         }
 
-        // Playout cap randomisation. Noise rides with the full budget: Dirichlet noise on a
-        // 32-simulation search perturbs the prior without buying exploration, and the move
-        // actually played is worse for it.
-        let policy_target = !capping || cap_rng.unit() < sp.full_search_fraction as f64;
-        if capping {
-            let sims = if policy_target { sp.sims } else { sp.cap_sims };
-            agent.set_budget(sims, policy_target.then_some(sp.noise));
-        }
+        self.record = Some(GameRecord {
+            seed: self.seed,
+            outcome: self.state.outcome,
+            samples: std::mem::take(&mut self.samples),
+        });
+    }
 
-        let result = agent.search(&state, &legal);
+    /// Turn a finished search into a sample and play the move.
+    fn finish_decision(&mut self, sp: &SelfPlayConfig, result: SearchResult) {
         let total: u32 = result.visits.iter().sum();
 
         let policy: Vec<(u16, f32)> = if total == 0 {
             // Only reachable at `sims == 1`, where the single simulation expands the root
             // and backs up without traversing an edge. Uniform is the honest target there.
-            let p = 1.0 / legal.len() as f32;
-            (0..legal.len()).map(|i| (i as u16, p)).collect()
+            let p = 1.0 / self.legal.len() as f32;
+            (0..self.legal.len()).map(|i| (i as u16, p)).collect()
         } else {
             result
                 .visits
@@ -250,8 +352,8 @@ pub fn play_game(
                 .collect()
         };
 
-        let chosen = if (samples.len() as u32) < sp.temperature_decisions {
-            sample_policy(&policy, sp.temperature, &mut rng)
+        let chosen = if (self.samples.len() as u32) < sp.temperature_decisions {
+            sample_policy(&policy, sp.temperature, &mut self.rng)
         } else {
             // Most-visited. Ties go to the lowest index, which is deterministic and matches
             // `NetMctsAgent::choose`.
@@ -268,23 +370,124 @@ pub fn play_game(
                 .0
         };
 
-        samples.push(Sample {
+        self.samples.push(Sample {
             chosen,
             root_value: result.root_value,
             // A capped search's visits are not a target, so they are not carried. Dropping
             // them here rather than at write time keeps the shard and the in-memory record
             // saying the same thing.
-            policy: if policy_target { policy } else { Vec::new() },
-            policy_target,
+            policy: if self.policy_target {
+                policy
+            } else {
+                Vec::new()
+            },
+            policy_target: self.policy_target,
         });
-        state.apply_trusted(legal[chosen as usize]);
+        self.state.apply_trusted(self.legal[chosen as usize]);
+    }
+}
+
+/// Play games `lo..hi` of a shard with up to `batch` of them in flight at once.
+///
+/// The speed-up this exists for is entirely in [`MlpEvaluator::eval_masked_batch`]: the lane
+/// trunk runs at ~14% of the machine's width on one position and ~85% on sixty-four, because
+/// the batch is the one dimension of the dot product that carries no dependency. Nothing
+/// about the games changes — see [`SearchInProgress`] — so the shard this writes is
+/// byte-identical to the one `batch = 1` writes.
+fn play_shard_batched(
+    config: GameConfig,
+    sp: &SelfPlayConfig,
+    checkpoint: &Path,
+    first_seed: u64,
+    lo: usize,
+    hi: usize,
+    batch: usize,
+    on_done: &mut dyn FnMut(),
+) -> Vec<GameRecord> {
+    let evaluator = crate::nn::evaluator_for(checkpoint, &config)
+        .unwrap_or_else(|e| panic!("netmcts: {e}"));
+    let (od, ad) = (obs_dim(&config), action_dim(&config));
+    let slots = batch.min(hi - lo).max(1);
+
+    let mut obs = vec![0.0f32; slots * od];
+    let mut masks = vec![false; slots * ad];
+    let mut logits = vec![0.0f32; slots * ad];
+    let mut values = vec![0.0f32; slots];
+    let mut scratch = evaluator.batch_scratch(slots);
+
+    let mut runners: Vec<Option<GameRunner>> = (0..slots).map(|_| None).collect();
+    let mut row_slot: Vec<usize> = Vec::with_capacity(slots);
+    let mut next = lo;
+    let mut out: Vec<GameRecord> = Vec::with_capacity(hi - lo);
+
+    loop {
+        let mut rows = 0usize;
+        row_slot.clear();
+        for slot in 0..slots {
+            if runners[slot].is_none() && next < hi {
+                runners[slot] = Some(GameRunner::new(
+                    config,
+                    sp,
+                    checkpoint,
+                    first_seed + next as u64,
+                ));
+                next += 1;
+            }
+            let Some(runner) = runners[slot].as_mut() else {
+                continue;
+            };
+            // Written at `rows`, not at `slot`, so the batch stays contiguous however many
+            // slots are idle. `advance` touches neither buffer unless it suspends.
+            match runner.advance(
+                sp,
+                &mut obs[rows * od..(rows + 1) * od],
+                &mut masks[rows * ad..(rows + 1) * ad],
+            ) {
+                SearchStep::NeedsEval => {
+                    row_slot.push(slot);
+                    rows += 1;
+                }
+                SearchStep::Done => {
+                    out.push(runner.take_record().expect("a finished game has a record"));
+                    runners[slot] = None;
+                    on_done();
+                }
+            }
+        }
+
+        if rows == 0 {
+            // Every live game contributes a row, so no rows means no live games.
+            debug_assert!(runners.iter().all(|r| r.is_none()));
+            if next >= hi {
+                break;
+            }
+            continue;
+        }
+
+        evaluator.eval_masked_batch(
+            &obs[..rows * od],
+            rows,
+            &masks[..rows * ad],
+            &mut logits[..rows * ad],
+            &mut values[..rows],
+            &mut scratch,
+        );
+        for (row, &slot) in row_slot.iter().enumerate() {
+            let runner = runners[slot]
+                .as_mut()
+                .expect("a batch row belongs to a live game");
+            runner.supply(
+                &logits[row * ad..(row + 1) * ad],
+                values[row],
+                &mut masks[row * ad..(row + 1) * ad],
+            );
+        }
     }
 
-    GameRecord {
-        seed,
-        outcome: state.outcome,
-        samples,
-    }
+    // Games finish out of order — a short game started later can end first — and the shard's
+    // bytes must not depend on that. Seeds are `first_seed + g`, so this is game order.
+    out.sort_by_key(|r| r.seed);
+    out
 }
 
 /// Sample an entry with probability proportional to `share^(1/temperature)`.
@@ -331,6 +534,7 @@ pub fn run(
     first_seed: u64,
     games: usize,
     threads: usize,
+    eval_batch: usize,
     generation: u32,
     out: &Path,
     progress: bool,
@@ -351,15 +555,14 @@ pub fn run(
     let done = AtomicUsize::new(0);
     let report_every = (games / 20).clamp(1, 500);
 
+    let eval_batch = eval_batch.max(1);
     let results: Vec<Vec<GameRecord>> = std::thread::scope(|scope| {
         let handles: Vec<_> = shards
             .iter()
             .map(|&(lo, hi)| {
                 let done = &done;
                 scope.spawn(move || {
-                    let mut out = Vec::with_capacity(hi - lo);
-                    for g in lo..hi {
-                        out.push(play_game(config, sp, checkpoint, first_seed + g as u64));
+                    let report = |done: &AtomicUsize| {
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if progress && (n % report_every == 0 || n == games) {
                             let secs = started.elapsed().as_secs_f64();
@@ -370,6 +573,23 @@ pub fn run(
                                 (games - n) as f64 / rate.max(1e-9)
                             );
                         }
+                    };
+                    if eval_batch > 1 {
+                        return play_shard_batched(
+                            config,
+                            sp,
+                            checkpoint,
+                            first_seed,
+                            lo,
+                            hi,
+                            eval_batch,
+                            &mut || report(done),
+                        );
+                    }
+                    let mut out = Vec::with_capacity(hi - lo);
+                    for g in lo..hi {
+                        out.push(play_game(config, sp, checkpoint, first_seed + g as u64));
+                        report(done);
                     }
                     out
                 })

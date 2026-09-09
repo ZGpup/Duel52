@@ -178,6 +178,13 @@ OPTIONS
   --cap-sims <n>                  simulations for a capped decision. Must be smaller than
                                   --sims, and is ignored when --full-search-fraction is 1
                                   (default 32)
+  --eval-batch <n>                games kept in flight per worker thread, so that their
+                                  network evaluations go through the trunk in one batch.
+                                  The batch is taken across games, never inside a search,
+                                  so the shard is byte-identical whatever this is set to —
+                                  it only changes how fast it is written. Costs ~400 KB of
+                                  live search tree per game per thread. 1 turns it off
+                                  (default 1)
   --c-puct <f>                    PUCT exploration constant (default 1.25)
   --dirichlet-alpha <f>           root noise concentration (default 0.3)
   --dirichlet-weight <f>          root noise share of the prior (default 0.25)
@@ -2307,6 +2314,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
     let mut out_path: Option<String> = None;
     let mut generation = 0u32;
     let mut quiet = false;
+    let mut eval_batch = 1usize;
     let mut sp = SelfPlayConfig::default();
 
     // Only the flags this command owns; everything else falls through to `parse_options`,
@@ -2334,6 +2342,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
                 sp.full_search_fraction = next_number(args, &mut i, "--full-search-fraction")?
             }
             "--cap-sims" => sp.cap_sims = next_number(args, &mut i, "--cap-sims")?,
+            "--eval-batch" => eval_batch = next_number(args, &mut i, "--eval-batch")?,
             "--quiet" => quiet = true,
             other => rest.push(other.to_string()),
         }
@@ -2371,6 +2380,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
         opts.seed,
         games,
         opts.threads,
+        eval_batch,
         generation,
         &out,
         !quiet,

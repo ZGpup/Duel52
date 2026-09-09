@@ -52,6 +52,10 @@ fn tiny() -> SelfPlayConfig {
 }
 
 fn write_shard(games: usize, threads: usize, tag: &str) -> PathBuf {
+    write_shard_batched(games, threads, 1, tag)
+}
+
+fn write_shard_batched(games: usize, threads: usize, eval_batch: usize, tag: &str) -> PathBuf {
     let out = std::env::temp_dir().join(format!(
         "duel52-shard-{}-{tag}.d52sp",
         std::process::id()
@@ -63,6 +67,7 @@ fn write_shard(games: usize, threads: usize, tag: &str) -> PathBuf {
         1,
         games,
         threads,
+        eval_batch,
         0,
         &out,
         false,
@@ -82,6 +87,39 @@ fn phase3_a_shard_does_not_depend_on_the_thread_count() {
         one, many,
         "the same six games sharded across four threads produced different bytes"
     );
+}
+
+/// The same, for `--eval-batch`, and it is the claim batched self-play is *for*.
+///
+/// `PLAN.md` §4.2d takes the evaluation batch across games rather than inside a search, so
+/// batching changes only when the network is consulted — never what it answers, because
+/// `LaneBody::trunk_batch` is bit-identical per row, and never which position is asked,
+/// because each game's search is untouched. If that holds, `--eval-batch` is a pure speed
+/// knob and every Elo number measured before it still stands. This is what says so.
+///
+/// The batch sizes deliberately straddle the game count: at 4 games and a batch of 8, most
+/// slots are idle and the rounds are short, which is the shape the end of every shard has.
+#[test]
+fn phase4_a_shard_does_not_depend_on_the_evaluation_batch() {
+    let one = std::fs::read(write_shard_batched(6, 2, 1, "b1")).expect("read shard");
+    for batch in [2usize, 3, 5, 8] {
+        let many = std::fs::read(write_shard_batched(6, 2, batch, &format!("b{batch}")))
+            .expect("read shard");
+        assert_eq!(
+            one,
+            many,
+            "six games at --eval-batch {batch} produced different bytes from --eval-batch 1"
+        );
+    }
+}
+
+/// Batching must not change a game even when it is the *only* game in flight, which is the
+/// case the tail of a shard always ends in.
+#[test]
+fn phase4_a_batched_game_matches_the_unbatched_one() {
+    let one = std::fs::read(write_shard_batched(1, 1, 1, "solo1")).expect("read shard");
+    let batched = std::fs::read(write_shard_batched(1, 1, 16, "solo16")).expect("read shard");
+    assert_eq!(one, batched, "a single game changed under --eval-batch 16");
 }
 
 /// The claim the whole storage design rests on: a recorded trajectory replays into exactly
@@ -300,6 +338,7 @@ fn phase3_more_simulations_visit_more_actions() {
             1,
             4,
             2,
+            1,
             0,
             &out,
             false,
@@ -496,7 +535,7 @@ fn phase4_capped_samples_carry_a_value_target_and_no_policy_target() {
         ..SelfPlayConfig::default()
     };
     let out = std::env::temp_dir().join(format!("duel52-pcr-{}.d52sp", std::process::id()));
-    selfplay::run(GameConfig::default(), &sp, &test_checkpoint(), 7, 12, 1, 0, &out, false)
+    selfplay::run(GameConfig::default(), &sp, &test_checkpoint(), 7, 12, 1, 1, 0, &out, false)
         .expect("self-play should write a shard");
 
     let shard = selfplay::Shard::read(&out).expect("read the shard back");

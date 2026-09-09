@@ -31,7 +31,7 @@ mod lane;
 mod mlp;
 mod weights;
 
-pub use mlp::{MlpEvaluator, Scratch};
+pub use mlp::{BatchScratch, MlpEvaluator, Scratch};
 pub use weights::{Arch, ArchKind, Weights, CHECKPOINT_MAGIC, CHECKPOINT_VERSION};
 
 use std::collections::HashMap;

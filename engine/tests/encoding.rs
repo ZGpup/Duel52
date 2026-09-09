@@ -636,6 +636,119 @@ fn phase4_the_lane_network_is_exactly_equivariant() {
     assert!(checked > 0, "no position was checked");
 }
 
+/// Evaluating a position in a batch gives **the same bits** as evaluating it alone.
+///
+/// This is the property batched self-play (`PLAN.md` §4.2d) rests on, and it is why that
+/// design is worth its extra complexity: batching changes *when* the network is consulted,
+/// never *what* it answers, so a game played with `--eval-batch 64` is the same game played
+/// with `--eval-batch 1` and every Elo number already measured survives the change.
+///
+/// Asserted on the **bits** rather than a tolerance, deliberately. A tolerance would pass a
+/// batched kernel that reassociated the reduction — which is exactly the change `mlp.rs`'s
+/// determinism contract forbids, and exactly the change a well-meaning optimisation would
+/// make. `to_bits` is the only assertion that can tell the two apart.
+///
+/// The batch sizes include 1 and a size that does not divide the row count, because the last
+/// batch of a self-play round is short whenever a game has just ended, and a kernel that is
+/// only correct at its full width would pass every other check.
+#[test]
+fn phase4_batched_evaluation_is_bit_identical() {
+    // A batch is one architecture, and `sample_positions` spans several configurations, so
+    // group by layout before batching anything.
+    let mut groups: Vec<(GameConfig, Vec<(GameState, Player)>)> = Vec::new();
+    for state in sample_positions().into_iter().chain(sub_decision_positions()) {
+        let key = (
+            obs_layout_hash(&state.config),
+            action_layout_hash(&state.config),
+        );
+        let at = groups.iter().position(|(c, _)| {
+            (obs_layout_hash(c), action_layout_hash(c)) == key
+        });
+        let config = state.config;
+        let rows = match at {
+            Some(i) => &mut groups[i].1,
+            None => {
+                groups.push((config, Vec::new()));
+                &mut groups.last_mut().expect("just pushed").1
+            }
+        };
+        for observer in Player::BOTH {
+            rows.push((state.clone(), observer));
+        }
+    }
+
+    let mut checked = 0;
+    for (config, rows) in &groups {
+        let arch = Arch::lane_for(config, 32, 2, 24);
+        let evaluator = MlpEvaluator::new(Weights::random(9091, arch), config);
+        let (od, ad) = (obs_dim(config), action_dim(config));
+        let n = rows.len();
+
+        let mut obs = vec![0.0f32; n * od];
+        let mut masks = vec![false; n * ad];
+        for (row, (state, observer)) in rows.iter().enumerate() {
+            encode_observation(state, *observer, &mut obs[row * od..(row + 1) * od]);
+            legal_mask(state, &mut masks[row * ad..(row + 1) * ad]);
+        }
+
+        // The reference: one row at a time, through the call the unbatched search makes.
+        let mut want_logits = vec![0.0f32; n * ad];
+        let mut want_values = vec![0.0f32; n];
+        let mut scratch = evaluator.scratch();
+        for row in 0..n {
+            want_values[row] = evaluator.eval_masked_with(
+                &obs[row * od..(row + 1) * od],
+                &masks[row * ad..(row + 1) * ad],
+                &mut want_logits[row * ad..(row + 1) * ad],
+                &mut scratch,
+            );
+        }
+
+        for bs in [1usize, 3, 7, 16, n] {
+            if bs == 0 || bs > n {
+                continue;
+            }
+            let mut got_logits = vec![0.0f32; n * ad];
+            let mut got_values = vec![0.0f32; n];
+            let mut batch = evaluator.batch_scratch(bs);
+            for lo in (0..n).step_by(bs) {
+                let hi = (lo + bs).min(n);
+                evaluator.eval_masked_batch(
+                    &obs[lo * od..hi * od],
+                    hi - lo,
+                    &masks[lo * ad..hi * ad],
+                    &mut got_logits[lo * ad..hi * ad],
+                    &mut got_values[lo..hi],
+                    &mut batch,
+                );
+            }
+            for row in 0..n {
+                assert_eq!(
+                    got_values[row].to_bits(),
+                    want_values[row].to_bits(),
+                    "value of row {row} moved at batch {bs}: {} vs {}",
+                    got_values[row],
+                    want_values[row]
+                );
+                for a in 0..ad {
+                    if !masks[row * ad + a] {
+                        continue;
+                    }
+                    assert_eq!(
+                        got_logits[row * ad + a].to_bits(),
+                        want_logits[row * ad + a].to_bits(),
+                        "logit {a} of row {row} moved at batch {bs}: {} vs {}",
+                        got_logits[row * ad + a],
+                        want_logits[row * ad + a]
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no batch was checked");
+}
+
 /// The masked path and the dense path are the same function.
 ///
 /// `net_mcts` only ever calls the masked one — a Duel 52 position offers ~21 of 2194 encoded
