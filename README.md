@@ -34,6 +34,11 @@ Every prompt names the rule it is applying, so if you think the engine is wrong 
 at the line. `duel52 powers` prints the card-power reference, and `duel52 demo --seed 47`
 watches a game play out action by action.
 
+Answer a prompt with the arrow keys or by typing its number, whichever suits the move: up and
+down walk the lines you could actually pick, right or Enter takes the one you are on, and left
+goes back a question. The line you are on carries a `*` and lights up red on the board above —
+the `*` because the red is gone on a terminal without colour, and the arrow keys are not.
+
 Add `--hint` and the agent you are playing will show you the three moves it would consider
 before each of your decisions, best first — the share of its search each one got, and what it
 thinks your chances are after it.

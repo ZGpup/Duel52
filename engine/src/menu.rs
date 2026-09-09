@@ -60,6 +60,11 @@
 //! being typed, alongside [`Menu::render_with`] painting the row itself. So the number is
 //! checked against the board *before* Enter, rather than regretted after it.
 //!
+//! The arrow keys reach the same place without a number: [`Menu::step`] walks the rows that
+//! are actually pickable and the CLI feeds the result back in as the selection, so arrowing
+//! onto a row lights exactly what typing its number lights. The row is marked with a `*` as
+//! well as in red, because a terminal without colour still has arrow keys.
+//!
 //! The focus is derived from the actions under a row rather than stored beside it, so a menu
 //! cannot point at a card it does not offer. A row lights only the part of the move it
 //! actually settles ([`Reach`]): the card you would act **with**, never the list of things
@@ -176,22 +181,73 @@ impl Menu {
         focus
     }
 
+    /// The numbers the arrow keys walk, in the order the rows are drawn.
+    ///
+    /// Only the rows that are both on screen and pickable: a hidden row is not drawn, and a
+    /// `—` row has nothing behind it, so neither is somewhere the cursor can sit. Both keep
+    /// their numbers for anyone typing one — the cursor is a second way to reach a row, never
+    /// a renumbering of the list. `BACK` is `0` and comes last, where it is drawn.
+    pub fn walkable(&self, nested: bool) -> Vec<usize> {
+        let mut numbers: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(i, row)| !row.hidden && !matches!(self.picks[*i], Pick::Unavailable))
+            .map(|(i, _)| i + 1)
+            .collect();
+        if nested {
+            numbers.push(0);
+        }
+        numbers
+    }
+
+    /// Move the cursor one row, wrapping at both ends.
+    ///
+    /// `cursor` is `None` when nothing has been walked onto yet, and then the list is entered
+    /// at whichever end the key came from — down takes the first row, up the last — so the
+    /// first arrow press always lands somewhere visible. A cursor on a row that has since
+    /// gone is treated the same way rather than clamped, because the menu it belonged to is
+    /// not the one being drawn.
+    pub fn step(&self, cursor: Option<usize>, nested: bool, down: bool) -> Option<usize> {
+        let numbers = self.walkable(nested);
+        if numbers.is_empty() {
+            return None;
+        }
+        let at = cursor.and_then(|number| numbers.iter().position(|n| *n == number));
+        let next = match (at, down) {
+            (None, true) => 0,
+            (None, false) => numbers.len() - 1,
+            (Some(i), true) => (i + 1) % numbers.len(),
+            (Some(i), false) => (i + numbers.len() - 1) % numbers.len(),
+        };
+        Some(numbers[next])
+    }
+
     /// The menu as printed: the question, then the numbered rows under their headings.
     ///
     /// `nested` adds the row that goes back up a level. It lives here rather than at the
     /// call site so that it lines up with everything above it.
     pub fn render(&self, nested: bool) -> String {
-        self.render_with(nested, None)
+        self.render_with(nested, None, false)
     }
 
-    /// [`Menu::render`], with the row the player is part-way through typing shown in red —
-    /// the same red the matching cards are wearing on the board above.
+    /// [`Menu::render`], with the row the prompt is pointing at marked — the row a number
+    /// is being typed for, or the one the arrow keys have walked onto.
     ///
-    /// `selected` is the number typed, so `Some(0)` picks out `BACK`. A number with no row
-    /// behind it highlights nothing, which is what says "that is not one of these".
-    pub fn render_with(&self, nested: bool, selected: Option<usize>) -> String {
+    /// `selected` is that row's number, so `Some(0)` picks out `BACK`. A number with no row
+    /// behind it marks nothing, which is what says "that is not one of these".
+    ///
+    /// It is marked **twice**: in the same red the matching cards are wearing on the board
+    /// above, and with a trailing `*`. The star is not decoration for the red — it is the
+    /// whole mark under `NO_COLOR`, in a pipe, and on a terminal that never had colour, and
+    /// without it the arrow keys would be unusable there. `color` turns off only the red.
+    pub fn render_with(&self, nested: bool, selected: Option<usize>, color: bool) -> String {
         let paint = |number: usize, line: String| -> String {
-            match selected == Some(number) {
+            if selected != Some(number) {
+                return line;
+            }
+            let line = format!("{line} *");
+            match color {
                 true => format!("{HIGHLIGHT}{line}{RESET}"),
                 false => line,
             }
@@ -1561,29 +1617,93 @@ mod tests {
         }
     }
 
-    /// Nothing is coloured until something is being typed, and then it is one row.
+    /// Nothing is marked until a row is selected, and then it is one row.
     #[test]
-    fn only_the_row_being_typed_is_coloured() {
+    fn only_the_selected_row_is_coloured() {
         let state = GameState::new(GameConfig::split_deck(), 5);
         let menu = build(&state, &state.legal_actions(), Some(Player::P0));
 
         let plain = menu.render(false);
         assert!(!plain.contains('\x1b'), "no colour without a selection\n{plain}");
-        assert_eq!(menu.render_with(false, None), plain);
+        assert!(!plain.contains(" *"), "and no star either\n{plain}");
+        assert_eq!(menu.render_with(false, None, true), plain);
         assert_eq!(
-            menu.render_with(false, Some(99)),
+            menu.render_with(false, Some(99), true),
             plain,
-            "a number no row has colours nothing"
+            "a number no row has marks nothing"
         );
 
-        let painted = menu.render_with(false, Some(1));
+        let painted = menu.render_with(false, Some(1), true);
         assert_eq!(painted.matches(HIGHLIGHT).count(), 1, "exactly one row\n{painted}");
         assert!(
-            painted.contains(&format!("{HIGHLIGHT}   PLAY   #1{RESET}")),
+            painted.contains(&format!("{HIGHLIGHT}   PLAY   #1 *{RESET}")),
             "the whole line, padding included\n{painted}"
         );
-        // The escape codes wrap the line, so the menu reads the same without them.
-        assert_eq!(painted.replace(HIGHLIGHT, "").replace(RESET, ""), plain);
+        // The escape codes wrap the line, so the menu reads the same without them — bar the
+        // star, which is the half of the mark that survives having no colour.
+        assert_eq!(
+            painted.replace(HIGHLIGHT, "").replace(RESET, "").replace(" *", ""),
+            plain
+        );
+    }
+
+    /// The star is the mark a terminal without colour is left with, so it has to stand on its
+    /// own: same row, no escape codes anywhere.
+    #[test]
+    fn the_star_marks_the_row_without_colour() {
+        let state = GameState::new(GameConfig::split_deck(), 5);
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        let marked = menu.render_with(false, Some(1), false);
+        assert!(!marked.contains('\x1b'), "no colour was asked for\n{marked}");
+        assert_eq!(marked.matches(" *").count(), 1, "exactly one row\n{marked}");
+        assert!(marked.contains("   PLAY   #1 *"), "on the selected row\n{marked}");
+        assert_eq!(
+            marked,
+            menu.render_with(false, Some(1), true).replace(HIGHLIGHT, "").replace(RESET, ""),
+            "colour adds the red and nothing else"
+        );
+    }
+
+    /// The arrow keys walk the rows you could actually pick, in the order they are drawn, and
+    /// wrap at both ends. A `—` row keeps its number for typing and is stepped over.
+    #[test]
+    fn the_cursor_walks_only_the_pickable_rows() {
+        let state = GameState::new(GameConfig::split_deck(), 5);
+        let menu = build(&state, &state.legal_actions(), Some(Player::P0));
+
+        let walkable = menu.walkable(false);
+        assert!(!walkable.is_empty(), "the opening turn can do something");
+        assert!(walkable.windows(2).all(|w| w[0] < w[1]), "drawing order: {walkable:?}");
+        for number in &walkable {
+            assert!(
+                !matches!(menu.picks[number - 1], Pick::Unavailable),
+                "#{number} shows `—` and cannot be walked onto\n{}",
+                menu.render(false)
+            );
+            assert!(!menu.rows[number - 1].hidden, "#{number} is not drawn");
+        }
+        assert!(
+            (1..=menu.len()).any(|n| !walkable.contains(&n)),
+            "the opening turn cannot attack, so something is unavailable\n{}",
+            menu.render(false)
+        );
+
+        // Entering the list from either end, then wrapping off the other one.
+        let first = *walkable.first().unwrap();
+        let last = *walkable.last().unwrap();
+        assert_eq!(menu.step(None, false, true), Some(first));
+        assert_eq!(menu.step(None, false, false), Some(last));
+        assert_eq!(menu.step(Some(last), false, true), Some(first));
+        assert_eq!(menu.step(Some(first), false, false), Some(last));
+        // A cursor left over from another menu enters as though there were none.
+        assert_eq!(menu.step(Some(99), false, true), Some(first));
+
+        // BACK is walkable only where it is drawn, and it is drawn last.
+        assert!(!walkable.contains(&0));
+        assert_eq!(menu.walkable(true).last(), Some(&0));
+        assert_eq!(menu.step(Some(last), true, true), Some(0));
+        assert_eq!(menu.step(Some(0), true, true), Some(first));
     }
 
     /// Which *move* an action is, as distinct from which card it happens to name.

@@ -956,7 +956,12 @@ enum Key {
     /// The player typed something that is not yet an answer. Redraw and keep waiting — this
     /// is what puts the live highlight on the board as a number is being typed.
     Edit,
-    /// Enter. The buffer holds the whole line.
+    /// An arrow: walk the cursor one row down the list, or one row up it.
+    Step { down: bool },
+    /// Left arrow — back up one question, the arrow-key half of `0` / `b`.
+    Ascend,
+    /// Enter, or the right arrow. The buffer holds the whole line, and an empty buffer means
+    /// "whatever the cursor is on" — which is what makes the arrows a complete way to play.
     Submit,
     /// No more input: end of a piped script, or Ctrl-D at an empty prompt.
     Eof,
@@ -1045,14 +1050,18 @@ fn read_key(buf: &mut String) -> io::Result<Key> {
             buf.clear();
             Ok(Key::Edit)
         }
-        // An escape sequence — an arrow or a function key. Swallow the two bytes that
-        // introduce it so they do not land in the buffer as text. A bare Esc is not
-        // followed by `[` or `O`, and then the byte after it is treated normally.
+        // An escape sequence — an arrow or a function key. A bare Esc is not followed by
+        // `[` or `O`, and then the byte after it is treated normally.
         0x1b => match read_byte()? {
-            Some(b'[') | Some(b'O') => {
-                read_byte()?;
-                Ok(Key::Edit)
-            }
+            Some(b'[') | Some(b'O') => Ok(match escape_final()? {
+                Some(b'A') => Key::Step { down: false },
+                Some(b'B') => Key::Step { down: true },
+                // Right selects, left goes back — the same two things Enter and `0` do, so
+                // a whole decision can be made from the arrow keys alone.
+                Some(b'C') => Key::Submit,
+                Some(b'D') => Key::Ascend,
+                _ => Key::Edit,
+            }),
             Some(other) => Ok(push_key(buf, other)),
             None => Ok(Key::Edit),
         },
@@ -1069,6 +1078,27 @@ fn push_key(buf: &mut String, byte: u8) -> Key {
         buf.push(byte as char);
     }
     Key::Edit
+}
+
+/// Read an escape sequence to its end and hand back the byte that identifies it.
+///
+/// `Esc [` and `Esc O` introduce a sequence of parameter bytes (digits, `;`) terminated by
+/// one in `@`..`~` — so an arrow is `Esc [ A` but the same arrow with a modifier held is
+/// `Esc [ 1 ; 5 A`, and Delete is `Esc [ 3 ~`. Reading to the terminator is what stops the
+/// tail of a longer sequence landing in the prompt as text. `Esc O A` terminates on its
+/// first byte, so both forms go through here.
+///
+/// Capped rather than looping forever, because the bytes are coming from a terminal and a
+/// sequence this long is line noise, not a keystroke.
+fn escape_final() -> io::Result<Option<u8>> {
+    for _ in 0..16 {
+        match read_byte()? {
+            None => return Ok(None),
+            Some(byte) if (0x40..=0x7e).contains(&byte) => return Ok(Some(byte)),
+            Some(_) => {}
+        }
+    }
+    Ok(None)
 }
 
 /// One byte from the terminal. `None` is end of input.
@@ -1593,16 +1623,28 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         let mut path: Vec<usize> = Vec::new();
         let mut complaint = String::new();
         let mut typed = String::new();
+        // Where the arrow keys have walked to, or `None` before they have been touched.
+        // Deliberately `None` at the start of every question rather than parked on the first
+        // row: nothing is preselected until a key says so, so Enter on an empty prompt still
+        // means nothing, exactly as it always did.
+        let mut cursor: Option<usize> = None;
         let action = loop {
             let node = root.at(&path);
 
-            // What the number typed so far points at. Recomputed on every keystroke, which
+            // The row the prompt is pointing at: the number typed so far, or — with nothing
+            // typed — wherever the arrows are sitting. Recomputed on every keystroke, which
             // is the whole point: three identical `(? ²♥)` in an enemy lane are told apart
             // by watching which one turns red, before Enter commits to it.
-            let hovered = (screen.color && keys.interactive())
-                .then(|| typed.trim().parse::<usize>().ok())
+            let selected = keys
+                .interactive()
+                .then(|| match typed.trim().is_empty() {
+                    true => cursor,
+                    false => typed.trim().parse::<usize>().ok(),
+                })
                 .flatten();
-            let focus = match hovered {
+            // The board can only light up on a terminal with colour. The `*` beside the row
+            // does not need one, which is what keeps the arrows usable without it.
+            let focus = match selected.filter(|_| screen.color) {
                 Some(number) => node.focus(&state, number),
                 None => Focus::none(),
             };
@@ -1611,7 +1653,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             // The menu stays directly under the board it applies to, and the hint goes below
             // it, so the block that changes as you walk the tree is the one next to the
             // board and the block that does not is the one next to the prompt.
-            let mut menu_text = node.render_with(!path.is_empty(), hovered);
+            let mut menu_text = node.render_with(!path.is_empty(), selected, screen.color);
             if let Some(hint) = &hint {
                 menu_text.push_str(&hint.render());
             }
@@ -1620,16 +1662,39 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             }
             screen.draw(&board, &menu_text, observer, &format!("{acting}> {typed}"));
 
-            match keys.read(&mut typed) {
+            let key = match keys.read(&mut typed) {
                 Err(e) => return Err(format!("cannot read input: {e}")),
-                Ok(Key::Eof) => {
+                Ok(key) => key,
+            };
+            // Up and down move the cursor and left is `back`, so the arrows take the line
+            // over — but neither clears the complaint, which belongs to the last thing that
+            // was *answered* and has to survive until something answers it.
+            match key {
+                Key::Eof => {
                     println!("\n(end of input)");
                     print_unrecorded(&opts, state.seed);
                     return Ok(());
                 }
                 // Still typing. Round the loop to redraw with the new highlight.
-                Ok(Key::Edit) => continue,
-                Ok(Key::Submit) => {}
+                Key::Edit => continue,
+                // The walk carries on from whatever is marked on screen — a number already
+                // typed as readily as a row already walked onto — so the first arrow after
+                // typing moves the mark rather than teleporting it back to the top.
+                Key::Step { down } => {
+                    typed.clear();
+                    cursor = node.step(selected, !path.is_empty(), down);
+                    continue;
+                }
+                // At the top there is nowhere to go back to. Silently, unlike `0` — an arrow
+                // held down a moment too long is not a mistake worth a message.
+                Key::Ascend => {
+                    typed.clear();
+                    if path.pop().is_some() {
+                        cursor = None;
+                    }
+                    continue;
+                }
+                Key::Submit => {}
             }
             let input = std::mem::take(&mut typed);
             let input = input.trim();
@@ -1638,7 +1703,8 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             complaint.clear();
 
             match input {
-                "" => continue,
+                // Nothing typed: the cursor answers for it, below.
+                "" => {}
                 "q" | "quit" | "exit" => {
                     println!("\nQuitting. Replay this game with --seed {}", state.seed);
                     print_unrecorded(&opts, state.seed);
@@ -1657,23 +1723,47 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                     continue;
                 }
                 "board" => continue, // the loop redraws it
-                "b" | "back" | "0" => {
+                "b" | "back" => {
                     if path.pop().is_none() {
                         complaint = "already at the top. `q` quits.".to_string();
                     }
+                    cursor = None;
                     continue;
                 }
                 _ => {}
             }
 
-            let Ok(number) = input.parse::<usize>() else {
-                complaint =
-                    format!("`{input}` is not a number. Type a number from the list, or `help`.");
-                continue;
+            // Enter — or the right arrow — on an empty prompt takes whatever the cursor is
+            // on, which is what makes the arrow keys a complete way to play. With no cursor
+            // there is nothing to take, and an empty line goes back to the board.
+            let number = match (input.is_empty(), cursor) {
+                (true, None) => continue,
+                (true, Some(number)) => number,
+                (false, _) => match input.parse::<usize>() {
+                    Ok(number) => number,
+                    Err(_) => {
+                        complaint = format!(
+                            "`{input}` is not a number. Type a number from the list, or `help`."
+                        );
+                        continue;
+                    }
+                },
             };
-            match number.checked_sub(1).and_then(|i| node.picks.get(i)) {
+            // `#0` is BACK, whether it was typed or the cursor walked onto it.
+            if number == 0 {
+                if path.pop().is_none() {
+                    complaint = "already at the top. `q` quits.".to_string();
+                }
+                cursor = None;
+                continue;
+            }
+            match node.picks.get(number - 1) {
                 Some(menu::Pick::Take(action)) => break *action,
-                Some(menu::Pick::Open(_)) => path.push(number - 1),
+                Some(menu::Pick::Open(_)) => {
+                    path.push(number - 1);
+                    // A new question, so nothing is walked onto in it yet.
+                    cursor = None;
+                }
                 // A row marked `—` keeps its number precisely so the others keep theirs, so
                 // this is a normal thing to type, not a mistake worth scolding.
                 Some(menu::Pick::Unavailable) => {
@@ -2219,6 +2309,13 @@ Choosing a move — one question at a time:
   directly below the board it applies to, with the last few moves above it. Run with
   --no-clear to keep every prompt in the scrollback instead.
 
+  OR USE THE ARROW KEYS. Up and down walk the list — only the lines you could actually
+  pick, so a `—` line is stepped over — right or Enter takes the line you are on, and left
+  goes back one question. The line you are on carries a `*`, and the card it names lights
+  up on the board exactly as a typed number would. Nothing is preselected until you press
+  an arrow, so Enter on an empty prompt still does nothing. Typing a number and arrowing
+  are the same list reached two ways; use whichever suits the move.
+
   TYPE A NUMBER AND LOOK UP. Before you press Enter, that line and the card it names turn
   red on the board. This is how you tell three identical `(? ²♥)` in an enemy lane apart:
   type 1, 2, 3 and watch which one lights up. Backspace or Ctrl-U takes it back; nothing is
@@ -2232,8 +2329,8 @@ Choosing a move — one question at a time:
   PLAY is the one step that reddens a lane heading rather than a card, because until the
   card is on the table the lane is the whole of the move.
 
-  (Needs a colour terminal. Under --no-clear, or piped to a file, or with NO_COLOR set,
-  the prompt goes back to plain lines with no preview.)
+  (The red needs a colour terminal; the `*` and the arrow keys do not. Under --no-clear, or
+  piped to a file, the prompt goes back to whole typed lines with no preview and no arrows.)
 
 Under --hint, a block below the menu:
   The moves the advising net would consider here, best first. `sims` is the share of its
@@ -2250,6 +2347,9 @@ Under --hint, a block below the menu:
 
 Commands at the prompt:
   <number>   pick that numbered line — see it on the board first
+  up / down  move to the next line you could pick; it is marked with a `*`
+  right      take the line you are on, same as Enter
+  left       back one question
   Ctrl-U     clear what you have typed
   0 / b      back one question
   help / ?   this message

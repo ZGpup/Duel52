@@ -85,7 +85,7 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 342 tests: rules, determinism, information hiding,
+cargo test                               # 354 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, and
                                          # the training corpus
 
