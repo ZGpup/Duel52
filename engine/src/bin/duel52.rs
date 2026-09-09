@@ -152,6 +152,16 @@ OPTIONS
                                   for stats, 400 for ladder/match/probe)
   --threads <n>                   worker threads (default: all cores). Results are
                                   identical whatever this is set to.
+  --eval-batch <n>                games kept in flight per worker thread, so that their
+                                  network evaluations go through the trunk in one batch.
+                                  Applies to selfplay, match, ladder and probe. The batch
+                                  is taken across games and never inside a search, so
+                                  results are identical whatever this is — it only changes
+                                  how fast they arrive. Only `netmcts` agents batch; a
+                                  match between two different checkpoints splits its games
+                                  between two batches. Costs ~400 KB of live search tree
+                                  per game in flight per thread. 1 turns it off
+                                  (default 1)
   --agents <a,b,...>              roster for ladder/probe (default: the frozen ladder)
   --anchor <agent>                which rung `ladder` pins to 0 Elo, named exactly as it
                                   appears in --agents (default: random). Elo is only
@@ -178,13 +188,6 @@ OPTIONS
   --cap-sims <n>                  simulations for a capped decision. Must be smaller than
                                   --sims, and is ignored when --full-search-fraction is 1
                                   (default 32)
-  --eval-batch <n>                games kept in flight per worker thread, so that their
-                                  network evaluations go through the trunk in one batch.
-                                  The batch is taken across games, never inside a search,
-                                  so the shard is byte-identical whatever this is set to —
-                                  it only changes how fast it is written. Costs ~400 KB of
-                                  live search tree per game per thread. 1 turns it off
-                                  (default 1)
   --c-puct <f>                    PUCT exploration constant (default 1.25)
   --dirichlet-alpha <f>           root noise concentration (default 0.3)
   --dirichlet-weight <f>          root noise share of the prior (default 0.25)
@@ -238,6 +241,10 @@ struct Options {
     all: bool,
     markdown: bool,
     threads: usize,
+    /// Games kept in flight per worker so their network evaluations batch (`PLAN.md` §4.2d).
+    /// A pure speed knob: `rule_2_the_ladder_is_eval_batch_independent` pins that the result
+    /// does not move. 1 turns it off.
+    eval_batch: usize,
     /// `None` means [`AgentSpec::LADDER`], the frozen benchmark.
     roster: Option<Vec<AgentSpec>>,
     /// Which rung `ladder` pins to 0 Elo. `None` means `random`, the original floor.
@@ -268,6 +275,7 @@ impl Default for Options {
             all: false,
             markdown: false,
             threads: default_threads(),
+            eval_batch: 1,
             roster: None,
             anchor: None,
             agent_a: None,
@@ -358,6 +366,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--threads" => {
                 let n: usize = next_number(args, &mut i, "--threads")?;
                 opts.threads = n.max(1);
+            }
+            "--eval-batch" => {
+                let n: usize = next_number(args, &mut i, "--eval-batch")?;
+                opts.eval_batch = n.max(1);
             }
             "--agents" => {
                 let v = next_value(args, &mut i, "--agents")?;
@@ -537,6 +549,7 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
         opts.seed,
         games,
         opts.threads,
+        opts.eval_batch,
         anchor,
         !opts.markdown,
     );
@@ -564,7 +577,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
     let b = opts.agent_b.clone().unwrap_or(AgentSpec::Random);
     let games = opts.games_or(400);
 
-    let result = ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads);
+    let result = ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads, opts.eval_batch);
     print!("{}", result.report());
     Ok(())
 }
@@ -592,6 +605,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
             opts.seed,
             games,
             opts.threads,
+            opts.eval_batch,
         ));
     }
 
@@ -2314,7 +2328,6 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
     let mut out_path: Option<String> = None;
     let mut generation = 0u32;
     let mut quiet = false;
-    let mut eval_batch = 1usize;
     let mut sp = SelfPlayConfig::default();
 
     // Only the flags this command owns; everything else falls through to `parse_options`,
@@ -2342,7 +2355,6 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
                 sp.full_search_fraction = next_number(args, &mut i, "--full-search-fraction")?
             }
             "--cap-sims" => sp.cap_sims = next_number(args, &mut i, "--cap-sims")?,
-            "--eval-batch" => eval_batch = next_number(args, &mut i, "--eval-batch")?,
             "--quiet" => quiet = true,
             other => rest.push(other.to_string()),
         }
@@ -2380,7 +2392,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
         opts.seed,
         games,
         opts.threads,
-        eval_batch,
+        opts.eval_batch,
         generation,
         &out,
         !quiet,

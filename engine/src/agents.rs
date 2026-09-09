@@ -55,6 +55,30 @@ pub trait Agent {
     /// Name for Elo tables and logs. Includes the search budget where there is one, so a
     /// result row identifies the agent that produced it rather than just its family.
     fn name(&self) -> String;
+
+    /// Begin a decision that can be suspended wherever it needs a network evaluation.
+    ///
+    /// `None` — the default, and the answer for every agent but `netmcts` — means this agent
+    /// decides without the network and the caller should just use [`Self::choose`]. A driver
+    /// that keeps games in flight uses this to batch evaluations across them (`PLAN.md`
+    /// §4.2d); one that does not can ignore it entirely.
+    ///
+    /// A caller that gets `Some` **must** pass it to [`Self::end_decision`]: `netmcts` moves
+    /// its search RNG into the returned value, so dropping it loses the stream position.
+    fn begin_decision(
+        &mut self,
+        _state: &GameState,
+        _legal: &[Action],
+    ) -> Option<SearchInProgress> {
+        None
+    }
+
+    /// Finish a decision begun with [`Self::begin_decision`], returning the action to play.
+    ///
+    /// `legal` must be the slice `begin_decision` was given.
+    fn end_decision(&mut self, _search: SearchInProgress, _legal: &[Action]) -> Action {
+        unreachable!("end_decision on an agent whose begin_decision returns None")
+    }
 }
 
 /// Picks uniformly at random from the legal actions.

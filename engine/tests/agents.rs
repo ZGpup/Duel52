@@ -431,6 +431,7 @@ fn phase2_the_ladder_is_thread_count_independent() {
         1,
         16,
         1,
+        1,
     );
     let b = ladder::run_match(
         GameConfig::split_deck(),
@@ -439,6 +440,7 @@ fn phase2_the_ladder_is_thread_count_independent() {
         1,
         16,
         4,
+        1,
     );
     assert_eq!(a.wins, b.wins);
     assert_eq!(a.draws, b.draws);
@@ -456,6 +458,7 @@ fn phase2_a_match_balances_colours() {
         AgentSpec::Random,
         1,
         40,
+        1,
         1,
     );
     assert_eq!(m.games, 40);
@@ -475,6 +478,7 @@ fn phase2_a_match_rounds_up_to_an_even_game_count() {
         1,
         7,
         1,
+        1,
     );
     assert_eq!(m.games, 8);
 }
@@ -490,6 +494,7 @@ fn phase2_greedy_beats_random_decisively() {
         1,
         60,
         4,
+        1,
     );
     assert!(
         m.score() > 0.75,
@@ -509,6 +514,7 @@ fn phase2_ismcts_beats_random_decisively() {
         1,
         40,
         4,
+        1,
     );
     assert!(
         m.score() > 0.75,
@@ -612,6 +618,130 @@ fn phase2_agent_specs_round_trip_through_their_names() {
     assert!(AgentSpec::parse("ismcts:lots").is_err());
 }
 
+/// A second random-init checkpoint, so a match can have a *different* network on each side.
+///
+/// That is the gate's actual shape — candidate against incumbent — and it is the case
+/// batched evaluation has to get right, because the two sides cannot share a batch.
+fn other_checkpoint() -> String {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let config = GameConfig::default();
+        let arch = duel52_engine::nn::Arch {
+            width: 24,
+            blocks: 2,
+            value_hidden: 12,
+            ..duel52_engine::nn::Arch::default_for(&config)
+        };
+        let path = std::env::temp_dir().join(format!("duel52-other-{}.d52nn", std::process::id()));
+        duel52_engine::nn::Weights::random(20260909, arch)
+            .save(&path, &config)
+            .expect("write the second roster checkpoint");
+        path.display().to_string()
+    })
+    .clone()
+}
+
+/// The gate must not move when its games are batched — `PLAN.md` §4.2d.
+///
+/// The same claim `phase4_a_shard_does_not_depend_on_the_evaluation_batch` makes for
+/// self-play, and it matters more here: this is the measurement the training loop *promotes*
+/// on, so a batched gate that scored differently would silently change which candidates ship.
+///
+/// Deliberately netmcts on **both** sides with two different checkpoints, because that is
+/// what forces the driver to group a round's suspended games by the network each is waiting
+/// on. A single-network match would pass with the grouping removed entirely.
+fn bits(xs: &[f64]) -> Vec<u64> {
+    xs.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn rule_2_the_ladder_is_eval_batch_independent() {
+    let a = AgentSpec::NetMcts {
+        checkpoint: test_checkpoint(),
+        sims: 8,
+    };
+    let b = AgentSpec::NetMcts {
+        checkpoint: other_checkpoint(),
+        sims: 8,
+    };
+    let one = ladder::run_match(
+        GameConfig::default(),
+        a.clone(),
+        b.clone(),
+        1,
+        8,
+        2,
+        1,
+    );
+    assert!(one.games > 0, "the reference match played nothing");
+    // 3 and 5 do not divide the games a worker gets, so a short final round is exercised.
+    for batch in [2usize, 3, 5, 16] {
+        let many = ladder::run_match(
+            GameConfig::default(),
+            a.clone(),
+            b.clone(),
+            1,
+            8,
+            2,
+            batch,
+        );
+        assert_eq!(
+            (one.wins, one.draws, one.games, one.score().to_bits()),
+            (many.wins, many.draws, many.games, many.score().to_bits()),
+            "--eval-batch {batch} changed the match result"
+        );
+        // The per-game f64s `probe` averages. Batching finishes games out of order, so
+        // these are the values that move if the driver absorbs them as they land rather
+        // than in game order — a difference the integer counts above cannot see.
+        for side in 0..2 {
+            assert_eq!(
+                bits(&one.behaviour[side].lane_concentration),
+                bits(&many.behaviour[side].lane_concentration),
+                "--eval-batch {batch} reordered agent {side}'s lane concentrations"
+            );
+            assert_eq!(
+                one.behaviour[side].hand_at_end,
+                many.behaviour[side].hand_at_end,
+                "--eval-batch {batch} reordered agent {side}'s per-game hand sizes"
+            );
+        }
+    }
+}
+
+/// And with only one network in the match, which is what a `random` or `greedy` panel row is:
+/// every suspended game belongs to the same batch and the opponent never suspends at all.
+#[test]
+fn rule_2_a_one_network_match_is_eval_batch_independent() {
+    let net = AgentSpec::NetMcts {
+        checkpoint: test_checkpoint(),
+        sims: 8,
+    };
+    let one = ladder::run_match(
+        GameConfig::default(),
+        net.clone(),
+        AgentSpec::Greedy,
+        1,
+        8,
+        2,
+        1,
+    );
+    let many = ladder::run_match(
+        GameConfig::default(),
+        net,
+        AgentSpec::Greedy,
+        1,
+        8,
+        2,
+        8,
+    );
+    assert_eq!(
+        (one.wins, one.draws, one.games, one.score().to_bits()),
+        (many.wins, many.draws, many.games, many.score().to_bits()),
+        "batching changed a match with one network in it"
+    );
+}
+
 /// A full round robin fits ratings, orders them, and anchors random at zero.
 #[test]
 fn phase2_the_ladder_produces_an_ordered_rating_table() {
@@ -621,6 +751,7 @@ fn phase2_the_ladder_produces_an_ordered_rating_table() {
         1,
         40,
         4,
+        1,
         "random",
         false,
     );

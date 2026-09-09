@@ -151,31 +151,6 @@ c_puct = 1.25
 full_search_fraction = 0.25
 cap_sims = 32
 
-# **Batched evaluation.** PLAN.md §4.2d. Games kept in flight per worker thread so their
-# network evaluations go through the lane trunk together.
-#
-# This is a pure speed knob and the only one in this file that is: the batch is taken across
-# *games*, never inside a search, so no game's search is altered and the shard is
-# byte-identical to the one `eval_batch = 1` writes.
-# `phase4_a_shard_does_not_depend_on_the_evaluation_batch` asserts exactly that, which is
-# what makes it safe to turn on mid-lineage — `runs/sixth` can be resumed with this set and
-# its generations stay comparable with the ones already in the run.
-#
-# Why it is worth 3x: a dot product is a reduction, so one position cannot fill the chip's
-# four-wide f32 units however the loop is written, and reassociating it is what `mlp.rs`'s
-# determinism contract forbids. The batch index carries no dependency, so it vectorises
-# without touching the summation order at all. Measured on the 8-core laptop, 512 games at
-# 256 sims with capping, lane 128x3:
-#
-#   eval_batch = 1     225.5 s     1.00x   — every run before this one
-#   eval_batch = 32     88.6 s     2.54x
-#   eval_batch = 64     69.3 s     3.26x   <- this
-#
-# ⚠️ **Capped by the games each worker gets**, which is `games / threads` — 1400 / 8 = 175
-# here, so 64 is comfortably reachable. A *smaller* generation would silently clamp it: at
-# 200 games on 8 cores each worker has 25, and 64 would behave as 25. Costs ~400 KB of live
-# search tree per game in flight, so 64 x 8 threads is ~200 MB.
-eval_batch = 64
 
 dirichlet_alpha = 0.3
 dirichlet_weight = 0.25
@@ -304,4 +279,30 @@ hours = 2.0
 seed = 5000000
 
 threads = 0                       # 0 = every core
+# **Batched evaluation.** PLAN.md §4.2d. Games kept in flight per worker thread so their
+# network evaluations go through the lane trunk together.
+#
+# This is a pure speed knob and the only one in this file that is: the batch is taken across
+# *games*, never inside a search, so no game's search is altered and the shard is
+# byte-identical to the one `eval_batch = 1` writes.
+# `phase4_a_shard_does_not_depend_on_the_evaluation_batch` asserts exactly that, which is
+# what makes it safe to turn on mid-lineage — `runs/sixth` can be resumed with this set and
+# its generations stay comparable with the ones already in the run.
+#
+# Why it is worth 3x: a dot product is a reduction, so one position cannot fill the chip's
+# four-wide f32 units however the loop is written, and reassociating it is what `mlp.rs`'s
+# determinism contract forbids. The batch index carries no dependency, so it vectorises
+# without touching the summation order at all. Measured on the 8-core laptop, 512 games at
+# 256 sims with capping, lane 128x3:
+#
+#   eval_batch = 1     225.5 s     1.00x   — every run before this one
+#   eval_batch = 32     88.6 s     2.54x
+#   eval_batch = 64     69.3 s     3.26x   <- this
+#
+# ⚠️ **Capped by the games each worker gets**, which is `games / threads` — 1400 / 8 = 175
+# here, so 64 is comfortably reachable. A *smaller* generation would silently clamp it: at
+# 200 games on 8 cores each worker has 25, and 64 would behave as 25. Costs ~400 KB of live
+# search tree per game in flight, so 64 x 8 threads is ~200 MB.
+eval_batch = 64
+
 engine = "./target/release/duel52"

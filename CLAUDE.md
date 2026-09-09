@@ -144,6 +144,9 @@ cargo test                               # 342 tests: rules, determinism, inform
 netmcts:models/duel52-split-gen022.d52nn@256,netmcts:models/duel52-split-gen031.d52nn@256
 # ~11 min. Drop --markdown to also get the per-pairing detail the fit was made of.
 ./target/release/duel52 match --a ismcts:800 --b pimc:32x1 --games 400
+# `--eval-batch N` works here too, and on `ladder` and `probe`. Same guarantee as self-play:
+# the batch is across games, so the score is identical and only arrives sooner. A gate splits
+# its games between two checkpoints, so it reaches about half self-play's batch.
 ./target/release/duel52 probe --games 400 --markdown --seed 1 --encoding-slots 21 \
     --agents netmcts:models/duel52-split-gen031.d52nn@256,random
 # probe is self-play instrumentation and it is where FINDINGS.md's strong-play tables come
@@ -305,12 +308,35 @@ therefore byte-identical whatever N is, which
 because a tolerance would pass exactly the reassociation the determinism contract forbids.
 3.26x at 64 on the laptop; `configs/train-3h-new.toml` sets it.
 
-Three things to keep straight. **The batch is clamped to `selfplay.games / run.threads`** —
-1400 over 8 is 175, fine, but a 200-game generation on 8 cores gets 25 and the config's 64 is
-silently a lie; `train check` prints the effective number. **It costs ~400 KB of live search
-tree per game in flight**, so 64 × 8 threads is ~200 MB. And **the gate does not have it
-yet**: `ladder.rs` still evaluates one position at a time, and the gate plus panel is 47% of a
-`train-3h-new` generation, so the loop-level gain is nearer 1.8x than 3.26x.
+**The gate and panel have it too**, through the same machinery: `probe::MatchGame` is the
+state machine `selfplay::GameRunner` is, and `Agent::begin_decision` is how a `Box<dyn Agent>`
+opts in — every agent but `netmcts` returns `None` and decides inline. A match differs in one
+way that caps the gain: **its two agents hold two different checkpoints**, so each round's
+suspended games are grouped by the network they are waiting on and evaluated separately,
+leaving a gate about half the batch self-play gets.
+
+Three things to keep straight. **The batch is clamped by the games a worker owns** —
+`selfplay.games / threads` for self-play, `gate.games / threads` for the gate; 1400 over 8 is
+175, fine, but a 200-game generation on 8 cores gets 25 and the config's 64 is silently a lie.
+`train check` prints both effective numbers. **It costs ~400 KB of live search tree per game
+in flight**, so 64 × 8 threads is ~200 MB. And **`nn::batch_slots` is not `min(games, batch)`**
+— see the next warning.
+
+⚠️ **A batch that does not divide a worker's games must be spread, not truncated.** The
+obvious `min(games, batch)` is worse than not batching at all: a worker with 37 games told to
+keep 32 in flight advances all 32 in lockstep, so they finish together, and then drains the
+last 5 at a batch of 5 for a full game's length. On a 300-game gate that made `--eval-batch 32`
+**slower than `--eval-batch 1`**, at 295% CPU against 712%. `nn::batch_slots` spreads a
+worker's games over the fewest waves instead — 37 games at a batch of 32 runs **19** in flight.
+A smaller batch that stays whole beats a big one that collapses.
+
+⚠️ **A batched match absorbs its games in game order, and that is load-bearing.** Games finish
+out of order once several are in flight, and `AgentBehaviour::absorb` *pushes* each game's lane
+and attack concentration into a `Vec<f64>` whose mean `probe` reports — so absorbing them as
+they land shifts that mean's last bits and makes the probe tables irreproducible. The gate
+itself reads only integers and would not have caught it;
+`rule_2_the_ladder_is_eval_batch_independent` compares the per-game f64s for exactly this
+reason, and fails if the sort is removed.
 
 ⚠️ **If you write a batched kernel, the accumulators must be a fixed-size stack array.**
 Accumulating straight into a slice of the output — the obvious way — leaves the compiler

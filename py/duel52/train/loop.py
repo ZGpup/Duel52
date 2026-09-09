@@ -382,6 +382,10 @@ class TrainingLoop:
         out = [str(self.engine), *args, *self.config.game.cli_flags()]
         if self.config.run.threads:
             out += ["--threads", str(self.config.run.threads)]
+        if self.config.run.eval_batch > 1:
+            # Shared by self-play and by every `match` the gate and panel run — the engine
+            # takes it as a global option for exactly that reason.
+            out += ["--eval-batch", str(self.config.run.eval_batch)]
         return out
 
     def selfplay(self, generation: int) -> tuple[Path, dict]:

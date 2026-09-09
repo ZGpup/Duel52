@@ -100,22 +100,8 @@ class SelfPlaySettings:
     #: a value target only. ``1.0`` is off, and is what every run before this one used.
     full_search_fraction: float = 1.0
     cap_sims: int = 32
-    #: **Batched evaluation** (`PLAN.md` §4.2d). Games kept in flight per worker thread, so
-    #: that their network evaluations go through the lane trunk in one batch. The batch is
-    #: taken across games and never inside a search, so this changes only how fast a shard is
-    #: written — ``engine/tests/selfplay.rs::phase4_a_shard_does_not_depend_on_the_evaluation_batch``
-    #: asserts the bytes do not move. ``1`` is off, which is what every run before this one
-    #: used.
-    #:
-    #: ⚠️ **It is capped by the games per worker**, which is ``selfplay.games / run.threads``:
-    #: a generation of 512 games on 8 threads gives each worker 64, so 128 would silently
-    #: behave as 64. Measured on the 8-core laptop at 512 games, lane 128×3, 256 sims with
-    #: capping: 1 → 225s, 32 → 89s, 64 → 69s.
-    eval_batch: int = 1
 
     def __post_init__(self) -> None:
-        if self.eval_batch < 1:
-            raise ValueError(f"[selfplay] eval_batch must be at least 1, got {self.eval_batch}")
         if not 0.0 < self.full_search_fraction <= 1.0:
             raise ValueError(
                 f"[selfplay] full_search_fraction must be in (0, 1], got "
@@ -148,7 +134,6 @@ class SelfPlaySettings:
             "--temperature-decisions", str(self.temperature_decisions),
             "--full-search-fraction", str(self.full_search_fraction),
             "--cap-sims", str(self.cap_sims),
-            "--eval-batch", str(self.eval_batch),
         ]
 
 
@@ -383,6 +368,21 @@ class RunSettings:
     seed: int = 1_000_000
     #: 0 means every core.
     threads: int = 0
+    #: **Batched evaluation** (`PLAN.md` §4.2d). Games kept in flight per worker thread so
+    #: their network evaluations go through the lane trunk together. It sits here rather than
+    #: under ``[selfplay]`` because it applies to the gate and the reference panel too, and
+    #: because it is a machine knob like ``threads`` rather than anything about the game.
+    #:
+    #: The batch is taken across games and never inside a search, so this changes only how
+    #: fast a generation runs — ``phase4_a_shard_does_not_depend_on_the_evaluation_batch``
+    #: and ``rule_2_the_ladder_is_eval_batch_independent`` assert the shard bytes and the
+    #: gate score do not move. ``1`` is off, which is what every run before this one used.
+    #:
+    #: ⚠️ **Clamped by the games each worker gets.** Self-play gets ``selfplay.games /
+    #: threads``; the gate gets ``gate.games / threads`` and then splits it between the two
+    #: checkpoints, so a gate reaches roughly half the batch self-play does. ``train check``
+    #: prints both effective numbers.
+    eval_batch: int = 1
     engine: str = "./target/release/duel52"
 
 

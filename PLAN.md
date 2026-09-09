@@ -333,10 +333,25 @@ Cost, on the 8-core laptop at 512 games, lane 128x3, 256 sims with capping:
 cores silently gets a smaller one — `train check` prints the effective number. It costs about
 400 KB of live search tree per game in flight.
 
-**What it does not cover: the gate.** `ladder.rs` still plays one position at a time, and for
-`train-3h-new` the gate and panel are 47% of a generation. So the loop-level gain is nearer
-1.8x than 3.26x until the same treatment reaches `run_match`. That is the obvious next piece
-and it is not done.
+**The gate has it too**, added straight after and the reason `run_match` grew an `eval_batch`
+argument. `probe::MatchGame` is the same state machine `GameRunner` is, and
+`Agent::begin_decision` is how a `Box<dyn Agent>` opts into being suspendable — every agent
+but `netmcts` returns `None` and decides inline exactly as before.
+
+One thing is genuinely different in a match, and it caps the gain: **the two agents hold two
+different checkpoints**, so a round's suspended games are grouped by the network each is
+waiting on and evaluated separately. The in-flight games split roughly evenly between the two,
+so a gate reaches about half the batch self-play does. A panel row against `random` or
+`greedy` does not pay that, because the non-network agent never suspends.
+
+⚠️ **And one trap, which cost a benchmark before it was found.** The batch a worker can use is
+capped by the games it owns, and the naive `min(games, batch)` is wrong in a way that is worse
+than not batching: a worker with 37 games told to keep 32 in flight advances all 32 in lockstep
+so they finish together, then drains the last 5 at a batch of 5 for a full game's length. On a
+300-game gate over 8 threads that tail made `--eval-batch 32` **slower than `--eval-batch 1`**,
+at 295% CPU against 712%. `nn::batch_slots` spreads a worker's games evenly over the fewest
+waves instead — 37 games at a batch of 32 runs 19 in flight, not 32. A smaller batch that
+stays whole beats a big one that collapses.
 
 **The trap this uncovered, which item 7 must not walk into.** Depth on the equivariant net
 costs far more than the parameter count suggests, because in the search path the input layer

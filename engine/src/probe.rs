@@ -24,10 +24,14 @@
 //! matters — agents see only their own information set — is enforced where decisions are
 //! made, in [`crate::agents`] and [`GameState::determinize`].
 
+use std::sync::Arc;
+
 use crate::action::Action;
-use crate::agents::{Agent, AgentSpec};
+use crate::agents::{Agent, AgentSpec, SearchInProgress, SearchStep};
 use crate::card::CardId;
 use crate::config::GameConfig;
+use crate::encode::{action_dim, obs_dim};
+use crate::nn::{MlpEvaluator, Scratch};
 use crate::outcome::{DrawReason, Outcome};
 use crate::player::Player;
 use crate::rank::Rank;
@@ -297,40 +301,162 @@ fn top_share(counts: &[u32], k: usize) -> Option<f64> {
     Some(top as f64 / total as f64)
 }
 
+/// One instrumented game, driven a network evaluation at a time.
+///
+/// The same loop [`play_instrumented`] always ran, turned inside out so a caller can keep
+/// several games in flight and evaluate their positions in one batch (`PLAN.md` §4.2d). Only
+/// `netmcts` suspends — [`Agent::begin_decision`] returns `None` for everything else, and
+/// those agents decide inline exactly as before.
+///
+/// There is one implementation: [`play_instrumented`] is this type driven one row at a time.
+pub struct MatchGame {
+    state: GameState,
+    stats: GameStats,
+    /// Indexed by [`Player::idx`], so the agent to ask is `agents[state.to_move.idx()]`.
+    agents: [Box<dyn Agent>; 2],
+    /// The legal actions of the decision being searched — what `end_decision` indexes.
+    legal: Vec<Action>,
+    search: Option<SearchInProgress>,
+    finished: bool,
+}
+
+impl MatchGame {
+    pub fn new(
+        config: GameConfig,
+        seed: u64,
+        p0: Box<dyn Agent>,
+        p1: Box<dyn Agent>,
+    ) -> MatchGame {
+        let state = GameState::new(config, seed);
+        let mut stats = GameStats::new(&config, seed);
+        stats.note_state(&state);
+        MatchGame {
+            state,
+            stats,
+            agents: [p0, p1],
+            legal: Vec::new(),
+            search: None,
+            finished: false,
+        }
+    }
+
+    /// Play on until the game needs a network evaluation, or it is over.
+    pub fn advance(&mut self, obs: &mut [f32], mask: &mut [bool]) -> SearchStep {
+        loop {
+            if let Some(search) = &mut self.search {
+                match search.advance(obs, mask) {
+                    SearchStep::NeedsEval => return SearchStep::NeedsEval,
+                    SearchStep::Done => {
+                        let search = self.search.take().expect("just matched");
+                        let seat = self.state.to_move.idx();
+                        let action = self.agents[seat].end_decision(search, &self.legal);
+                        self.play(action);
+                    }
+                }
+            } else if self.finished {
+                return SearchStep::Done;
+            } else if self.state.outcome.is_over() {
+                self.stats.finish(&self.state);
+                self.finished = true;
+                return SearchStep::Done;
+            } else {
+                self.legal = self.state.legal_actions();
+                let seat = self.state.to_move.idx();
+                match self.agents[seat].begin_decision(&self.state, &self.legal) {
+                    Some(search) => self.search = Some(search),
+                    None => {
+                        let action = self.agents[seat].choose(&self.state, &self.legal);
+                        self.play(action);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answer the evaluation [`Self::advance`] suspended on. `mask` must be the buffer it
+    /// filled.
+    pub fn supply(&mut self, logits: &[f32], value: f32, mask: &mut [bool]) {
+        self.search
+            .as_mut()
+            .expect("supply without a search in progress")
+            .supply(logits, value, mask);
+    }
+
+    /// The network the suspended search is waiting on — how a driver groups games into
+    /// batches when the two agents hold different checkpoints, which in a gate they do.
+    pub fn pending_evaluator(&self) -> Option<&Arc<MlpEvaluator>> {
+        self.search.as_ref().map(|s| s.evaluator())
+    }
+
+    pub fn finish(self) -> GameStats {
+        debug_assert!(self.finished, "finish before the game ended");
+        self.stats
+    }
+
+    fn play(&mut self, action: Action) {
+        let acting = self.state.to_move;
+        let ply_before = self.state.ply;
+        let allowance_before = self.state.actions_remaining;
+        let costs = action.costs_an_action();
+
+        let threes_before = GameStats::face_down_threes(&self.state);
+
+        self.stats.note_action(&self.state, action);
+        self.state.apply_trusted(action);
+        self.stats.decisions += 1;
+        self.stats.note_state(&self.state);
+        self.stats
+            .note_turn_ends(acting, ply_before, allowance_before, costs, &self.state);
+        self.stats
+            .note_three_transitions(&threes_before, acting, action, &self.state);
+    }
+}
+
+/// Per-evaluator working buffers, so a driver holding two checkpoints does not allocate one
+/// per evaluation. Keyed by pointer, which `nn::evaluator_for`'s cache makes checkpoint
+/// identity.
+#[derive(Default)]
+pub struct ScratchPool {
+    entries: Vec<(usize, Scratch)>,
+}
+
+impl ScratchPool {
+    pub fn get(&mut self, evaluator: &Arc<MlpEvaluator>) -> &mut Scratch {
+        let key = Arc::as_ptr(evaluator) as usize;
+        let at = match self.entries.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                self.entries.push((key, evaluator.scratch()));
+                self.entries.len() - 1
+            }
+        };
+        &mut self.entries[at].1
+    }
+}
+
 /// Play one instrumented game between two agents.
 pub fn play_instrumented(
     config: GameConfig,
     seed: u64,
-    p0: &mut dyn Agent,
-    p1: &mut dyn Agent,
+    p0: Box<dyn Agent>,
+    p1: Box<dyn Agent>,
 ) -> GameStats {
-    let mut state = GameState::new(config, seed);
-    let mut stats = GameStats::new(&config, seed);
-    stats.note_state(&state);
+    let (od, ad) = (obs_dim(&config), action_dim(&config));
+    let mut obs = vec![0.0f32; od];
+    let mut mask = vec![false; ad];
+    let mut logits = vec![0.0f32; ad];
+    let mut pool = ScratchPool::default();
 
-    while !state.outcome.is_over() {
-        let legal = state.legal_actions();
-        let action = match state.to_move {
-            Player::P0 => p0.choose(&state, &legal),
-            Player::P1 => p1.choose(&state, &legal),
-        };
-        let acting = state.to_move;
-        let ply_before = state.ply;
-        let allowance_before = state.actions_remaining;
-        let costs = action.costs_an_action();
-
-        let threes_before = GameStats::face_down_threes(&state);
-
-        stats.note_action(&state, action);
-        state.apply_trusted(action);
-        stats.decisions += 1;
-        stats.note_state(&state);
-        stats.note_turn_ends(acting, ply_before, allowance_before, costs, &state);
-        stats.note_three_transitions(&threes_before, acting, action, &state);
+    let mut game = MatchGame::new(config, seed, p0, p1);
+    while game.advance(&mut obs, &mut mask) == SearchStep::NeedsEval {
+        let evaluator = game
+            .pending_evaluator()
+            .expect("a suspended search names its network")
+            .clone();
+        let value = evaluator.eval_masked_with(&obs, &mask, &mut logits, pool.get(&evaluator));
+        game.supply(&logits, value, &mut mask);
     }
-
-    stats.finish(&state);
-    stats
+    game.finish()
 }
 
 /// Play one instrumented game between two [`AgentSpec`]s, building both from `seed`.
@@ -340,9 +466,9 @@ pub fn play_spec_game(
     p0: AgentSpec,
     p1: AgentSpec,
 ) -> GameStats {
-    let mut a = p0.build(seed, AGENT_STREAM[0]);
-    let mut b = p1.build(seed, AGENT_STREAM[1]);
-    play_instrumented(config, seed, a.as_mut(), b.as_mut())
+    let a = p0.build(seed, AGENT_STREAM[0]);
+    let b = p1.build(seed, AGENT_STREAM[1]);
+    play_instrumented(config, seed, a, b)
 }
 
 // ============================================================== aggregation ==

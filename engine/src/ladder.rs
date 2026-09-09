@@ -24,13 +24,30 @@
 //! not depend on the thread count — `rule_2_the_ladder_is_thread_count_independent` pins
 //! that, because a benchmark whose numbers move when you change `--threads` is not a
 //! benchmark.
+//!
+//! # Batched evaluation
+//!
+//! `--eval-batch N` keeps `N` games in flight per worker so their network evaluations go
+//! through the trunk together (`PLAN.md` §4.2d). It is a speed knob and nothing else: the
+//! batch is taken across games and never inside a search, so
+//! `rule_2_the_ladder_is_eval_batch_independent` holds the result fixed for the same reason
+//! the thread-count test does. This matters more here than in self-play, because the gate is
+//! the measurement the training loop *promotes* on — a batched gate that scored differently
+//! would quietly change which candidates ship.
+//!
+//! Only `netmcts` batches. Every other agent decides inline, so a panel row against `random`
+//! or `greedy` has one network in it rather than two.
 
 use std::time::Instant;
 
-use crate::agents::AgentSpec;
+use std::sync::Arc;
+
+use crate::agents::{AgentSpec, SearchStep};
 use crate::config::GameConfig;
 use crate::elo::{fit, EloTable, Pairing};
-use crate::probe::{play_instrumented, MatchStats, AGENT_STREAM};
+use crate::encode::{action_dim, obs_dim};
+use crate::nn::BatchScratch;
+use crate::probe::{play_instrumented, MatchGame, MatchStats, AGENT_STREAM};
 
 /// Play `games` games between two agents, alternating who moves first.
 ///
@@ -43,10 +60,12 @@ pub fn run_match(
     first_seed: u64,
     games: usize,
     threads: usize,
+    eval_batch: usize,
 ) -> MatchStats {
     let started = Instant::now();
     let games = games + (games % 2);
     let threads = threads.max(1).min(games.max(1));
+    let eval_batch = eval_batch.max(1);
 
     let mut total = MatchStats::empty(config, [a.clone(), b.clone()]);
     if games == 0 {
@@ -72,6 +91,11 @@ pub fn run_match(
             .map(|&(lo, hi)| {
                 let specs = &specs;
                 scope.spawn(move || {
+                    if eval_batch > 1 {
+                        return play_shard_batched(
+                            config, specs, first_seed, lo, hi, eval_batch,
+                        );
+                    }
                     let mut shard = MatchStats::empty(config, specs.clone());
                     for g in lo..hi {
                         shard.absorb(&play_indexed(config, specs, first_seed, g), seats(g));
@@ -91,6 +115,174 @@ pub fn run_match(
     }
     total.elapsed_secs = started.elapsed().as_secs_f64();
     total
+}
+
+/// Build both agents for one game, seated.
+///
+/// Stream tags follow the *agent*, not the seat, so an agent consumes the same random
+/// numbers in both halves of a colour-paired deal.
+fn build_seated(
+    agents: &[AgentSpec; 2],
+    seed: u64,
+    seats: [usize; 2],
+) -> (Box<dyn crate::agents::Agent>, Box<dyn crate::agents::Agent>) {
+    (
+        agents[seats[0]].build(seed, AGENT_STREAM[seats[0]]),
+        agents[seats[1]].build(seed, AGENT_STREAM[seats[1]]),
+    )
+}
+
+/// Play games `lo..hi` of a match with up to `batch` of them in flight at once.
+///
+/// The gate and the reference panel are 47% of a `train-3h-new` generation and were the half
+/// `PLAN.md` §4.2d did not reach at first. Same idea as `selfplay::play_shard_batched` and
+/// the same guarantee — the batch is taken across games, no search is altered, and
+/// `rule_2_the_ladder_is_eval_batch_independent` asserts the result does not move.
+///
+/// **One thing is different here: a match has two agents with two different checkpoints.**
+/// The candidate and the incumbent are separate networks, so a round's suspended games are
+/// grouped by the evaluator they are waiting on and each group is evaluated on its own. That
+/// halves the batch a gate can reach relative to self-play — the games in flight split
+/// roughly evenly between the two sides — which is why the gate's speed-up is nearer 2x than
+/// self-play's 3.26x. A panel row against `random` or `greedy` has only one network and does
+/// not pay that, because the non-network agent never suspends at all.
+fn play_shard_batched(
+    config: GameConfig,
+    specs: &[AgentSpec; 2],
+    first_seed: u64,
+    lo: usize,
+    hi: usize,
+    batch: usize,
+) -> MatchStats {
+    let slots = crate::nn::batch_slots(hi - lo, batch);
+    let (od, ad) = (obs_dim(&config), action_dim(&config));
+
+    // Per slot, because a slot's observation is written when it suspends and its mask must
+    // still be the buffer `supply` clears.
+    let mut obs = vec![0.0f32; slots * od];
+    let mut masks = vec![false; slots * ad];
+    // Contiguous per evaluator, because `eval_masked_batch` takes rows in one block and a
+    // group's slots are scattered. Fully overwritten each time, so nothing goes stale.
+    let mut stage_obs = vec![0.0f32; slots * od];
+    let mut stage_masks = vec![false; slots * ad];
+    let mut logits = vec![0.0f32; slots * ad];
+    let mut values = vec![0.0f32; slots];
+
+    let mut games: Vec<Option<(usize, MatchGame)>> = (0..slots).map(|_| None).collect();
+    let mut pending: Vec<(usize, usize)> = Vec::with_capacity(slots);
+    let mut keys: Vec<usize> = Vec::with_capacity(2);
+    let mut rows: Vec<usize> = Vec::with_capacity(slots);
+    let mut scratches: Vec<(usize, BatchScratch)> = Vec::new();
+    let mut next = lo;
+    // Collected rather than absorbed as they finish, then absorbed in game order.
+    //
+    // ⚠️ Not fussiness. `AgentBehaviour::absorb` *pushes* each game's lane and attack
+    // concentration into a `Vec<f64>` whose mean `probe` later reports, and a mean over f64
+    // depends on summation order. Absorbing games as they complete would leave that mean
+    // differing in its last bits between `--eval-batch 1` and anything else — a difference
+    // small enough to look like nothing and large enough to make the probe tables
+    // irreproducible. The gate itself reads only integers and would not have noticed.
+    let mut finished: Vec<(usize, crate::probe::GameStats)> = Vec::with_capacity(hi - lo);
+
+    loop {
+        pending.clear();
+        for slot in 0..slots {
+            if games[slot].is_none() && next < hi {
+                let g = next;
+                next += 1;
+                let seed = first_seed + (g / 2) as u64;
+                let (first, second) = build_seated(specs, seed, seats(g));
+                games[slot] = Some((g, MatchGame::new(config, seed, first, second)));
+            }
+            let Some((g, game)) = games[slot].as_mut() else {
+                continue;
+            };
+            match game.advance(
+                &mut obs[slot * od..(slot + 1) * od],
+                &mut masks[slot * ad..(slot + 1) * ad],
+            ) {
+                SearchStep::NeedsEval => {
+                    let key = Arc::as_ptr(
+                        game.pending_evaluator()
+                            .expect("a suspended search names its network"),
+                    ) as usize;
+                    pending.push((slot, key));
+                }
+                SearchStep::Done => {
+                    let g = *g;
+                    let (_, game) = games[slot].take().expect("live a line ago");
+                    finished.push((g, game.finish()));
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            // Every live game contributes a row, so no rows means no live games.
+            debug_assert!(games.iter().all(|g| g.is_none()));
+            if next >= hi {
+                break;
+            }
+            continue;
+        }
+
+        keys.clear();
+        for &(_, key) in &pending {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        for &key in &keys {
+            rows.clear();
+            rows.extend(pending.iter().filter(|(_, k)| *k == key).map(|(s, _)| *s));
+            for (row, &slot) in rows.iter().enumerate() {
+                stage_obs[row * od..(row + 1) * od]
+                    .copy_from_slice(&obs[slot * od..(slot + 1) * od]);
+                stage_masks[row * ad..(row + 1) * ad]
+                    .copy_from_slice(&masks[slot * ad..(slot + 1) * ad]);
+            }
+            let evaluator = games[rows[0]]
+                .as_ref()
+                .expect("a pending slot is live")
+                .1
+                .pending_evaluator()
+                .expect("a pending slot has a suspended search")
+                .clone();
+            let at = match scratches.iter().position(|(k, _)| *k == key) {
+                Some(i) => i,
+                None => {
+                    scratches.push((key, evaluator.batch_scratch(slots)));
+                    scratches.len() - 1
+                }
+            };
+            let n = rows.len();
+            evaluator.eval_masked_batch(
+                &stage_obs[..n * od],
+                n,
+                &stage_masks[..n * ad],
+                &mut logits[..n * ad],
+                &mut values[..n],
+                &mut scratches[at].1,
+            );
+            for (row, &slot) in rows.iter().enumerate() {
+                games[slot]
+                    .as_mut()
+                    .expect("a pending slot is live")
+                    .1
+                    .supply(
+                        &logits[row * ad..(row + 1) * ad],
+                        values[row],
+                        &mut masks[slot * ad..(slot + 1) * ad],
+                    );
+            }
+        }
+    }
+
+    finished.sort_by_key(|(g, _)| *g);
+    let mut shard = MatchStats::empty(config, specs.clone());
+    for (g, stats) in &finished {
+        shard.absorb(stats, seats(*g));
+    }
+    shard
 }
 
 /// Which agent index sits in which seat for game `g`: even games put agent 0 first.
@@ -116,9 +308,8 @@ fn play_indexed(
 
     // Stream tags follow the *agent*, not the seat, so an agent consumes the same random
     // numbers in both halves of a colour-paired deal.
-    let mut first = agents[seats[0]].build(seed, AGENT_STREAM[seats[0]]);
-    let mut second = agents[seats[1]].build(seed, AGENT_STREAM[seats[1]]);
-    play_instrumented(config, seed, first.as_mut(), second.as_mut())
+    let (first, second) = build_seated(agents, seed, seats);
+    play_instrumented(config, seed, first, second)
 }
 
 /// A complete round-robin, plus the ratings fitted to it.
@@ -211,6 +402,7 @@ pub fn run_ladder(
     first_seed: u64,
     games_per_pairing: usize,
     threads: usize,
+    eval_batch: usize,
     anchor_name: &str,
     progress: bool,
 ) -> LadderResult {
@@ -236,6 +428,7 @@ pub fn run_ladder(
                 first_seed,
                 games_per_pairing,
                 threads,
+                eval_batch,
             );
             if progress {
                 eprintln!(

@@ -78,6 +78,71 @@ pub fn evaluator_for(path: &Path, config: &GameConfig) -> Result<Arc<MlpEvaluato
     Ok(evaluator)
 }
 
+/// How many games a worker should keep in flight, given how many it owns and the batch it
+/// was asked for.
+///
+/// **Not `min(games, batch)`, and the difference is not small.** A worker with 37 games told
+/// to keep 32 in flight runs 32 in lockstep — they all advance one simulation per round, so
+/// they finish together — and then drains the last 5 at a batch of 5, which is slower per
+/// position than the unbatched path and lasts a full game. Measured on a 300-game gate over
+/// 8 threads, that tail made `--eval-batch 32` *slower than `--eval-batch 1`*.
+///
+/// So: take the fewest rounds of at most `batch` that cover `games`, then spread the games
+/// evenly over them. 37 games at a batch of 32 becomes 19 in flight, not 32 — a smaller batch
+/// that stays whole, which is worth more than a big batch that collapses.
+///
+/// ```text
+/// games  batch   slots   why
+///    37     64      37   one wave, everything in flight
+///    37     32      19   two waves of 19 and 18, rather than 32 then 5
+///   175     64      59   three waves, rather than 64 + 64 + 47
+///    64     64      64   exact
+/// ```
+pub fn batch_slots(games: usize, batch: usize) -> usize {
+    let batch = batch.max(1);
+    if games == 0 {
+        return 1;
+    }
+    if batch >= games {
+        return games;
+    }
+    let waves = games.div_ceil(batch);
+    games.div_ceil(waves)
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::batch_slots;
+
+    #[test]
+    fn a_batch_that_covers_everything_puts_everything_in_flight() {
+        assert_eq!(batch_slots(37, 64), 37);
+        assert_eq!(batch_slots(64, 64), 64);
+        assert_eq!(batch_slots(1, 64), 1);
+    }
+
+    /// The case that made a batched gate slower than an unbatched one.
+    #[test]
+    fn a_batch_that_does_not_divide_the_work_is_spread_rather_than_left_with_a_stub() {
+        assert_eq!(batch_slots(37, 32), 19);
+        assert_eq!(batch_slots(175, 64), 59);
+        assert_eq!(batch_slots(100, 64), 50);
+    }
+
+    /// Whatever it returns, the waves it implies must still cover the games in the same
+    /// number of rounds the requested batch would have taken — spreading must not cost a wave.
+    #[test]
+    fn spreading_never_adds_a_wave() {
+        for games in 1..400usize {
+            for batch in 1..80usize {
+                let slots = batch_slots(games, batch);
+                assert!(slots >= 1 && slots <= batch.max(1).min(games.max(1)));
+                assert_eq!(games.div_ceil(slots), games.div_ceil(batch.max(1)));
+            }
+        }
+    }
+}
+
 /// Something that can turn observations into raw policy logits and values.
 ///
 /// **Batch-shaped from the start, deliberately.** The self-play loop this is built for will

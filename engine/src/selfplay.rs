@@ -272,10 +272,11 @@ impl GameRunner {
     fn advance(&mut self, sp: &SelfPlayConfig, obs: &mut [f32], mask: &mut [bool]) -> SearchStep {
         loop {
             if let Some(search) = &mut self.search {
-                match search.advance(&mut self.agent, obs, mask) {
+                match search.advance(obs, mask) {
                     SearchStep::NeedsEval => return SearchStep::NeedsEval,
                     SearchStep::Done => {
-                        let result = self.search.take().expect("just matched").finish();
+                        let search = self.search.take().expect("just matched");
+                        let result = self.agent.end_search(search);
                         self.finish_decision(sp, result);
                     }
                 }
@@ -292,7 +293,7 @@ impl GameRunner {
             .search
             .as_mut()
             .expect("supply without a search in progress");
-        search.supply(&mut self.agent, logits, value, mask);
+        search.supply(logits, value, mask);
     }
 
     fn take_record(&mut self) -> Option<GameRecord> {
@@ -407,7 +408,7 @@ fn play_shard_batched(
     let evaluator = crate::nn::evaluator_for(checkpoint, &config)
         .unwrap_or_else(|e| panic!("netmcts: {e}"));
     let (od, ad) = (obs_dim(&config), action_dim(&config));
-    let slots = batch.min(hi - lo).max(1);
+    let slots = crate::nn::batch_slots(hi - lo, batch);
 
     let mut obs = vec![0.0f32; slots * od];
     let mut masks = vec![false; slots * ad];

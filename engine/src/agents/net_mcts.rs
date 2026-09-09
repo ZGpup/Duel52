@@ -238,28 +238,33 @@ impl NetMctsAgent {
     /// transcriptions of PUCT would be two chances to diverge.
     pub fn search(&mut self, state: &GameState, legal: &[Action]) -> SearchResult {
         let config = state.config;
-        let evaluator = self.evaluator(&config);
         let mut obs = vec![0.0f32; obs_dim(&config)];
         let mut mask = vec![false; action_dim(&config)];
         let mut logits = vec![0.0f32; action_dim(&config)];
-        let mut scratch = evaluator.scratch();
 
         let mut search = self.begin_search(state, legal);
-        while let SearchStep::NeedsEval = search.advance(self, &mut obs, &mut mask) {
+        let evaluator = search.evaluator.clone();
+        let mut scratch = evaluator.scratch();
+        while let SearchStep::NeedsEval = search.advance(&mut obs, &mut mask) {
             let value = evaluator.eval_masked_with(&obs, &mask, &mut logits, &mut scratch);
-            search.supply(self, &logits, value, &mut mask);
+            search.supply(&logits, value, &mut mask);
         }
-        search.finish()
+        self.end_search(search)
     }
 
     /// Begin a search that suspends wherever it needs a network evaluation.
     ///
     /// The budget, exploration constant and root noise are snapshotted here, so
-    /// [`Self::set_budget`] between decisions means what it always meant. The agent stays
-    /// borrowed only for the call — [`SearchInProgress`] takes `&mut NetMctsAgent` back on
-    /// each step, because the search RNG lives on the agent and has to carry across the
-    /// whole game rather than restart per decision.
+    /// [`Self::set_budget`] between decisions means what it always meant.
+    ///
+    /// **The search RNG moves into the returned value and comes back in
+    /// [`Self::end_search`].** It has to carry across a whole game rather than restart per
+    /// decision, and a suspended search cannot borrow the agent — the batched match driver
+    /// holds its agents as `Box<dyn Agent>` and could not hand a `&mut NetMctsAgent` back.
+    /// Dropping a `SearchInProgress` without ending it therefore loses the stream position;
+    /// every driver in the tree ends what it begins.
     pub fn begin_search(&mut self, state: &GameState, legal: &[Action]) -> SearchInProgress {
+        let evaluator = self.evaluator(&state.config);
         SearchInProgress {
             config: state.config,
             me: state.acting_player(),
@@ -268,6 +273,8 @@ impl NetMctsAgent {
             sims: self.sims,
             c_puct: self.c_puct,
             noise: self.noise,
+            rng: std::mem::replace(&mut self.rng, Rng::new(0)),
+            evaluator,
             tree: vec![Node::default()],
             path: Vec::with_capacity(16),
             root_value_total: 0.0,
@@ -276,6 +283,26 @@ impl NetMctsAgent {
             pending: None,
             set: Vec::with_capacity(64),
         }
+    }
+
+    /// Take a finished search back, restoring the RNG stream to the agent.
+    pub fn end_search(&mut self, search: SearchInProgress) -> SearchResult {
+        let (result, rng) = search.finish();
+        self.rng = rng;
+        result
+    }
+
+    /// The action [`Agent::choose`] would play, given a finished search.
+    fn most_visited(result: &SearchResult, legal: &[Action]) -> Action {
+        // Most-visited, the standard robust-child rule: a rarely visited edge can hold a
+        // high average off two lucky evaluations.
+        let mut best = 0usize;
+        for i in 1..result.visits.len() {
+            if result.visits[i] > result.visits[best] {
+                best = i;
+            }
+        }
+        legal[best]
     }
 
     /// PUCT over the edges legal in this determinization.
@@ -404,6 +431,13 @@ pub struct SearchInProgress {
     sims: usize,
     c_puct: f32,
     noise: Option<RootNoise>,
+    /// Moved off the agent for the life of the search — see [`NetMctsAgent::begin_search`].
+    rng: Rng,
+    /// Carried so a driver can group suspended searches by the network they are waiting on:
+    /// a gate match has two agents with two different checkpoints, and each needs its own
+    /// batch. `evaluator_for` caches by path and layout, so pointer identity is checkpoint
+    /// identity.
+    evaluator: Arc<MlpEvaluator>,
     tree: Vec<Node>,
     /// (node, edge) pairs traversed, reused across simulations.
     path: Vec<(usize, usize)>,
@@ -422,18 +456,13 @@ impl SearchInProgress {
     /// On [`SearchStep::NeedsEval`] the observation is written into `obs` and the legal
     /// actions are set in `mask`; both must still hold those values when [`Self::supply`] is
     /// called. On [`SearchStep::Done`] neither buffer is touched.
-    pub fn advance(
-        &mut self,
-        agent: &mut NetMctsAgent,
-        obs: &mut [f32],
-        mask: &mut [bool],
-    ) -> SearchStep {
+    pub fn advance(&mut self, obs: &mut [f32], mask: &mut [bool]) -> SearchStep {
         debug_assert!(
             self.pending.is_none(),
             "advance while an evaluation is outstanding"
         );
         while self.sims_done < self.sims {
-            let mut world = self.root.determinize(self.me, &mut agent.rng);
+            let mut world = self.root.determinize(self.me, &mut self.rng);
             let mut node = 0usize;
             self.path.clear();
 
@@ -513,13 +542,7 @@ impl SearchInProgress {
     /// ([`crate::Outcome::value_for`]) happens here, in one place, so a backed-up net value
     /// and a backed-up terminal result are the same quantity. `mask` must be the buffer
     /// `advance` filled; it is left all-false.
-    pub fn supply(
-        &mut self,
-        agent: &mut NetMctsAgent,
-        logits: &[f32],
-        value: f32,
-        mask: &mut [bool],
-    ) {
+    pub fn supply(&mut self, logits: &[f32], value: f32, mask: &mut [bool]) {
         let Pending {
             world,
             available,
@@ -541,7 +564,7 @@ impl SearchInProgress {
             self.tree.push(Node::default());
             let logit = logits[encode_action(&action, &world)];
             let gamma = match (node, self.noise) {
-                (0, Some(n)) => agent.rng.gamma(n.alpha) as f32,
+                (0, Some(n)) => self.rng.gamma(n.alpha) as f32,
                 _ => 0.0,
             };
             self.tree[node].edges.push(Edge {
@@ -576,8 +599,13 @@ impl SearchInProgress {
         }
     }
 
-    /// The finished search, as [`NetMctsAgent::search`] would have returned it.
-    pub fn finish(self) -> SearchResult {
+    /// The network this search is waiting on, for grouping suspended searches into batches.
+    pub fn evaluator(&self) -> &Arc<MlpEvaluator> {
+        &self.evaluator
+    }
+
+    /// The finished search, and the RNG stream to hand back to the agent.
+    fn finish(self) -> (SearchResult, Rng) {
         let me = self.me;
         let tree = &self.tree;
         let (visits, values): (Vec<u32>, Vec<Option<f32>>) = self
@@ -608,12 +636,14 @@ impl SearchInProgress {
             }
         };
 
-        SearchResult {
+        let nodes = tree.len();
+        let result = SearchResult {
             visits,
             values,
             root_value,
-            nodes: tree.len(),
-        }
+            nodes,
+        };
+        (result, self.rng)
     }
 }
 
@@ -623,19 +653,26 @@ impl Agent for NetMctsAgent {
             return legal[0];
         }
         let result = self.search(state, legal);
-        // Most-visited, the standard robust-child rule: a rarely visited edge can hold a
-        // high average off two lucky evaluations.
-        let mut best = 0usize;
-        for i in 1..result.visits.len() {
-            if result.visits[i] > result.visits[best] {
-                best = i;
-            }
-        }
-        legal[best]
+        NetMctsAgent::most_visited(&result, legal)
     }
 
     fn name(&self) -> String {
         format!("netmcts:{}@{}", self.checkpoint.display(), self.sims)
+    }
+
+    /// `None` on a forced move, which is what keeps [`Self::choose`]'s shortcut: a single
+    /// legal action costs no simulations and should not occupy a batch slot.
+    fn begin_decision(
+        &mut self,
+        state: &GameState,
+        legal: &[Action],
+    ) -> Option<SearchInProgress> {
+        (legal.len() > 1).then(|| self.begin_search(state, legal))
+    }
+
+    fn end_decision(&mut self, search: SearchInProgress, legal: &[Action]) -> Action {
+        let result = self.end_search(search);
+        NetMctsAgent::most_visited(&result, legal)
     }
 }
 

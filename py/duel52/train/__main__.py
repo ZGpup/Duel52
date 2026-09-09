@@ -90,23 +90,30 @@ def _check(args: argparse.Namespace) -> int:
             f"policy targets a generation against "
             f"{sp.games * 136 // tr.sample_stride:,} value targets"
         )
-    if sp.eval_batch > 1:
-        # `selfplay.rs` clamps the batch to the games a worker actually owns, so a small
-        # generation on many cores silently gets a smaller batch than the config asks for.
-        # Say the effective number, because the clamp is invisible in the run's output.
+    if config.run.eval_batch > 1:
+        # The engine clamps the batch to the games a worker actually owns, so a small
+        # generation on many cores silently gets a smaller one than the config asks for, and
+        # the clamp is invisible in the run's own output. Say what it will really be.
         workers = config.run.threads or os.cpu_count() or 1
-        per_worker = max(sp.games // max(workers, 1), 1)
-        effective = min(sp.eval_batch, per_worker)
-        line = (
-            f"eval batch:     {sp.eval_batch} games in flight per worker — batched "
-            f"evaluation, and byte-identical to 1"
+        asked = config.run.eval_batch
+        sp_eff = min(asked, max(sp.games // max(workers, 1), 1))
+        # A gate splits its in-flight games between two checkpoints, so each batch is about
+        # half of what the slot count suggests — see `ladder::play_shard_batched`.
+        gate_slots = min(asked, max(config.gate.games // max(workers, 1), 1))
+        print(
+            f"eval batch:     {asked} games in flight per worker, over {workers} threads — "
+            f"a speed knob only,"
         )
-        print(f"                {line}")
-        if effective < sp.eval_batch:
+        print(
+            f"                results are identical to eval_batch = 1 "
+            f"(self-play {sp_eff}/worker, gate {gate_slots}/worker split over 2 nets)"
+        )
+        if sp_eff < asked:
             print(
-                f"                ⚠️  only {effective} in practice: {sp.games} games over "
-                f"{workers} threads is {per_worker} each"
+                f"                ⚠️  self-play gets only {sp_eff}: {sp.games} games over "
+                f"{workers} threads is {sp.games // max(workers, 1)} each"
             )
+
     # What a fixed step count actually means depends on how full the buffer is, and the
     # answer at generation 1 is what cost `runs/fourth` its first generation.
     if tr.epochs_per_generation <= 0:
