@@ -1623,13 +1623,20 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         let mut path: Vec<usize> = Vec::new();
         let mut complaint = String::new();
         let mut typed = String::new();
-        // Where the arrow keys have walked to, or `None` before they have been touched.
-        // Deliberately `None` at the start of every question rather than parked on the first
-        // row: nothing is preselected until a key says so, so Enter on an empty prompt still
-        // means nothing, exactly as it always did.
+        // Where the arrow keys have walked to. `None` means "not placed yet", which is what
+        // every new question is set back to, and the top of the loop then parks it on the
+        // first row that can be picked — so a list always opens with a row marked and Enter
+        // always has something to take.
         let mut cursor: Option<usize> = None;
         let action = loop {
             let node = root.at(&path);
+
+            // Only where there is a mark to see. Line mode — a pipe, `--no-clear` — draws no
+            // `*` and no red, so a cursor there would be an invisible default that an empty
+            // line silently acted on; there, a blank line goes on meaning nothing.
+            if cursor.is_none() && keys.interactive() {
+                cursor = node.entry(!path.is_empty());
+            }
 
             // The row the prompt is pointing at: the number typed so far, or — with nothing
             // typed — wherever the arrows are sitting. Recomputed on every keystroke, which
@@ -2312,8 +2319,8 @@ Choosing a move — one question at a time:
   OR USE THE ARROW KEYS. Up and down walk the list — only the lines you could actually
   pick, so a `—` line is stepped over — right or Enter takes the line you are on, and left
   goes back one question. The line you are on carries a `*`, and the card it names lights
-  up on the board exactly as a typed number would. Nothing is preselected until you press
-  an arrow, so Enter on an empty prompt still does nothing. Typing a number and arrowing
+  up on the board exactly as a typed number would. Every question opens with the first
+  line you could pick already marked, so Enter alone takes it. Typing a number and arrowing
   are the same list reached two ways; use whichever suits the move.
 
   TYPE A NUMBER AND LOOK UP. Before you press Enter, that line and the card it names turn

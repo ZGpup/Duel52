@@ -201,13 +201,21 @@ impl Menu {
         numbers
     }
 
+    /// Where the cursor starts: the first row that can be picked, or `None` in a menu where
+    /// nothing can be.
+    ///
+    /// Every question opens with this row marked, so the list always has an answer on it and
+    /// Enter always means something.
+    pub fn entry(&self, nested: bool) -> Option<usize> {
+        self.walkable(nested).first().copied()
+    }
+
     /// Move the cursor one row, wrapping at both ends.
     ///
-    /// `cursor` is `None` when nothing has been walked onto yet, and then the list is entered
-    /// at whichever end the key came from — down takes the first row, up the last — so the
-    /// first arrow press always lands somewhere visible. A cursor on a row that has since
-    /// gone is treated the same way rather than clamped, because the menu it belonged to is
-    /// not the one being drawn.
+    /// `cursor` is `None` where there is nothing to walk from, and then the list is entered at
+    /// whichever end the key came from — down takes the first row, up the last. A cursor on a
+    /// row that has since gone is treated the same way rather than clamped, because the menu
+    /// it belonged to is not the one being drawn.
     pub fn step(&self, cursor: Option<usize>, nested: bool, down: bool) -> Option<usize> {
         let numbers = self.walkable(nested);
         if numbers.is_empty() {
@@ -1692,6 +1700,9 @@ mod tests {
         // Entering the list from either end, then wrapping off the other one.
         let first = *walkable.first().unwrap();
         let last = *walkable.last().unwrap();
+        // Where a question opens: the first row that can be picked, never a `—` row.
+        assert_eq!(menu.entry(false), Some(first));
+        assert_eq!(menu.entry(true), Some(first), "BACK is last, so it is not the entry");
         assert_eq!(menu.step(None, false, true), Some(first));
         assert_eq!(menu.step(None, false, false), Some(last));
         assert_eq!(menu.step(Some(last), false, true), Some(first));
