@@ -97,16 +97,13 @@ def _check(args: argparse.Namespace) -> int:
         workers = config.run.threads or os.cpu_count() or 1
         asked = config.run.eval_batch
         sp_eff = min(asked, max(sp.games // max(workers, 1), 1))
-        # A gate splits its in-flight games between two checkpoints, so each batch is about
-        # half of what the slot count suggests — see `ladder::play_shard_batched`.
-        gate_slots = min(asked, max(config.gate.games // max(workers, 1), 1))
         print(
             f"eval batch:     {asked} games in flight per worker, over {workers} threads — "
             f"a speed knob only,"
         )
         print(
-            f"                results are identical to eval_batch = 1 "
-            f"(self-play {sp_eff}/worker, gate {gate_slots}/worker split over 2 nets)"
+            f"                results are identical to eval_batch = 1 · self-play "
+            f"{sp_eff}/worker · not applied to the gate (F4.8: 7% slower there)"
         )
         if sp_eff < asked:
             print(

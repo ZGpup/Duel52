@@ -302,6 +302,56 @@ about that distinction since the first flip-timing curve and should stay careful
 These are findings about the instrument rather than the game, kept because they decide what to
 do next.
 
+### F4.8: the lane network passes gen031 by +167 Elo, in one seven-hour sitting
+
+`runs/seventh`, `configs/train-7h.toml`, split, `encoding_slots = 21`, `run.seed = 6000000`
+so the games span seeds **6,000,000–6,080,000** (4,000 a generation), warm-started from
+`runs/sixth/checkpoints/best.d52nn`. **20 generations, 11 promoted, 80,000 self-play games,
+6.96 hours** on the 8-core M2 laptop, stopped by the clock rather than by the gate.
+
+**The result, 400 games at equal simulations:**
+
+| | score | | Elo |
+|---|---:|---|---:|
+| vs `gen031@256` **before** the run | 0.3175 ± 0.064 | (200 games) | −133 |
+| vs `gen031@256` **after** | **0.7238 ± 0.044** | W288 L109 D3 | **+167** |
+| vs `runs/sixth` best, after | 0.8700 ± 0.033 | W347 L51 D2 | +330 |
+
+**A +300 Elo swing in one sitting**, against +189 for the entire preceding flat lineage
+(gen016 → gen022 → gen031, three runs). The lane-equivariant architecture was never the
+problem; `runs/sixth` was simply a from-scratch run that had not been given enough games.
+
+⚠️ **The two rows are not perfectly consistent, and the direct one is the one to quote.**
++330 over `runs/sixth` and `runs/sixth` at −133 would predict +197 against gen031, not +167.
+Elo is not transitive across a game that is not, and each row carries ±35–40 Elo of its own —
+they are compatible, but a chained estimate is not a measurement.
+
+**What the shape of the run says.** The panel row against `gen031@64`, by generation:
+
+```
+0.52 0.65 0.58 0.71 0.76 0.78 0.74 0.77 0.70 0.77 │ 0.83 0.81 0.84 0.80 0.83 0.84 0.77 0.85 0.83 0.81
+                                       lr drop ──┘
+```
+
+It plateaued at ~0.77 from generation 5 and broke out to ~0.83 exactly when `lr_schedule`
+dropped the rate to 5e-4 at generation 10 — the clearest evidence in this project so far that
+the schedule earns its keep, and a vindication of keying tiers to the generations a run will
+*finish* (`PLAN.md` §4.2 change 5). Held-out value MSE sat at 0.54–0.58 throughout while
+policy loss fell 2.098 → 1.818: it learned steadily without overfitting. Gate scores drifting
+to ~0.50 over the last five generations is convergence at this data scale, not a fault — three
+of the last five were refused and the incumbent held.
+
+⚠️ **`reference_tolerance = 0.10` saved this run, and 0.05 would have damaged it.** At
+generation 9 a candidate that won its 294-game gate **0.605** posted a 0.700 panel row against
+a 0.780 high-water mark. At `train-3h-new`'s inherited 0.05 the veto floor was 0.730 and that
+candidate would have been refused outright. `configs/train-12h.toml` predicted this from
+simulation; it happened for real, once, in twenty generations.
+
+**Sizing.** 4,000 games a generation rather than `train-3h-new`'s 1,400, because batched
+self-play (F4.7) made the old ratio wrong: at 1,400 the gate would have been the majority of
+the clock. At 4,000 self-play is ~55% and the run got 80,000 games where `runs/sixth` got
+18,200.
+
 ### F4.7: self-play is 94% neural network, and 3.26x of it was free
 
 Measured 2026-09-09 on the 8-core M2 laptop (Mac14,7, 4 performance + 4 efficiency cores),
@@ -350,12 +400,22 @@ opt in while every other agent decides inline. A match caps the gain in a way se
 not: its two agents hold two different checkpoints, so each round's suspended games are grouped
 by the network they wait on, and a gate reaches about half self-play's batch.
 
-⚠️ **The gate's end-to-end speed-up is not recorded here because I did not measure it
-cleanly.** Two attempts were contaminated by test suites running on the same eight cores, and
-a third found the `batch_slots` bug below. The unbatched reference is solid — 300 games, two
-lane nets at 256 sims, 8 threads, **381.5 s** — and the identity is asserted by test rather
-than by benchmark, so nothing downstream depends on the missing number. It is worth taking
-properly on an idle machine before it is quoted anywhere.
+⚠️ **Measured properly on an idle machine, batching the gate is a *regression*.** 300 games,
+two lane nets at 256 simulations, 8 threads: **373.5 s unbatched against 401.2 s at
+`--eval-batch 64`, 7% slower**, for bit-identical scores (0.5333, W158 L138 D4). The
+mechanism is the two-checkpoint split — a gate reaches only half self-play's batch, and at
+~18 rows per evaluator the trunk saving no longer covers interleaving ~37 live search trees
+per worker and staging their observations into contiguous rows. Self-play at the same setting
+is 3.26x faster, so the knob is worth having; it is simply not worth applying everywhere.
+
+`TrainingLoop.selfplay` therefore passes `--eval-batch` to self-play alone. `runs/seventh` ran
+before this was known and paid the 7% on every gate and panel — it still finished 20
+generations, so the cost was real but small against self-play's gain.
+
+The lesson generalises past this knob: **an optimisation that is a large win on one workload
+can be a small loss on a neighbouring one, and "same machinery, same direction" is not
+evidence.** I asserted a ~2x gate speed-up in a commit message on exactly that reasoning
+before measuring it.
 
 **Two bugs, both found by measuring rather than by reasoning, and both worth remembering.**
 

@@ -333,8 +333,9 @@ Cost, on the 8-core laptop at 512 games, lane 128x3, 256 sims with capping:
 cores silently gets a smaller one — `train check` prints the effective number. It costs about
 400 KB of live search tree per game in flight.
 
-**The gate has it too**, added straight after and the reason `run_match` grew an `eval_batch`
-argument. `probe::MatchGame` is the same state machine `GameRunner` is, and
+**The gate can use it and does not**, which is the measured answer rather than the assumed one:
+batching a match is a 7% regression (`FINDINGS.md` F4.8), because its two checkpoints halve the
+batch. The machinery went in anyway and `run_match` grew an `eval_batch` argument, `probe::MatchGame` is the same state machine `GameRunner` is, and
 `Agent::begin_decision` is how a `Box<dyn Agent>` opts into being suspendable — every agent
 but `netmcts` returns `None` and decides inline exactly as before.
 

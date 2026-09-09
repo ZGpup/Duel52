@@ -382,10 +382,6 @@ class TrainingLoop:
         out = [str(self.engine), *args, *self.config.game.cli_flags()]
         if self.config.run.threads:
             out += ["--threads", str(self.config.run.threads)]
-        if self.config.run.eval_batch > 1:
-            # Shared by self-play and by every `match` the gate and panel run — the engine
-            # takes it as a global option for exactly that reason.
-            out += ["--eval-batch", str(self.config.run.eval_batch)]
         return out
 
     def selfplay(self, generation: int) -> tuple[Path, dict]:
@@ -400,6 +396,15 @@ class TrainingLoop:
             "--generation", str(generation),
             *self.config.selfplay.cli_flags(),
         )
+        if self.config.run.eval_batch > 1:
+            # ⚠️ **Self-play only, and that is a measurement rather than an oversight.**
+            # Batching a *match* is a regression: measured on the 8-core laptop over a
+            # 300-game gate between two lane nets at 256 sims, `--eval-batch 64` took
+            # 401.2 s against 373.5 s unbatched — 7% slower, for identical scores. A gate
+            # splits its in-flight games between two checkpoints, so it reaches only half
+            # self-play's batch, and at that width the trunk saving no longer covers
+            # interleaving 37 live search trees per worker. `FINDINGS.md` F4.8.
+            args += ["--eval-batch", str(self.config.run.eval_batch)]
         started = time.perf_counter()
         # Progress goes to the engine's stderr and straight through to ours, so the user
         # watching the run sees games/sec and an ETA while it happens.

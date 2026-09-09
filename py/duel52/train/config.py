@@ -369,19 +369,24 @@ class RunSettings:
     #: 0 means every core.
     threads: int = 0
     #: **Batched evaluation** (`PLAN.md` §4.2d). Games kept in flight per worker thread so
-    #: their network evaluations go through the lane trunk together. It sits here rather than
-    #: under ``[selfplay]`` because it applies to the gate and the reference panel too, and
-    #: because it is a machine knob like ``threads`` rather than anything about the game.
+    #: their network evaluations go through the lane trunk together. A machine knob like
+    #: ``threads``, which is why it lives here rather than under ``[selfplay]``.
     #:
     #: The batch is taken across games and never inside a search, so this changes only how
     #: fast a generation runs — ``phase4_a_shard_does_not_depend_on_the_evaluation_batch``
     #: and ``rule_2_the_ladder_is_eval_batch_independent`` assert the shard bytes and the
     #: gate score do not move. ``1`` is off, which is what every run before this one used.
     #:
-    #: ⚠️ **Clamped by the games each worker gets.** Self-play gets ``selfplay.games /
-    #: threads``; the gate gets ``gate.games / threads`` and then splits it between the two
-    #: checkpoints, so a gate reaches roughly half the batch self-play does. ``train check``
-    #: prints both effective numbers.
+    #: ⚠️ **Applied to self-play only, because batching a match is a regression.** Measured
+    #: on the 8-core laptop, a 300-game gate between two lane nets at 256 sims took 401.2 s
+    #: at ``--eval-batch 64`` against 373.5 s unbatched — 7% *slower*, for bit-identical
+    #: scores. A gate splits its in-flight games between two checkpoints so it reaches half
+    #: self-play's batch, and at that width the trunk saving stops covering the cost of
+    #: interleaving ~37 live search trees per worker. ``FINDINGS.md`` F4.8. Self-play at the
+    #: same setting is 3.26x faster, so the knob is worth having — just not everywhere.
+    #:
+    #: ⚠️ **Clamped by the games each worker gets**, ``selfplay.games / threads``.
+    #: ``train check`` prints the effective number.
     eval_batch: int = 1
     engine: str = "./target/release/duel52"
 

@@ -308,12 +308,13 @@ therefore byte-identical whatever N is, which
 because a tolerance would pass exactly the reassociation the determinism contract forbids.
 3.26x at 64 on the laptop; `configs/train-3h-new.toml` sets it.
 
-**The gate and panel have it too**, through the same machinery: `probe::MatchGame` is the
-state machine `selfplay::GameRunner` is, and `Agent::begin_decision` is how a `Box<dyn Agent>`
-opts in — every agent but `netmcts` returns `None` and decides inline. A match differs in one
-way that caps the gain: **its two agents hold two different checkpoints**, so each round's
-suspended games are grouped by the network they are waiting on and evaluated separately,
-leaving a gate about half the batch self-play gets.
+**The gate and panel *can* use it and should not.** The machinery is there — `probe::MatchGame`
+is the state machine `selfplay::GameRunner` is, and `Agent::begin_decision` is how a
+`Box<dyn Agent>` opts in — but a match holds **two different checkpoints**, so each round's
+games are grouped by the network they wait on and a gate reaches half self-play's batch. At
+that width it is a **7% regression**: 300 games, two lane nets at 256 sims, 373.5 s unbatched
+against 401.2 s at `--eval-batch 64`, bit-identical scores (`FINDINGS.md` F4.8). The training
+loop passes the flag to `selfplay` only. Keep it that way unless a measurement says otherwise.
 
 Three things to keep straight. **The batch is clamped by the games a worker owns** —
 `selfplay.games / threads` for self-play, `gate.games / threads` for the gate; 1400 over 8 is
