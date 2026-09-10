@@ -380,8 +380,50 @@ impl Weights {
         }
         let _ = writeln!(s, "obs_layout_hash={:016x}", obs_layout_hash(config));
         let _ = writeln!(s, "action_layout_hash={:016x}", action_layout_hash(config));
+        // Which *game* this network was trained on (`MODULAR_RULES.md` §6). Optional on
+        // read, like `arch`, so the four shipped checkpoints keep loading.
+        //
+        // ⚠️ **Deliberately not checked by `Weights::load`**, unlike the two layout hashes
+        // directly above it. A mismatch here is not always an error: generation 1 of every
+        // warm-started run is a net trained under ruleset A playing under ruleset B, and
+        // that is the mechanism that makes a rules experiment cost three hours instead of
+        // twenty-four. Refusing it in the loader would make `--init-from` useless across
+        // rulesets and would take the affordability argument with it.
+        //
+        // The hard error lives where a cross-ruleset number would be *read as a result*:
+        // `Shard::read` (a corrupted replay buffer, with no human present) and the three
+        // measurement commands in `bin/duel52.rs`. The training loop prints and continues.
+        let _ = writeln!(s, "rules_name={}", config.rules_name);
+        let _ = writeln!(s, "rules_hash={:016x}", config.rules_hash());
         let _ = writeln!(s, "param_order={}", names.join(","));
         s
+    }
+
+    /// The ruleset a checkpoint says it was trained on, if it says.
+    ///
+    /// `None` for a checkpoint written before the field existed, which can only mean the
+    /// canonical rules — nothing else could be expressed then.
+    pub fn stamped_rules(path: &Path) -> Result<Option<(String, u64)>, String> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(|e| format!("cannot read checkpoint `{}`: {e}", path.display()))?;
+        let header = Weights::header_of(&bytes).map_err(|e| format!("`{}`: {e}", path.display()))?;
+        let get = |key: &str| -> Option<String> {
+            header
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        };
+        match (get("rules_name"), get("rules_hash")) {
+            (Some(name), Some(hash)) => {
+                let h = u64::from_str_radix(&hash, 16)
+                    .map_err(|_| format!("`{}`: rules_hash `{hash}` is not hex", path.display()))?;
+                Ok(Some((name, h)))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub fn to_bytes(&self, config: &GameConfig) -> Vec<u8> {
@@ -397,6 +439,24 @@ impl Weights {
             }
         }
         out
+    }
+
+    /// The header text of a checkpoint, without parsing the payload. Used by anything that
+    /// wants a stamped field — the ruleset, say — without paying for the weights.
+    pub fn header_of(bytes: &[u8]) -> Result<&str, String> {
+        if bytes.len() < 12 {
+            return Err("truncated: not even a header".into());
+        }
+        if &bytes[..6] != CHECKPOINT_MAGIC {
+            return Err("not a .d52nn checkpoint (bad magic)".into());
+        }
+        let header_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let header_end = 12 + header_len;
+        if bytes.len() < header_end {
+            return Err("truncated: the header is shorter than it claims".into());
+        }
+        std::str::from_utf8(&bytes[12..header_end])
+            .map_err(|_| "the header is not valid UTF-8".to_string())
     }
 
     pub fn from_bytes(bytes: &[u8], config: &GameConfig) -> Result<Weights, String> {

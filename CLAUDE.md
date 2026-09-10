@@ -14,6 +14,8 @@ the instrument.
 | `FINDINGS.md` | Strategy insights as they emerge. This is the actual output of the project. |
 | `README.md` | The public front door, and where `duel52 replay` is documented. |
 | `RENTING.md` | How to rent a box and run `PLAN.md` item 7 on it, written for someone who has never rented one. Provider choice, the two ways to lose the run, and the Stage 1 measurements. |
+| `MODULAR_RULES.md` | **The rules-mod system.** Where rules live, the three tiers a change falls into, and what each costs. Read §2 before pricing any rule change and §6 before trusting any number. |
+| `configs/rules/README.md` | The ruleset registry. How to add one, and the four things to run before it earns a training run. |
 | `CLAUDE.md` | This file. Commands, architecture, and the traps. |
 | `archive/` | The superseded working docs, frozen 2026-09-05 and not maintained. |
 
@@ -57,7 +59,9 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 - **Everything is seeded and deterministic.** Same seed + same config → identical game.
   Non-reproducible results are bugs.
 - **Config-driven, no hardcoded constants.** Variant selection, deck composition, removal
-  count, draw rules, and stalemate threshold all live in config.
+  count, draw rules, stalemate threshold, **every card's power and every combat number** all
+  live in config. No production code names a rank to decide what it does — it reads
+  `config.power(rank)` and asks the `PowerId`. See "Rules mods" below.
 - **Device-agnostic.** Code must run on MPS locally and CUDA on a rented box with no edits
   beyond a config value. That is the handoff path — but note what it hands off: **the gradient
   step is 2–4% of the loop** and is only 1.4× faster on a GPU than on eight CPU cores
@@ -85,9 +89,10 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 354 tests: rules, determinism, information hiding,
-                                         # the Phase 3 encoding path, the lane symmetry, and
-                                         # the training corpus
+cargo test                               # 388 tests: rules, determinism, information hiding,
+                                         # the Phase 3 encoding path, the lane symmetry, the
+                                         # training corpus, the modded power variants, and
+                                         # the cross-ruleset invariant suite
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
@@ -128,6 +133,41 @@ cargo test                               # 354 tests: rules, determinism, inform
 # Measure. `demo --seed N` replays exactly the game `stats` counted for seed N.
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
 ./target/release/duel52 config configs/split.toml          # validate a config file
+
+# Rules mods (MODULAR_RULES.md). A ruleset is a file in configs/rules/ and nothing else —
+# that directory IS the registry, and engine/tests/rulesets.rs enumerates it, so a new file
+# is covered by every structural invariant the moment it exists.
+./target/release/duel52 config configs/rules/three-vengeance-1.toml   # resolve + rules_hash
+cargo test --test rulesets                                 # 11 invariants x every ruleset
+cargo test --test rules_mods                               # the named tests for each variant
+
+# Screen before you spend a training run. `ismcts` and `greedy` need no checkpoint, so they
+# play any ruleset the day the file is written. Minutes, not hours.
+./target/release/duel52 screen --games 400 --seed 1 --agents greedy,random       # fast pass
+./target/release/duel52 screen --games 200 --seed 1                              # ismcts:800
+# It tells you a ruleset is BROKEN, never that it is good. A ply-cap draw is a hard failure:
+# game_rules.md §7's finiteness proof depends on specific rules, so breaking it is a bug
+# report, not a result.
+
+# PLAN.md §4's card value table — what each card is worth, in win-probability points.
+./target/release/duel52 card-value --encoding-slots 21 --games 400 \
+    --checkpoint models/duel52-split-lane-gen032.d52nn
+# It varies the rank of a card **in hand**, not one face-up in a lane. That is the whole
+# design: face-up measures a constant power at full value, a one-shot as already SPENT, and
+# the 3 with its Trap structurally disabled — so the first version ranked power *kind* and
+# put 8/J/10/9 on top, which is exactly `is_constant()`. Read `in hand`; `on board` is the
+# contrast, and `gap` says whether a card's value is in the flip or in the body.
+# ⚠️ Read the CONTROL line first. Each rank is also substituted into the OPPONENT'S hand,
+# which the observer cannot see, so the thirteen tensors are identical and the spread must be
+# 0.00000. If it is not, the method is broken and the table is noise.
+# ⚠️ `mirrored` cannot be measured this way (§9b publishes the removed multiset, so almost no
+# rank has an unseen copy left). The tool detects the thin sample and refuses to print.
+
+# A rules experiment is a 3-hour warm start, not a 24-hour run, because the encoder is
+# rank-agnostic and no ruleset moves a layout hash.
+.venv/bin/python -m duel52.train check --config configs/train-mod-3h.toml
+.venv/bin/python -m duel52.train run --config configs/train-mod-3h.toml \
+    --run-dir runs/mod-three-vengeance --init-from models/duel52-split-lane-gen032.d52nn
 
 # Rating agents. Budgets are part of the agent name, so a result row names the agent that
 # produced it: random · greedy · flatmc:600 · pimc:32x1 · ismcts:800.
@@ -486,7 +526,10 @@ where lanes and cards are numbered from 1.
 | Path | What |
 |---|---|
 | `engine/src/state.rs` | `GameState` and the queries the rules are written in terms of |
-| `engine/src/apply.rs` | Powers, combat, turn machinery. The rules live here. |
+| `engine/src/apply.rs` | Combat and turn machinery. **Card powers no longer live here** — it dispatches to `powers/` |
+| `engine/src/powers/` | One module per rank. Changing what the 3 does touches `three.rs` and nothing else. `mod.rs` holds `PowerId`, the hooks and the dispatch |
+| `engine/src/damage.rs` | `DamageSource` and the damage queue. Why damage is a FIFO and not recursion, and what keeps a death-trigger cascade finite |
+| `engine/src/cardvalue.rs` | `PLAN.md` §4's card value table, and the null control that makes it readable |
 | `engine/src/legal.rs` | Legal-action enumeration |
 | `engine/src/config.rs` | Every tunable; the three variant presets |
 | `engine/src/testkit.rs` | Building positions by hand, for tests and Phase 5 probes |
@@ -529,6 +572,22 @@ Three structural points that are easy to undo by accident:
   ordering.
 - **Cards are tracked by `CardId`, never by slot.** Slots compact on death and shift when a
   Queen moves a card, so anything remembered across a resolution step holds ids.
+
+- **Nothing outside `powers/` may branch on a `Rank` to decide behaviour.** Read
+  `card.live_power(&config)` and ask the `PowerId` — `taunts()`, `is_nimble()`,
+  `retaliate_mode()`. `live_power` returns `None` for a face-down card, which is `game_rules.md`
+  §6's "powers are inert while face-down" made structural rather than remembered. A
+  `rank == Rank::EIGHT` in `state.rs` or `apply.rs` is a bug: it silently ignores the ruleset.
+
+- **`rules_hash` is not `obs_layout_hash`, and the difference is the point.** The encoder is
+  rank-agnostic, so **no ruleset moves a layout hash** — that is what lets `--init-from`
+  warm-start a rules experiment from the current champion and turns 24 hours into 3
+  (`engine/tests/rulesets.rs::no_ruleset_moves_the_encoder_layout` asserts it). It also means
+  a shard or checkpoint from another ruleset is *indistinguishable on shape alone*, which is
+  why `rules_hash` exists. It is checked where a cross-ruleset number would be read as a
+  result — `Shard::read`, `ladder`, `match`, `probe`, `card-value`, and the Python replay
+  buffer — and deliberately **not** in `Weights::load`, because generation 1 of every
+  warm-started run is legitimately cross-ruleset. `MODULAR_RULES.md` §6.
 
 - **There is exactly one encoder, and it is in Rust.** `engine/src/encode.rs` owns the
   feature layout; Python reaches it through `Game.encode_observation()` and gets its

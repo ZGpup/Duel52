@@ -537,7 +537,7 @@ impl PyGame {
                     // face-down card is a blank 2-HP card whatever its rank — so a Jack
                     // cannot be identified by watching it survive.
                     c.set_item("damage", card.damage)?;
-                    c.set_item("max_hp", card.max_hp())?;
+                    c.set_item("max_hp", card.max_hp(&s.config))?;
                     c.set_item("frozen", card.is_frozen(s.ply))?;
                     c.set_item("attacks_used", card.attacks_used)?;
                     c.set_item("attack_allowance", card.attack_allowance)?;
@@ -798,16 +798,27 @@ fn ladder_agents() -> Vec<String> {
 /// The layout is identical across the three variants (same lanes, same rank count, same
 /// `encoding_slots`), so one checkpoint plays all three; `variant` is accepted anyway
 /// because Duel52-mini (`DESIGN.md` §7) will not share it.
+/// `rules_file` names a `configs/rules/*.toml` and takes the place of `variant`, exactly as
+/// `--config` does on the CLI: the file's own `variant` key decides the deck. Passing both is
+/// an error rather than a precedence rule, for the same reason the CLI refuses it — it is
+/// never clear which should win.
 #[pyfunction]
-#[pyo3(signature = (variant="split", encoding_slots=None))]
+#[pyo3(signature = (variant="split", encoding_slots=None, rules_file=None))]
 fn encoding_spec<'py>(
     py: Python<'py>,
     variant: &str,
     encoding_slots: Option<usize>,
+    rules_file: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let v = Variant::parse(variant)
-        .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
-    let mut config = GameConfig::preset(v);
+    let mut config = match rules_file {
+        Some(path) => GameConfig::from_config_file(std::path::Path::new(path))
+            .map_err(PyValueError::new_err)?,
+        None => {
+            let v = Variant::parse(variant)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
+            GameConfig::preset(v)
+        }
+    };
     if let Some(n) = encoding_slots {
         config.encoding_slots = n;
     }
@@ -830,6 +841,12 @@ fn encoding_spec<'py>(
         "action_layout_hash",
         format!("{:016x}", encode::action_layout_hash(&config)),
     )?;
+    // Which *game* these rules describe (`MODULAR_RULES.md` §6). Independent of the two
+    // layout hashes above, and that independence is the point: a rules mod leaves the
+    // layout untouched, so this is the only thing that can tell two rulesets apart.
+    d.set_item("rules_name", config.rules_name.to_string())?;
+    d.set_item("rules_hash", format!("{:016x}", config.rules_hash()))?;
+    d.set_item("rules_string", config.rules_string())?;
     // The full descriptions, for a diff when the hashes disagree and you need to know
     // *which* feature moved.
     d.set_item("obs_layout", encode::obs_layout_string(&config))?;
@@ -1043,6 +1060,10 @@ fn replay_shard<'py>(
         "action_layout_hash",
         format!("{:016x}", encode::action_layout_hash(&shard.config)),
     )?;
+    // Recomputed from the shard's own embedded config rather than read off its header, so a
+    // shard written before the field existed still reports the ruleset it was played under.
+    d.set_item("rules_name", shard.config.rules_name.to_string())?;
+    d.set_item("rules_hash", format!("{:016x}", shard.config.rules_hash()))?;
     Ok(d)
 }
 

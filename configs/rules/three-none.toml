@@ -1,0 +1,14 @@
+# Ablation: the 3 has no power.
+#
+# The control for both vengeance rulesets, and a balance question in its own right — the
+# flip-timing curve in `FINDINGS.md` says *when* a power starts paying, never *what it is
+# worth*, and an ablation is the crudest way to ask the second question without a card value
+# table (`MODULAR_RULES.md` §10).
+#
+# A 3 here is a plain 2-HP body that dies when killed. If the agent's win rate barely moves,
+# the Trap was worth less than the flip-timing curve suggests.
+
+include = "canonical.toml"
+
+rules_name = "three-none"
+powers.three = "none"

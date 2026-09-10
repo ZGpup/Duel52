@@ -91,21 +91,28 @@ pub struct GameStats {
     pub stuck_turns: [u32; 2],
     pub pairs_declared: [u32; 2],
 
-    /// Face-down 3s that were killed and sprang their Trap (§6), by player.
+    /// Face-down cards that were killed and survived it — a death trigger firing — by
+    /// player and rank.
     ///
-    /// The 3 is the one rank whose power is conditioned on staying hidden, so the flip rate
-    /// alone cannot say whether holding it paid: a 3 held to the end of the game and a 3
-    /// held until it sprang look identical in `flips_by_rank`. This counts the payoff.
-    pub traps_sprung: [u32; 2],
-    /// 3s turned face-up by a **5's cascade** rather than by their owner choosing to,
-    /// by player.
+    /// Canonically this is only the 3, the one rank whose power is conditioned on staying
+    /// hidden: the flip rate alone cannot say whether holding it paid, because a 3 held to
+    /// the end of the game and a 3 held until it sprang look identical in `flips_by_rank`.
+    /// This counts the payoff.
+    ///
+    /// Keyed by **rank** rather than hardcoded to the 3 (`MODULAR_RULES.md` §11 step 7): a
+    /// card module that owns its rules should own its measurement too, so that a new death
+    /// trigger arrives instrumented rather than invisible to the probe.
+    pub triggers_sprung_by_rank: [[u32; Rank::COUNT]; 2],
+    /// Cards turned face-up by a **cascade** — a 5 or a King — rather than by their owner
+    /// choosing to, by player and rank.
     ///
     /// Split out because `flips_by_rank` counts only [`Action::Flip`]; a 5 flips the lane
     /// from inside `apply`, so those never reach [`GameStats::note_action`]. Without this
-    /// the four outcomes of a played 3 do not sum.
-    pub threes_flipped_by_five: [u32; 2],
-    /// 3s still face-down on the board when the game ended, by player. Includes base 3s.
-    pub threes_face_down_at_end: [u32; 2],
+    /// the four outcomes of a played card do not sum.
+    pub flipped_by_cascade_by_rank: [[u32; Rank::COUNT]; 2],
+    /// Cards still face-down on the board when the game ended, by player and rank. Includes
+    /// base cards.
+    pub face_down_at_end_by_rank: [[u32; Rank::COUNT]; 2],
 }
 
 impl GameStats {
@@ -129,33 +136,37 @@ impl GameStats {
             unflipped_at_end: [0, 0],
             stuck_turns: [0, 0],
             pairs_declared: [0, 0],
-            traps_sprung: [0, 0],
-            threes_flipped_by_five: [0, 0],
-            threes_face_down_at_end: [0, 0],
+            triggers_sprung_by_rank: [[0; Rank::COUNT]; 2],
+            flipped_by_cascade_by_rank: [[0; Rank::COUNT]; 2],
+            face_down_at_end_by_rank: [[0; Rank::COUNT]; 2],
         }
     }
 
-    /// Every face-down 3 in play, as `(id, owner)`. Snapshotted before an `apply` so the
-    /// transitions that `apply` causes can be read off afterwards.
-    fn face_down_threes(state: &GameState) -> Vec<(CardId, Player)> {
+    /// Every face-down card with a **death trigger** in play, as `(id, owner, rank)`.
+    ///
+    /// Snapshotted before an `apply` so the transitions that `apply` causes can be read off
+    /// afterwards. Selected by [`PowerId::has_death_trigger`] rather than by rank, so a new
+    /// "on death, do X" power is measured from the day it exists — and so a ruleset that
+    /// ablates the 3 correctly measures nothing rather than measuring zero.
+    fn face_down_trigger_cards(state: &GameState) -> Vec<(CardId, Player, Rank)> {
         let mut out = Vec::new();
         for p in Player::BOTH {
             for (_, _, card) in state.cards_of(p) {
-                if card.rank == Rank::THREE && !card.face_up {
-                    out.push((card.id, p));
+                if !card.face_up && card.power(&state.config).has_death_trigger() {
+                    out.push((card.id, p, card.rank));
                 }
             }
         }
         out
     }
 
-    /// Classify every face-down 3 that turned face-up during one `apply`.
+    /// Classify every face-down trigger card that turned face-up during one `apply`.
     ///
     /// A face-down 3 never dies — it springs (§6) — so a snapshotted id is always still in
     /// play afterwards, either still face-down or face-up. Three ways it can have turned
     /// face-up, and the acting player separates them:
     ///
-    /// 1. **Its owner was not acting.** Then it was killed, and the Trap sprang. Nothing
+    /// 1. **Its owner was not acting.** Then it was killed, and the trigger fired. Nothing
     ///    else can turn an opponent's card face-up: the 4 only *looks*, privately, and the
     ///    5 flips its own side. And the owner cannot have sprung their own 3 on their own
     ///    turn, because damage only ever originates from an attack — including the 8's
@@ -163,14 +174,19 @@ impl GameStats {
     /// 2. **Its owner was acting and chose it.** An ordinary flip, already counted in
     ///    [`GameStats::note_action`].
     /// 3. **Its owner was acting and did not choose it.** A 5's cascade flipped the lane.
-    fn note_three_transitions(
+    ///
+    /// ⚠️ Case 1's reasoning is a property of the **canonical** ruleset, not of the engine.
+    /// A variant that let a player damage their own cards would misfile a self-inflicted
+    /// spring as a cascade flip. Nothing here can detect that; it is noted so the next
+    /// person to add such a power knows this counter is one of the things it breaks.
+    fn note_trigger_transitions(
         &mut self,
-        before: &[(CardId, Player)],
+        before: &[(CardId, Player, Rank)],
         acting: Player,
         action: Action,
         state: &GameState,
     ) {
-        for &(id, owner) in before {
+        for &(id, owner, rank) in before {
             let still_down = state
                 .cards_of(owner)
                 .any(|(_, _, card)| card.id == id && !card.face_up);
@@ -178,9 +194,9 @@ impl GameStats {
                 continue;
             }
             if owner != acting {
-                self.traps_sprung[owner.idx()] += 1;
+                self.triggers_sprung_by_rank[owner.idx()][rank.index()] += 1;
             } else if !matches!(action, Action::Flip { .. }) {
-                self.threes_flipped_by_five[owner.idx()] += 1;
+                self.flipped_by_cascade_by_rank[owner.idx()][rank.index()] += 1;
             }
         }
     }
@@ -267,10 +283,9 @@ impl GameStats {
                 .cards_of(p)
                 .filter(|(_, _, card)| !card.face_up)
                 .count() as u32;
-            self.threes_face_down_at_end[p.idx()] = state
-                .cards_of(p)
-                .filter(|(_, _, card)| !card.face_up && card.rank == Rank::THREE)
-                .count() as u32;
+            for (_, _, card) in state.cards_of(p).filter(|(_, _, c)| !c.face_up) {
+                self.face_down_at_end_by_rank[p.idx()][card.rank.index()] += 1;
+            }
         }
     }
 
@@ -399,7 +414,7 @@ impl MatchGame {
         let allowance_before = self.state.actions_remaining;
         let costs = action.costs_an_action();
 
-        let threes_before = GameStats::face_down_threes(&self.state);
+        let triggers_before = GameStats::face_down_trigger_cards(&self.state);
 
         self.stats.note_action(&self.state, action);
         self.state.apply_trusted(action);
@@ -408,7 +423,7 @@ impl MatchGame {
         self.stats
             .note_turn_ends(acting, ply_before, allowance_before, costs, &self.state);
         self.stats
-            .note_three_transitions(&threes_before, acting, action, &self.state);
+            .note_trigger_transitions(&triggers_before, acting, action, &self.state);
     }
 }
 
@@ -502,10 +517,11 @@ pub struct AgentBehaviour {
     pub flip_ply_sum: [u64; Rank::COUNT],
     pub lane_concentration: Vec<f64>,
     pub attack_concentration: Vec<f64>,
-    /// The fate of the 3, the one rank whose power needs darkness. See [`GameStats`].
-    pub traps_sprung: u64,
-    pub threes_flipped_by_five: u64,
-    pub threes_face_down_at_end: u64,
+    /// The fate of every card with a death trigger — canonically just the 3, the one rank
+    /// whose power needs darkness. See [`GameStats`].
+    pub triggers_sprung_by_rank: [u64; Rank::COUNT],
+    pub flipped_by_cascade_by_rank: [u64; Rank::COUNT],
+    pub face_down_at_end_by_rank: [u64; Rank::COUNT],
 }
 
 impl AgentBehaviour {
@@ -530,14 +546,14 @@ impl AgentBehaviour {
         self.stuck_turns += stats.stuck_turns[i] as u64;
         self.pairs += stats.pairs_declared[i] as u64;
         self.unflipped_at_end += stats.unflipped_at_end[i] as u64;
-        self.traps_sprung += stats.traps_sprung[i] as u64;
-        self.threes_flipped_by_five += stats.threes_flipped_by_five[i] as u64;
-        self.threes_face_down_at_end += stats.threes_face_down_at_end[i] as u64;
         for r in 0..Rank::COUNT {
             self.plays_by_rank[r] += stats.plays_by_rank[i][r] as u64;
             self.flips_by_rank[r] += stats.flips_by_rank[i][r] as u64;
             self.base_flips_by_rank[r] += stats.base_flips_by_rank[i][r] as u64;
             self.flip_ply_sum[r] += stats.flip_ply_sum[i][r];
+            self.triggers_sprung_by_rank[r] += stats.triggers_sprung_by_rank[i][r] as u64;
+            self.flipped_by_cascade_by_rank[r] += stats.flipped_by_cascade_by_rank[i][r] as u64;
+            self.face_down_at_end_by_rank[r] += stats.face_down_at_end_by_rank[i][r] as u64;
         }
         if let Some(v) = stats.lane_concentration(p, lanes_to_win) {
             self.lane_concentration.push(v);
@@ -562,14 +578,14 @@ impl AgentBehaviour {
         self.stuck_turns += other.stuck_turns;
         self.pairs += other.pairs;
         self.unflipped_at_end += other.unflipped_at_end;
-        self.traps_sprung += other.traps_sprung;
-        self.threes_flipped_by_five += other.threes_flipped_by_five;
-        self.threes_face_down_at_end += other.threes_face_down_at_end;
         for r in 0..Rank::COUNT {
             self.plays_by_rank[r] += other.plays_by_rank[r];
             self.flips_by_rank[r] += other.flips_by_rank[r];
             self.base_flips_by_rank[r] += other.base_flips_by_rank[r];
             self.flip_ply_sum[r] += other.flip_ply_sum[r];
+            self.triggers_sprung_by_rank[r] += other.triggers_sprung_by_rank[r];
+            self.flipped_by_cascade_by_rank[r] += other.flipped_by_cascade_by_rank[r];
+            self.face_down_at_end_by_rank[r] += other.face_down_at_end_by_rank[r];
         }
         self.lane_concentration
             .extend_from_slice(&other.lane_concentration);
@@ -664,7 +680,18 @@ impl AgentBehaviour {
     /// so it is the one term that can push the sum past 1. At the default config each
     /// player has two 3s and three base cards, so this is a small and infrequent bias.
     pub fn three_fates(&self) -> Option<(f64, f64, f64, f64)> {
-        let r = Rank::THREE.index();
+        self.card_fates(Rank::THREE)
+    }
+
+    /// The four fates of one played rank: flipped by choice, flipped by a cascade, sprang a
+    /// death trigger, still face-down at the end.
+    ///
+    /// Generalised from `three_fates` (`MODULAR_RULES.md` §11 step 7) so a new death-trigger
+    /// power is measurable the day it exists. For a rank with no death trigger the third
+    /// term is always zero, which is correct rather than missing — it says the card never
+    /// came back.
+    pub fn card_fates(&self, rank: Rank) -> Option<(f64, f64, f64, f64)> {
+        let r = rank.index();
         let played = self.plays_by_rank[r];
         if played == 0 {
             return None;
@@ -673,27 +700,51 @@ impl AgentBehaviour {
         let voluntary = self.flips_by_rank[r].saturating_sub(self.base_flips_by_rank[r]);
         Some((
             voluntary as f64 / n,
-            self.threes_flipped_by_five as f64 / n,
-            self.traps_sprung as f64 / n,
-            self.threes_face_down_at_end as f64 / n,
+            self.flipped_by_cascade_by_rank[r] as f64 / n,
+            self.triggers_sprung_by_rank[r] as f64 / n,
+            self.face_down_at_end_by_rank[r] as f64 / n,
         ))
     }
 
     /// Threes played from hand per game — the denominator `three_fates` divides by.
     pub fn threes_played_per_game(&self) -> f64 {
+        self.played_per_game(Rank::THREE)
+    }
+
+    /// Cards of one rank played from hand per game.
+    pub fn played_per_game(&self, rank: Rank) -> f64 {
         if self.games == 0 {
             return f64::NAN;
         }
-        self.plays_by_rank[Rank::THREE.index()] as f64 / self.games as f64
+        self.plays_by_rank[rank.index()] as f64 / self.games as f64
     }
 
     /// Traps sprung per game. The absolute frequency behind `three_fates`, because a rate
     /// out of a rarely played card can look large while describing almost nothing.
     pub fn traps_per_game(&self) -> f64 {
+        self.triggers_per_game(Rank::THREE)
+    }
+
+    /// Death triggers of one rank fired per game.
+    pub fn triggers_per_game(&self, rank: Rank) -> f64 {
         if self.games == 0 {
             return f64::NAN;
         }
-        self.traps_sprung as f64 / self.games as f64
+        self.triggers_sprung_by_rank[rank.index()] as f64 / self.games as f64
+    }
+
+    /// Every rank whose power has a death trigger under `config`, with its fates. The
+    /// per-card instrumentation a modded ruleset needs, in one call.
+    pub fn death_trigger_fates(
+        &self,
+        config: &GameConfig,
+    ) -> Vec<(Rank, (f64, f64, f64, f64))> {
+        Rank::ALL
+            .into_iter()
+            .filter(|r| r.index() <= config.max_rank_index)
+            .filter(|r| config.power(*r).has_death_trigger())
+            .filter_map(|r| self.card_fates(r).map(|f| (r, f)))
+            .collect()
     }
 
     /// Mean ply at which this agent turns a given rank face-up. `None` if it never did.

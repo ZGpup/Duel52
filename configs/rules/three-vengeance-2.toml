@@ -1,0 +1,21 @@
+# The 3 hits back, hard.
+#
+# The same shape as `three-vengeance-1.toml` at twice the damage — and it is a **separate
+# named power**, not `three-vengeance-1` plus a `three_vengeance_damage = 2` key.
+#
+# That is `MODULAR_RULES.md` §5a's decision, and the reason is worth restating here because
+# this file is where it is easiest to see. A `three_vengeance_damage` key would parse
+# perfectly well in a config where `powers.three = "trap"`, contribute to `rules_hash`, and
+# do nothing at all — and `from_config_str` could not reject it, because rejecting unknown
+# keys is not the same as rejecting inapplicable ones. Two names cannot express that state.
+#
+# The cost is that orthogonal knobs multiply. The rule of thumb: if you ever want a genuine
+# cross product, promote one axis to a Tier-1 numeric field instead of enumerating.
+#
+# 2 damage kills a 2-HP attacker outright, so this is a much sharper rule than it looks:
+# a lone card that kills a face-down 3 now trades itself for it.
+
+include = "canonical.toml"
+
+rules_name = "three-vengeance-2"
+powers.three = "trap_vengeance_two_damage"

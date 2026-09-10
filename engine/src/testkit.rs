@@ -107,13 +107,14 @@ impl Position {
     /// Note the ceiling depends on face-up state: a face-down Jack is a blank 2-HP card
     /// (`game_rules.md` §5), so 2 damage kills it and only a *face-up* Jack can sit on 2.
     pub fn damage(&mut self, lane: usize, owner: Player, slot: usize, damage: u8) -> &mut Self {
+        let config = self.state.config;
         let card = &mut self.state.lanes[lane].side_mut(owner)[slot];
         assert!(
-            damage < card.max_hp(),
+            damage < card.max_hp(&config),
             "{damage} damage would kill a {} {} ({} HP)",
             if card.face_up { "face-up" } else { "face-down" },
             card.rank,
-            card.max_hp()
+            card.max_hp(&config)
         );
         card.damage = damage;
         self

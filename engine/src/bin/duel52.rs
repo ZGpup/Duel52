@@ -39,11 +39,12 @@ fn main() {
         "nn-dump" => cmd_nn_dump(&args[1..]),
         "selfplay" => cmd_selfplay(&args[1..]),
         "shard" => cmd_shard(&args[1..]),
-        "powers" => {
-            print!("{}", power_reference());
-            Ok(())
-        }
+        // Takes options, so `duel52 powers --config configs/rules/three-vengeance-1.toml`
+        // describes the ruleset you are about to play rather than the rules as written.
+        "powers" => parse_options(&args[1..]).map(|o| print!("{}", power_reference(&o.config))),
         "config" => cmd_config(&args[1..]),
+        "screen" => cmd_screen(&args[1..]),
+        "card-value" => cmd_card_value(&args[1..]),
         "version" | "--version" | "-V" => {
             println!("duel52 engine {VERSION}");
             Ok(())
@@ -67,6 +68,7 @@ fn usage() -> String {
 
 USAGE
   duel52 play    [options]        play against the engine in the terminal
+  duel52 screen  [options]        screen every ruleset in configs/rules/, no training
   duel52 replay  [options]        walk a recorded game and see what the net thought
   duel52 demo    [options]        watch one random-vs-random game, action by action
   duel52 stats   [options]        random-vs-random statistics (Phase 1 deliverable)
@@ -387,11 +389,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--b" => opts.agent_b = Some(AgentSpec::parse(&next_value(args, &mut i, "--b")?)?),
             "--config" => {
                 let path = next_value(args, &mut i, "--config")?;
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read `{path}`: {e}"))?;
-                from_file = Some(
-                    GameConfig::from_config_str(&text).map_err(|e| format!("`{path}`: {e}"))?,
-                );
+                // Through `from_config_file` so `include` resolves against the config's own
+                // directory — that is what lets `configs/rules/*.toml` be a diff on a base
+                // rather than thirteen copied power lines (`MODULAR_RULES.md` §5d).
+                from_file = Some(GameConfig::from_config_file(std::path::Path::new(&path))?);
             }
             "--as" => {
                 let v = next_value(args, &mut i, "--as")?;
@@ -472,10 +473,370 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
 
 // ====================================================================== commands ==
 
+/// `PLAN.md` §4's card value table — what each rank is worth, in win-probability points.
+///
+/// See `engine/src/cardvalue.rs` for the method and, more importantly, for the control that
+/// makes it trustworthy. Read the control line before the table: if it is not ~0.00 the
+/// table means nothing.
+fn cmd_card_value(args: &[String]) -> Result<(), String> {
+    let mut checkpoint: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--checkpoint" {
+            i += 1;
+            checkpoint = Some(
+                args.get(i)
+                    .cloned()
+                    .ok_or("--checkpoint needs a path")?,
+            );
+        } else {
+            rest.push(args[i].clone());
+        }
+        i += 1;
+    }
+    let checkpoint = checkpoint.ok_or("card-value needs --checkpoint <path.d52nn>")?;
+    let opts = parse_options(&rest)?;
+    let positions = opts.games_or(200);
+
+    // Cross-ruleset is refused here for the same reason it is on `probe`: this produces a
+    // number a human reads as a result about a card.
+    refuse_cross_ruleset(
+        &[AgentSpec::NetPolicy {
+            checkpoint: checkpoint.clone(),
+        }],
+        &opts.config,
+    )?;
+
+    let evaluator =
+        duel52_engine::nn::evaluator_for(std::path::Path::new(&checkpoint), &opts.config)?;
+    let table = duel52_engine::cardvalue::measure(
+        evaluator.as_ref(),
+        &opts.config,
+        positions,
+        opts.seed,
+    );
+
+    println!(
+        "Card value — {} positions, seed {}\n  checkpoint: {checkpoint}\n  rules: {}",
+        table.positions,
+        opts.seed,
+        opts.config.rules_label()
+    );
+    if table.rejected > 0 {
+        let kept = 100.0 * table.positions as f64
+            / (table.positions + table.rejected).max(1) as f64;
+        println!(
+            "  kept {:.1}% of sampled positions — {} skipped because some rank could not be\n  \
+             held there without inventing a card the deck does not contain.",
+            kept, table.rejected
+        );
+    }
+    // A thin sample is not a small error bar, it is a different measurement. `mirrored`
+    // publishes its removed multiset (§9b), so the observer accounts for nearly their whole
+    // deck and almost no position admits all thirteen substitutions — see `cardvalue.rs`.
+    if table.positions < 30 {
+        println!(
+            "\n  ⚠️  ONLY {} POSITION(S) SURVIVED. This is not a small sample, it is the wrong\n     \
+             tool for this ruleset: asking \"what if I held an R\" needs a copy of R to be\n     \
+             somewhere the observer cannot see, and here almost nothing is. `mirrored` is the\n     \
+             known case. Do not read the table below.",
+            table.positions
+        );
+        return Ok(());
+    }
+    println!();
+
+    // The control first, deliberately: it decides whether the rest is worth reading.
+    if table.control_is_clean() {
+        println!(
+            "  control: {:.5} points of spread across ranks — clean. Substituting the same\n           \
+             thirteen ranks into the OPPONENT'S hand, which we cannot see, must not move the\n           \
+             value at all, and does not.",
+            table.control_spread
+        );
+    } else {
+        println!(
+            "  ⚠️  CONTROL FAILED: {:.5} points of spread, and it must be 0.\n     \
+             The observation carries our own hand as rank counts and the opponent's as a bare\n     \
+             size, so substituting into their hand leaves all thirteen tensors identical and the\n     \
+             value head must return one number. It did not. Do not read the table below — the\n     \
+             method is broken, not the cards.",
+            table.control_spread
+        );
+    }
+    println!();
+
+    // `advantage` — the value of holding this card **in hand** — is the measurement, and the
+    // only column worth ranking on. `on board` is the contrast, and is deliberately shown
+    // second and labelled: it favours the four constant powers by construction, because a
+    // one-shot has already fired by the time it is face-up and a 3 has no power at all.
+    if opts.markdown {
+        println!("| rank | power | kind | in hand | ± | on board | gap |");
+        println!("|---|---|---|---:|---:|---:|---:|");
+    } else {
+        println!("  rank  power                  kind       in hand   ±      on board    gap");
+    }
+    for row in table.ranked() {
+        let power = opts.config.power(row.rank);
+        let kind = if power.is_constant() {
+            "constant"
+        } else if power.fires_on_flip() {
+            "one-shot"
+        } else if power.has_death_trigger() {
+            "condition"
+        } else {
+            "none"
+        };
+        let gap = row.advantage - row.board_advantage;
+        if opts.markdown {
+            println!(
+                "| {} | {} | {} | {:+.2} | {:.2} | {:+.2} | {:+.2} |",
+                row.rank,
+                power.display_name(),
+                kind,
+                row.advantage,
+                row.advantage_stderr,
+                row.board_advantage,
+                gap,
+            );
+        } else {
+            println!(
+                "  {:<5} {:<22} {:<10} {:>+6.2} ±{:.2}   {:>+6.2}  {:>+6.2}",
+                row.rank.to_string(),
+                power.display_name(),
+                kind,
+                row.advantage,
+                row.advantage_stderr,
+                row.board_advantage,
+                gap,
+            );
+        }
+    }
+    println!(
+        "\n  spread: {:.2} points between the best card and the worst.",
+        table.spread()
+    );
+    println!(
+        "\n  in hand   The measurement. Holding everything else fixed, having this card in\n  \
+         {:10}hand rather than an average card is worth this much of a game. Every rank is\n  \
+         {:10}measured at the same point in its life, whatever kind of power it carries.\n\n  \
+         ±         Paired: every rank is measured on the identical position, so the\n  \
+         {:10}position's own difficulty subtracts out. This is the error on the\n  \
+         {:10}comparison between cards, not on the absolute win rate.\n\n  \
+         on board  The same card already face-up in a lane. ⚠️ NOT comparable across power\n  \
+         {:10}kinds: a constant power is fully live here, a one-shot has already fired and\n  \
+         {:10}is spent, and the 3's Trap only works face-down. Read it against `in hand`,\n  \
+         {:10}never on its own.\n\n  \
+         gap       in hand − on board. Large and positive means the card's value is in the\n  \
+         {:10}flip or in staying hidden; near zero or negative means it is in the body\n  \
+         {:10}standing in the lane.",
+        "", "", "", "", "", "", "", "", ""
+    );
+    println!(
+        "\n  ⚠️  This measures THIS CHECKPOINT'S value head, which is evidence about Duel 52\n  \
+         only to the extent that head is good. `PLAN.md` §4 names a trustworthy value head as\n  \
+         the prerequisite, and that is what the long runs are for."
+    );
+    Ok(())
+}
+
+/// Screen every registered ruleset with the hand-written agents, no training involved.
+///
+/// `MODULAR_RULES.md` §9. At twenty rulesets the binding constraint stops being "can I
+/// express this rule" and becomes "can I afford to measure it" — twenty rulesets at a
+/// three-hour warm start each is sixty hours of box time. This is the tier below that.
+///
+/// `ismcts` and `greedy` take no checkpoint, so they run under any ruleset the day the file
+/// is written. What comes back will not tell you a ruleset is *good* — search agents are not
+/// the meta, and `CLAUDE.md` retired the hand-written ladder for exactly that reason. It
+/// reliably tells you one is **broken**: degenerate, drawish, endless, or holding a card
+/// nobody ever plays. At twenty candidates that is most of the value, and it is the
+/// difference between sixty hours and a handful.
+///
+/// `random` stays in the roster because lane and attack concentration have no absolute
+/// scale — 0.907 means nothing without uniform play's 0.777 in the same table (`CLAUDE.md`).
+fn cmd_screen(args: &[String]) -> Result<(), String> {
+    let opts = parse_options(args)?;
+    let games = opts.games_or(200);
+
+    let dir = std::path::Path::new("configs/rules");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read the ruleset registry `{}`: {e}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no rulesets in `{}`", dir.display()));
+    }
+
+    // Deterministic and checkpoint-free by default, so the whole screen is reproducible from
+    // `--seed` and needs no checkpoint to exist. `--agents` overrides it: `greedy,random` is
+    // the fast pass for a first look, `ismcts:800,random` the slower one worth running before
+    // committing a training run.
+    //
+    // `random` earns its place in either roster. Lane and attack concentration have no
+    // absolute scale — picking the busiest lanes after the fact inflates the number even for
+    // a uniform player — so 0.907 means nothing without uniform play's 0.777 beside it
+    // (`CLAUDE.md`).
+    let roster = opts.roster.clone().unwrap_or_else(|| {
+        vec![AgentSpec::Ismcts { iterations: 800 }, AgentSpec::Random]
+    });
+    refuse_cross_ruleset(&roster, &opts.config)?;
+
+    eprintln!(
+        "Screening {} ruleset(s) × {} agent(s), {} games each. No training involved.",
+        files.len(),
+        roster.len(),
+        games + (games % 2)
+    );
+
+    struct Row {
+        ruleset: String,
+        agent: String,
+        draws: f64,
+        stalemate: f64,
+        ply_cap: usize,
+        mean_plies: f64,
+        lane_conc: f64,
+        flip_rate: f64,
+        /// Least- and most-*flipped* rank, by the share of played copies the agent chose to
+        /// turn face-up.
+        ///
+        /// ⚠️ Deliberately not "least/most **played**". Plays per rank is a statistic about
+        /// the *deal*, not about the agent: with two copies of every rank in a player's deck
+        /// everyone plays much the same distribution, and the first version of this table
+        /// read an identical `6 (1.18/g) · 3 (1.57/g)` for all seven rulesets and both
+        /// agents, which is what gave it away. Flip rate is a decision.
+        shyest: String,
+        keenest: String,
+        /// Death triggers fired per game — the payoff of a Trap-shaped power, which the flip
+        /// rate cannot see because a card that springs was never flipped by choice.
+        triggers: f64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+
+    for path in &files {
+        let mut config = GameConfig::from_config_file(path)?;
+        // `--encoding-slots` and the stalemate knobs still apply, so a screen can be run at
+        // the training run's settings.
+        config.encoding_slots = opts.config.encoding_slots;
+        config.stalemate_value = opts.config.stalemate_value;
+        let name = config.rules_name.to_string();
+
+        for spec in roster.iter() {
+            eprintln!("  {name} · {} …", spec.name());
+            let m = ladder::run_match(
+                config,
+                spec.clone(),
+                spec.clone(),
+                opts.seed,
+                games,
+                opts.threads,
+                1,
+            );
+            let b = &m.behaviour[0];
+            // Flip *rate* per rank: of the copies of this rank the agent played from hand,
+            // what share did it choose to turn face-up. Ranks it never played are skipped
+            // rather than scored 0, which would put every unplayed rank at the bottom.
+            //
+            // ⚠️ Base flips are subtracted, the same correction `AgentBehaviour::card_fates`
+            // makes. `flips_by_rank` counts every flip including base cards, but
+            // `plays_by_rank` counts only cards played *from hand* — a base card was never
+            // played. Without the subtraction the ratio exceeds 1, and the first version of
+            // this table printed `6 (105%)`, which is what gave it away.
+            let mut flip_rate: Vec<(usize, f64)> = (0..config.rank_count())
+                .filter(|&r| b.plays_by_rank[r] > 0)
+                .map(|r| {
+                    let voluntary = b.flips_by_rank[r].saturating_sub(b.base_flips_by_rank[r]);
+                    (r, voluntary as f64 / b.plays_by_rank[r] as f64)
+                })
+                .collect();
+            flip_rate.sort_by(|a, c| a.1.partial_cmp(&c.1).expect("no NaN"));
+            let fmt = |pick: Option<&(usize, f64)>| match pick {
+                Some((r, v)) => {
+                    format!("{} ({:.0}%)", duel52_engine::Rank::from_index(*r), 100.0 * v)
+                }
+                None => "—".to_string(),
+            };
+            let triggers: f64 = (0..config.rank_count())
+                .map(|r| b.triggers_sprung_by_rank[r] as f64)
+                .sum::<f64>()
+                / b.games.max(1) as f64;
+            rows.push(Row {
+                ruleset: name.clone(),
+                agent: spec.name(),
+                draws: m.draws as f64 / m.games as f64,
+                stalemate: m.draws_stalemate as f64 / m.games as f64,
+                ply_cap: m.draws_ply_limit,
+                mean_plies: m.mean_plies(),
+                lane_conc: b.mean_lane_concentration(),
+                flip_rate: if b.plays == 0 {
+                    f64::NAN
+                } else {
+                    b.flips as f64 / b.plays as f64
+                },
+                shyest: fmt(flip_rate.first()),
+                keenest: fmt(flip_rate.last()),
+                triggers,
+            });
+        }
+    }
+
+    println!(
+        "\nRuleset screen — {} games per agent per ruleset, seed {}\n",
+        games + (games % 2),
+        opts.seed
+    );
+    println!(
+        "| ruleset | agent | draws | stalemate | ply cap | mean plies | flip rate | lane conc | \
+         triggers/g | least flipped | most flipped |"
+    );
+    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|");
+    for r in &rows {
+        println!(
+            "| {} | {} | {:.1}% | {:.1}% | {} | {:.1} | {:.2} | {:.3} | {:.2} | {} | {} |",
+            r.ruleset,
+            r.agent,
+            100.0 * r.draws,
+            100.0 * r.stalemate,
+            r.ply_cap,
+            r.mean_plies,
+            r.flip_rate,
+            r.lane_conc,
+            r.triggers,
+            r.shyest,
+            r.keenest,
+        );
+    }
+
+    // The one row that is a hard failure rather than a reading. `game_rules.md` §7 proves
+    // the game finite from specific rules, so a ply-cap draw means this ruleset broke the
+    // proof — it is a bug report, not a result (`MODULAR_RULES.md` §8).
+    let broken: Vec<&Row> = rows.iter().filter(|r| r.ply_cap > 0).collect();
+    if broken.is_empty() {
+        println!("\nNo ruleset reached the ply cap.");
+    } else {
+        println!("\n⚠️  These rulesets hit the ply cap and are not finite as written:");
+        for r in broken {
+            println!("      {} · {} — {} game(s)", r.ruleset, r.agent, r.ply_cap);
+        }
+        return Err("a ruleset reached the ply cap".to_string());
+    }
+    println!(
+        "\nRead this as a filter, not a verdict: it says which rulesets are broken, never\n\
+         which are good. A surviving ruleset is worth a training run; the rest are not."
+    );
+    Ok(())
+}
+
 fn cmd_config(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("config needs a file path")?;
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
-    let config = GameConfig::from_config_str(&text).map_err(|e| format!("`{path}`: {e}"))?;
+    // Through `from_config_file`, so `include` resolves against the file's own directory
+    // (`MODULAR_RULES.md` §5d). What is printed is the fully-resolved form, which is also
+    // what gets stamped into a shard and a game record.
+    let config = GameConfig::from_config_file(std::path::Path::new(path))?;
     println!("{path} is valid. It resolves to:\n");
     print!("{}", config.to_config_string());
     println!(
@@ -486,6 +847,23 @@ fn cmd_config(args: &[String]) -> Result<(), String> {
         } else {
             "game (shared)"
         }
+    );
+    println!("rules: {}", config.rules_label());
+    let diff = config.power_diff();
+    if diff.is_empty() {
+        println!("        (the rules as written — no card power differs from canonical)");
+    } else {
+        println!("        modded cards: {}", diff.join(", "));
+    }
+    // The layout hashes are what a checkpoint and a shard are checked against, and they are
+    // deliberately *independent* of the rules: the encoder is rank-agnostic, so a rules mod
+    // never moves them and `--init-from` works across rulesets (`MODULAR_RULES.md` §1b).
+    println!(
+        "layout: obs_dim {} action_dim {} obs {:016x} action {:016x}",
+        duel52_engine::encode::obs_dim(&config),
+        duel52_engine::encode::action_dim(&config),
+        duel52_engine::encode::obs_layout_hash(&config),
+        duel52_engine::encode::action_layout_hash(&config),
     );
     Ok(())
 }
@@ -516,10 +894,76 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
 
 /// The Phase 2 deliverable: a round-robin over the agent ladder, and the Elo table fitted
 /// to it.
+/// Refuse to measure an agent that was trained on a different game.
+///
+/// `MODULAR_RULES.md` §6. This is the **hard error**, and it belongs on exactly the three
+/// commands whose output a human reads as a result: `ladder`, `match` and `probe`. There is
+/// no escape flag, because cross-ruleset play is not an experiment anybody wants — it is
+/// the accident that produced `PLAN.md` §5's false claim about per-variant layouts, where a
+/// split-trained checkpoint played `--variant base` at full speed and the score looked like
+/// a finding.
+///
+/// ⚠️ It is deliberately **not** in `Weights::load`. Generation 1 of every warm-started run
+/// is a net trained under ruleset A playing under ruleset B, and that is the mechanism that
+/// makes a rules experiment cost three hours rather than twenty-four. `selfplay` and the
+/// training loop print the mismatch and continue; only the measurement commands refuse.
+fn refuse_cross_ruleset(roster: &[AgentSpec], config: &GameConfig) -> Result<(), String> {
+    let want = config.rules_hash();
+    for spec in roster {
+        let Some(path) = spec.checkpoint() else {
+            continue;
+        };
+        let stamped = duel52_engine::nn::Weights::stamped_rules(std::path::Path::new(path))?;
+        match stamped {
+            Some((name, hash)) if hash != want => {
+                return Err(format!(
+                    "{} was trained on rules {name}/{hash:016x}, but this run plays {} — a \
+                     score between the two would not mean anything, so it is refused rather \
+                     than printed.\n  Train an agent on these rules, or run the measurement \
+                     under the rules the agent was trained on.",
+                    spec.name(),
+                    config.rules_label(),
+                ));
+            }
+            Some(_) => {}
+            // An **unstamped** checkpoint carries no ruleset at all — the four shipped ones
+            // predate the field. Two cases, and they deserve different answers:
+            None if !config.is_canonical_rules() => {
+                // It certainly was not trained on a mod, because no mod could be expressed
+                // when it was written. This is a definite mismatch.
+                return Err(format!(
+                    "{} predates rules stamping, so it was trained on the rules as written — \
+                     but this run plays {}, which is a modded ruleset. Refused.\n  Train an \
+                     agent on these rules first; `--init-from` warm-starts from an unstamped \
+                     checkpoint, which is exactly what it is for.",
+                    spec.name(),
+                    config.rules_label(),
+                ));
+            }
+            None => {
+                // Canonical rules, but for *which variant* is unknowable — and this is the
+                // exact hole that produced `PLAN.md` §5's false claim, where a split-trained
+                // checkpoint played `--variant base` and the score looked like a finding.
+                // It cannot be checked without the stamp, so say so rather than pass in
+                // silence or refuse a checkpoint that is probably fine.
+                eprintln!(
+                    "warning: {} carries no rules stamp, so which variant it was trained on \
+                     cannot be verified. This run plays {}. Every checkpoint written from now \
+                     on is stamped; this one is not.",
+                    spec.name(),
+                    config.rules_label(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_ladder(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
     let roster = opts.roster();
     let games = opts.games_or(400);
+    refuse_cross_ruleset(&roster, &opts.config)?;
 
     // An anchor that is not in the roster would silently fall back to whichever agent was
     // listed first, and the whole table would be measured against something nobody named.
@@ -576,6 +1020,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
     });
     let b = opts.agent_b.clone().unwrap_or(AgentSpec::Random);
     let games = opts.games_or(400);
+    refuse_cross_ruleset(&[a.clone(), b.clone()], &opts.config)?;
 
     let result = ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads, opts.eval_batch);
     print!("{}", result.report());
@@ -592,6 +1037,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     let opts = parse_options(args)?;
     let roster = opts.roster();
     let games = opts.games_or(400);
+    refuse_cross_ruleset(&roster, &opts.config)?;
 
     let mut rows = Vec::new();
     for spec in &roster {
@@ -1722,7 +2168,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                     continue;
                 }
                 "powers" => {
-                    screen.interlude(&power_reference(), &mut keys);
+                    screen.interlude(&power_reference(&state.config), &mut keys);
                     continue;
                 }
                 "rules" => {

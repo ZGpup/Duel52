@@ -728,7 +728,7 @@ fn rule_6_seven_healing_is_capped_at_max_hp() {
     go(&mut s, Action::Flip { lane: 0, slot: 0 });
     let jack = card_at(&s, 0, P0, 1);
     assert_eq!(jack.damage, 0);
-    assert_eq!(jack.hp_remaining(), 3, "healed to 3, not to 5");
+    assert_eq!(jack.hp_remaining(&s.config), 3, "healed to 3, not to 5");
 }
 
 /// §6: the 7 "Includes base cards **once the draw pile is empty**".

@@ -29,13 +29,19 @@ from .trainer import resolve_device
 
 def _check(args: argparse.Namespace) -> int:
     config: TrainConfig = load_config(args.config)
-    spec = spec_for(config.game.variant, config.game.encoding_slots)
+    spec = spec_for(config.game.variant, config.game.encoding_slots, config.game.rules_file)
     engine = Path(config.run.engine)
 
     print(f"config      {config.source}")
     print(f"device      {resolve_device(config.train.device)}")
     print(f"engine      {engine}{'' if engine.exists() else '   *** MISSING — cargo build --release'}")
-    print(f"game        variant={config.game.variant} encoding_slots={config.game.encoding_slots}")
+    if config.game.rules_file:
+        print(f"game        rules_file={config.game.rules_file} encoding_slots={config.game.encoding_slots}")
+    else:
+        print(f"game        variant={config.game.variant} encoding_slots={config.game.encoding_slots}")
+    # Which game is being learned. Independent of the layout hashes below it: a rules mod
+    # never moves those, so this is the only line that distinguishes two rulesets.
+    print(f"rules       {spec['rules_name']}/{spec['rules_hash']}")
     print(f"encoding    obs_dim={spec['obs_dim']} action_dim={spec['action_dim']}")
     print(f"            obs_layout_hash={spec['obs_layout_hash']}")
     print(f"            action_layout_hash={spec['action_layout_hash']}")

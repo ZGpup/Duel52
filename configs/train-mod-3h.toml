@@ -1,0 +1,158 @@
+# The first real rules experiment — `MODULAR_RULES.md` §11 step 9.
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-mod-3h.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-mod-3h.toml \
+#       --run-dir runs/mod-three-vengeance \
+#       --init-from models/duel52-split-lane-gen032.d52nn
+#
+# **This is the config that proves the whole exercise was worth doing**, and the line that
+# does it is `rules_file` in `[game]`. Nothing else here is new: the trunk, the search budget
+# and the schedule are `train-7h.toml`'s, re-keyed to three hours.
+#
+# ============================================================================
+# Why a rules experiment costs three hours and not twenty-four
+# ============================================================================
+#
+# Because `--init-from` works **across rulesets**. The encoder is rank-agnostic — there is no
+# per-power feature anywhere in `encode.rs`, only a rank one-hot and generic mechanical state
+# — so changing what the 3 does leaves `obs_dim`, `action_dim` and both layout hashes exactly
+# where they were. Verified, at `encoding_slots = 21`:
+#
+#   canonical-2026-09  rules 8a9767ea88977b84  obs_dim 4290  obs b1355a841a1fdc4a
+#   three-vengeance-1  rules 176f07f41c541e6a  obs_dim 4290  obs b1355a841a1fdc4a
+#
+# The ruleset differs; the layout does not. So `lane-gen032` loads, and this run starts from
+# an agent that already plays well rather than from noise. `MODULAR_RULES.md` §1b calls this
+# the single most valuable property the project has, and it was nobody's design — it is an
+# accident of having encoded ranks and not powers.
+#
+# ⚠️ Generation 1 is therefore **legitimately cross-ruleset**: a net trained on the rules as
+# written, playing the modded game. That is the mechanism, not a mistake, which is why
+# `rules_hash` is *not* enforced by `Weights::load` and why `train check` prints the mismatch
+# rather than refusing it. The hard error lives where a cross-ruleset number would be read as
+# a result — `ladder`, `match`, `probe`, `card-value` — and on a replay buffer, where two
+# rulesets in one window is silent corruption with no human present (`MODULAR_RULES.md` §6).
+#
+# ============================================================================
+# What this run is for, and what it is not
+# ============================================================================
+#
+# It is **not** "does the modded agent beat the canonical agent". That comparison is
+# meaningless and the engine refuses to compute it: an agent trained on ruleset A beating one
+# trained on ruleset B, under A's rules, says nothing about whether A is a better game.
+#
+# What comes out that *is* meaningful is within-ruleset, and there are two things to read:
+#
+#   1. **The card value table.** After this run:
+#
+#        ./target/release/duel52 card-value --encoding-slots 21 --games 400 \
+#            --config configs/rules/three-vengeance-1.toml \
+#            --checkpoint runs/mod-three-vengeance/checkpoints/best.d52nn
+#
+#      against the canonical baseline measured 2026-09-09 on lane-gen032, where the 3 sits at
+#      **+0.27 ± 0.08** points, sixth of thirteen. If vengeance is worth having, the 3 moves
+#      up; if it moves a lot, it is worth having *too much*. Read the control line first.
+#
+#   2. **The 3's fates**, from `probe`. `triggers_sprung_by_rank` divided by threes played:
+#      the share of played 3s that sprang. ⚠️ The prediction is that this **falls**, not
+#      rises. Vengeance makes attacking a face-down card more expensive, so competent play
+#      attacks them less — the Trap fires less often while being worth more each time. A rise
+#      would mean the agents have not noticed the change, which is a reason to distrust the
+#      run rather than a result.
+#
+# Screen first, always. `duel52 screen` costs minutes and rules out the broken ones; this
+# config costs three hours and is only worth spending on a ruleset that survived it.
+
+[game]
+# ⚠️ **The one line that makes this a rules experiment.** Replaces `variant` — the CLI
+# refuses `--config` and `--variant` together, and the ruleset file's own `variant` key
+# decides the deck (it includes `canonical.toml`, so: split).
+rules_file = "configs/rules/three-vengeance-1.toml"
+
+# FINDINGS.md F3.1. Also fixes the lane widths the checkpoint header carries.
+encoding_slots = 21
+stalemate_value = 0.0             # FINDINGS.md F3.6
+
+[net]
+# Pinned by the warm start, not chosen: `--init-from` refuses a checkpoint whose trunk
+# disagrees with these, and lane-gen032 is lane 128 x 3.
+arch = "lane"
+width = 128
+blocks = 3
+value_hidden = 128
+
+[selfplay]
+# ~half `train-7h.toml`'s 4000, to keep the gate a tax rather than a partner at a third of
+# the clock. At ~7.4 games/sec self-play this is ~4.5 min a generation against the gate's
+# fixed ~6.7 min, so self-play is ~45% — slightly gate-heavy, which is the right way to be
+# wrong for a run whose output is a *comparison* rather than a strength claim.
+games = 2000
+
+sims = 256
+c_puct = 1.25
+full_search_fraction = 0.25
+cap_sims = 32
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+device = "auto"
+batch_size = 512
+lane_augment = false              # a no-op on the lane-equivariant net
+
+epochs_per_generation = 0.9
+steps_per_generation = 600
+
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+# Keyed to the ~10 generations three hours buys at this generation size, not carried over
+# from a longer run — the mistake `train-7h.toml`'s header records this project making twice.
+lr_schedule = [[0, 1.0], [5, 0.25], [8, 0.0625]]
+
+sample_stride = 2
+buffer_generations = 4
+buffer_samples = 700000
+
+# Generation 1 is played by a warm-started net, so its positions are worth holding out.
+# F4.6 is the record of the from-scratch case where they are not.
+holdout_samples = 8000
+
+[gate]
+games = 300
+threshold = 0.52
+min_decisive = 30
+sims = 256
+
+# ⚠️ **No `netmcts:` row on the panel, and that is deliberate.** Every shipped checkpoint was
+# trained on the canonical rules, so scoring this run against one would be exactly the
+# cross-ruleset comparison the engine refuses everywhere a human reads the number. `random`
+# and `greedy` need no checkpoint and play any ruleset, so they survive as what they are here:
+# a cliff detector, not a measurement.
+#
+# The consequence is that this run has **no informative panel row at all** — the gate against
+# its own incumbent is the whole signal. That is acceptable for a three-hour comparison and
+# would not be for a headline strength claim.
+reference = ["random", "greedy"]
+reference_games = 100
+reference_games_saturated = 40
+reference_saturated_at = 0.99
+reference_tolerance = 0.10
+max_consecutive_refusals = 5
+
+[run]
+generations = 20
+hours = 3.0
+
+# A fresh block, above runs/sixth's 5,000,000+ and train-7h's 6,000,000+. A collision would
+# silently re-deal games a net has already trained on.
+seed = 7000000
+
+threads = 0
+eval_batch = 64
+engine = "./target/release/duel52"

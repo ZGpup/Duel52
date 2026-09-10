@@ -562,7 +562,7 @@ fn card_menu(
     let mut b = Builder::new(prompt);
     for slot in column_slots(state, lane, owner, observer) {
         let card = &state.lanes[lane].side(owner)[slot];
-        let token = card_token(card, observer);
+        let token = card_token(card, observer, &state.config);
         let (text, pick) = detail(slot);
         let note = if text.is_empty() {
             token
@@ -768,7 +768,7 @@ fn copies_note(state: &GameState, observer: Observer, lane: usize, slots: &[usiz
     let me = state.acting_player();
     let tokens: Vec<String> = slots
         .iter()
-        .map(|&slot| card_token(&state.lanes[lane].side(me)[slot], observer))
+        .map(|&slot| card_token(&state.lanes[lane].side(me)[slot], observer, &state.config))
         .collect();
     let tokens = tokens.join(" ");
     if slots
@@ -1007,7 +1007,7 @@ fn attack_menu(state: &GameState, attacks: &[Action], observer: Observer) -> Men
             };
             let note = format!(
                 "{:<6} {:<11} {}",
-                card_token(&state.lanes[lane].side(me)[slot], observer),
+                card_token(&state.lanes[lane].side(me)[slot], observer, &state.config),
                 power_note(state, lane, me, slot, observer),
                 paired,
             );

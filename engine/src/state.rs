@@ -12,6 +12,7 @@ use crate::card::{Card, CardId, PairId};
 use crate::config::{GameConfig, Variant};
 use crate::outcome::Outcome;
 use crate::player::Player;
+use crate::powers::PowerId;
 use crate::rank::{Rank, RankCounts};
 use crate::rng::Rng;
 
@@ -290,6 +291,10 @@ pub struct GameState {
     pub(crate) next_pair_id: u32,
     /// Did anything take damage or die this ply? Drives `quiet_plies`.
     pub(crate) damage_this_ply: bool,
+    /// Hits waiting to land. Always empty at an action boundary — see
+    /// [`crate::damage::DamageQueue`] for why damage is a queue rather than recursion, and
+    /// `debug_check_invariants` for the assertion that it drains.
+    pub(crate) damage_queue: crate::damage::DamageQueue,
     /// Reserved for Phase 3 determinization sampling (`DESIGN.md` §6); unused during play,
     /// since nothing after the deal is random.
     pub(crate) rng: Rng,
@@ -465,16 +470,16 @@ impl GameState {
             .filter(|&i| self.base_unlocked || !side[i].is_base)
             .collect();
 
-        let jacks: Vec<usize> = targetable
+        let taunters: Vec<usize> = targetable
             .iter()
             .copied()
-            .filter(|&i| side[i].has_live_power(Rank::JACK))
+            .filter(|&i| side[i].live_power(&self.config).is_some_and(|p| p.taunts()))
             .collect();
 
-        if jacks.is_empty() {
+        if taunters.is_empty() {
             targetable
         } else {
-            jacks
+            taunters
         }
     }
 
@@ -506,13 +511,13 @@ impl GameState {
             return Vec::new();
         };
         // Nimble dodges the spread personally.
-        if primary.has_live_power(Rank::NINE) {
+        if primary.live_power(&self.config).is_some_and(|p| p.is_nimble()) {
             return Vec::new();
         }
         self.legal_attack_targets(lane, defender)
             .into_iter()
             .filter(|&i| i != primary_slot)
-            .filter(|&i| !side[i].has_live_power(Rank::NINE))
+            .filter(|&i| !side[i].live_power(&self.config).is_some_and(|p| p.is_nimble()))
             .collect()
     }
 
@@ -528,10 +533,16 @@ impl GameState {
     /// against — a 9 hitting a face-down Jack deals its ordinary 1, and kills it in two
     /// like anything else. This is consistent with the twinstrike rule: everything that
     /// keys on a target being a Jack reads `has_live_power`, never the bare rank.
-    pub fn attack_damage(&self, attacker_rank: Rank, target: &Card, is_pair: bool) -> u8 {
-        let base = if is_pair { 2 } else { 1 };
-        if attacker_rank == Rank::NINE && target.has_live_power(Rank::JACK) {
-            base * 2
+    pub fn attack_damage(&self, attacker: Option<PowerId>, target: &Card, is_pair: bool) -> u8 {
+        let base = if is_pair {
+            self.config.pair_attack_damage
+        } else {
+            self.config.single_attack_damage
+        };
+        let nimble = attacker.is_some_and(|p| p.is_nimble());
+        let taunting = target.live_power(&self.config).is_some_and(|p| p.taunts());
+        if nimble && taunting {
+            base.saturating_mul(self.config.nimble_vs_taunt_multiplier)
         } else {
             base
         }
@@ -597,6 +608,12 @@ impl GameState {
     /// answer. Run after every action in debug builds.
     pub(crate) fn debug_check_invariants(&self) {
         if cfg!(debug_assertions) {
+            // Damage never survives an action boundary. If it does, a drain was skipped and
+            // the next action would apply last action's hits — see `crate::damage`.
+            assert!(
+                self.damage_queue.is_empty() && !self.damage_queue.is_draining(),
+                "the damage queue was not drained before the action finished"
+            );
             for (l, lane) in self.lanes.iter().enumerate() {
                 for p in Player::BOTH {
                     let side = lane.side(p);
@@ -610,11 +627,11 @@ impl GameState {
                     for c in side {
                         assert_eq!(c.owner, p, "card {:?} filed on the wrong side", c.id);
                         assert!(
-                            c.damage < c.max_hp(),
+                            c.damage < c.max_hp(&self.config),
                             "dead card {:?} still in play with {} damage against {} max HP",
                             c.id,
                             c.damage,
-                            c.max_hp()
+                            c.max_hp(&self.config)
                         );
                         assert!(
                             !(c.is_base && !c.entered_as_base),
@@ -745,6 +762,7 @@ pub(crate) fn empty_state(config: GameConfig, seed: u64) -> GameState {
         next_card_id: 0,
         next_pair_id: 0,
         damage_this_ply: false,
+        damage_queue: crate::damage::DamageQueue::default(),
         rng: Rng::derive(seed, 0xD0E1_5205_2000_0001),
         config,
         seed,

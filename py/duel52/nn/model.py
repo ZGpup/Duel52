@@ -55,17 +55,30 @@ __all__ = [
 LN_EPS = 1e-5
 
 
-def spec_for(variant: str = "split", encoding_slots: int | None = None) -> dict[str, Any]:
-    """The engine's encoding spec: tensor shapes and layout hashes.
+def spec_for(
+    variant: str = "split",
+    encoding_slots: int | None = None,
+    rules_file: str | None = None,
+) -> dict[str, Any]:
+    """The engine's encoding spec: tensor shapes, layout hashes, and the ruleset.
 
     A thin re-export of ``duel52.encoding_spec()`` so that training code has one obvious
     place to get it and no reason to hard-code a dimension.
+
+    ``rules_file`` names a ``configs/rules/*.toml`` and replaces ``variant``, exactly as
+    ``--config`` replaces ``--variant`` on the CLI. It changes ``rules_name``/``rules_hash``
+    and **nothing else** — the encoder is rank-agnostic, so no ruleset moves a layout hash
+    (``MODULAR_RULES.md`` §1b). That is what lets ``--init-from`` warm-start a rules
+    experiment from the current champion.
     """
     from .._engine import encoding_spec
 
-    if encoding_slots is None:
-        return encoding_spec(variant=variant)
-    return encoding_spec(variant=variant, encoding_slots=encoding_slots)
+    kwargs: dict[str, Any] = {"variant": variant}
+    if encoding_slots is not None:
+        kwargs["encoding_slots"] = encoding_slots
+    if rules_file is not None:
+        kwargs["rules_file"] = rules_file
+    return encoding_spec(**kwargs)
 
 
 @dataclass(frozen=True)

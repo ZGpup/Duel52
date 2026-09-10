@@ -111,6 +111,21 @@ class Generation:
     header: dict[str, str]
 
     @property
+    def rules_hash(self) -> str | None:
+        """Which *game* this shard is of (``MODULAR_RULES.md`` §6).
+
+        ``None`` for a shard written before the stamp existed, which can only be canonical.
+        Independent of ``obs_dim``/``action_dim``: the encoder is rank-agnostic, so a shard
+        generated under a modded ruleset is indistinguishable from a canonical one on shape
+        alone. This is the only thing that separates them.
+        """
+        return self.header.get("rules_hash")
+
+    @property
+    def rules_name(self) -> str | None:
+        return self.header.get("rules_name")
+
+    @property
     def nbytes(self) -> int:
         return int(
             self.obs_index.nbytes
@@ -323,8 +338,24 @@ class ReplayBuffer:
                 # Only reachable if the encoder changed mid-run, which would silently mix
                 # two layouts into one gradient step.
                 raise ValueError(
-                    f"{path} replays to obs_dim={gen.obs_dim} action_dim={gen.action_dim}, but "
-                    f"the buffer holds {first.obs_dim}/{first.action_dim}"
+                    f"{gen.path} replays to obs_dim={gen.obs_dim} action_dim={gen.action_dim}, "
+                    f"but the buffer holds {first.obs_dim}/{first.action_dim}"
+                )
+            # ⚠️ The **hard error** of ``MODULAR_RULES.md`` §6, and the reason it has to live
+            # here rather than in the checkpoint loader. Two shards of two different games in
+            # one replay buffer is silent corruption: the shapes match, nothing crashes, and
+            # the network is trained on positions from a game it will never play. There is no
+            # human in this loop to notice, which is exactly why there is no escape flag.
+            #
+            # A missing stamp means a pre-mod shard, which can only be canonical — so it is
+            # compatible with anything else unstamped, and refused against a stamped one.
+            if gen.rules_hash != first.rules_hash:
+                raise ValueError(
+                    f"{gen.path} was played under rules "
+                    f"{gen.rules_name}/{gen.rules_hash}, but the buffer holds "
+                    f"{first.rules_name}/{first.rules_hash}. Two rulesets cannot share a "
+                    f"replay buffer — the layout is identical, so nothing else would catch "
+                    f"this. Start a new run for the new ruleset."
                 )
         self.generations.append(gen)
         while len(self.generations) > self.max_generations or (

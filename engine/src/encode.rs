@@ -371,7 +371,10 @@ fn encode_slot(state: &GameState, observer: Player, card: &Card, mine: bool, out
     // Max HP is public even on a face-down card, and leaks nothing: §5 makes every
     // face-down card a blank 2-HP card whatever its rank, so a Jack cannot be identified
     // by watching it survive.
-    w.one_hot(if card.max_hp() >= 3 { 1 } else { 0 }, MAX_HP_BUCKETS);
+    w.one_hot(
+        if card.max_hp(&state.config) >= 3 { 1 } else { 0 },
+        MAX_HP_BUCKETS,
+    );
     w.bit(card.is_frozen(state.ply));
     w.one_hot(
         (card.attack_allowance as usize).min(ALLOWANCE_BUCKETS - 1),
