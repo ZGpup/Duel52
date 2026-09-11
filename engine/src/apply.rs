@@ -29,9 +29,9 @@ use crate::config::TwoPower;
 use crate::damage::{DamageQueue, DamageSource, Hit};
 use crate::outcome::{DrawReason, Outcome};
 use crate::player::Player;
-use crate::powers::{self, LethalOutcome, PowerCtx};
+use crate::powers::{self, LethalOutcome, PowerCtx, PowerId};
 use crate::rank::Rank;
-use crate::state::{GameState, Pending, ResolveKind};
+use crate::state::{GameState, LaneChoice, OptionChoice, Pending, ResolveKind};
 
 impl GameState {
     // =================================================================== public entry ==
@@ -112,6 +112,8 @@ impl GameState {
             Action::MoveHere { lane, slot } => self.do_move_here(lane as usize, slot as usize),
             Action::GiveBack { rank } => self.do_give_back(rank),
             Action::SplitTarget { slot } => self.do_split_target(slot as usize),
+            Action::ChooseLane { side, lane } => self.do_choose_lane(side, lane as usize),
+            Action::ChooseOption { option } => self.do_choose_option(option),
         }
 
         self.settle();
@@ -347,8 +349,19 @@ impl GameState {
             return; // already left play
         };
 
+        // A shield absorbs the whole hit and is spent doing it (`MODULAR_RULES.md` §7,
+        // reserve item 3 — set by `PowerId::SevenShieldAll`). Under the canonical ruleset no
+        // card ever carries a status bit, so this is one predictable-false test per hit.
+        //
+        // It returns **before** `damage_this_ply`, so a shielded hit does not reset §7's
+        // quiet-ply counter: nothing was damaged and nothing was killed, and treating it as
+        // action would let two shielded boards stall the stalemate detector forever.
         {
             let card = &mut self.lanes[lane].sides[side][slot];
+            if card.has_status(crate::card::STATUS_SHIELDED) {
+                card.clear_status(crate::card::STATUS_SHIELDED);
+                return;
+            }
             card.damage = card.damage.saturating_add(hit.amount);
         }
         // §7: the quiet-ply counter "resets on damage or a kill and on nothing else".
@@ -597,9 +610,60 @@ impl GameState {
             .expect("legality guaranteed this rank is in hand");
         hand.remove(pos);
 
+        // `view_choose` puts the destination to the player instead of reading it off the
+        // config. The card is already out of hand either way, so the option node cannot
+        // fizzle and leave a card in limbo.
+        if self.config.power(Rank::TWO) == PowerId::TwoViewChoose {
+            self.pending.push(Pending::ChooseOption {
+                player,
+                kind: OptionChoice::GiveBackDestination { rank },
+            });
+            return;
+        }
         match self.config.two_power {
             TwoPower::Bottom => self.pile_mut(player).put_on_bottom(rank, player),
             TwoPower::Discard => self.discards[player.idx()].push(rank),
+        }
+    }
+
+    // ==================================================== the encoder reserve (§7) ==
+
+    /// Answer a [`Pending::ChooseLane`] node. `MODULAR_RULES.md` §7, reserve item 2.
+    ///
+    /// `side` is not read: `legal_lane_choices` is what decides which side a given power may
+    /// name, and it emits only the one that power is entitled to. Checking it again here
+    /// would be a second copy of that rule, which is exactly how legality and resolution
+    /// drift apart.
+    fn do_choose_lane(&mut self, _side: Side, lane: usize) {
+        let Some(Pending::ChooseLane { player, kind }) = self.pending.pop() else {
+            unreachable!("do_choose_lane called outside a ChooseLane node");
+        };
+        match kind {
+            LaneChoice::KingEmpower { king } => {
+                let queue = self.king_reactivation_targets(player, lane, king);
+                if !queue.is_empty() {
+                    self.pending.push(Pending::ResolveOrder {
+                        kind: ResolveKind::KingEmpower,
+                        player,
+                        lane: lane as u8,
+                        remaining: queue,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Answer a [`Pending::ChooseOption`] node. §7, reserve item 2.
+    fn do_choose_option(&mut self, option: u8) {
+        let Some(Pending::ChooseOption { player, kind }) = self.pending.pop() else {
+            unreachable!("do_choose_option called outside a ChooseOption node");
+        };
+        match kind {
+            OptionChoice::GiveBackDestination { rank } => match option {
+                0 => self.pile_mut(player).put_on_bottom(rank, player),
+                1 => self.discards[player.idx()].push(rank),
+                other => unreachable!("legality offers only 0..{}, got {other}", kind.count()),
+            },
         }
     }
 

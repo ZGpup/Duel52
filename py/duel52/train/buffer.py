@@ -55,10 +55,20 @@ class LaneAugmenter:
     action: np.ndarray
 
     @staticmethod
-    def from_engine(variant: str = "split", encoding_slots: int | None = None) -> LaneAugmenter:
+    def from_engine(
+        variant: str = "split",
+        encoding_slots: int | None = None,
+        rules_file: str | None = None,
+    ) -> LaneAugmenter:
         from .._engine import lane_permutations
 
-        perms = lane_permutations(variant=variant, encoding_slots=encoding_slots)
+        # `rules_file` since the encoder reserve (`MODULAR_RULES.md` §7) — an extended
+        # ruleset has a wider observation and an extra lane-indexed policy block, so its
+        # permutation tables are a different shape and a different map. :meth:`check` would
+        # catch the width, but not a same-width table that relabelled the wrong block.
+        perms = lane_permutations(
+            variant=variant, encoding_slots=encoding_slots, rules_file=rules_file
+        )
         as_rows = lambda key: np.stack(  # noqa: E731
             [np.frombuffer(p[key], dtype="<u4").astype(np.int64) for p in perms]
         )

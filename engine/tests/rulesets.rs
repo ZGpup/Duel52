@@ -30,7 +30,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use duel52_engine::agents::AgentSpec;
@@ -416,26 +416,76 @@ fn every_ruleset_keeps_agents_honest() {
 fn no_ruleset_moves_the_encoder_layout() {
     use duel52_engine::encode::{action_dim, action_layout_hash, obs_dim, obs_layout_hash};
 
-    let mut seen: BTreeSet<(usize, usize, u64, u64)> = BTreeSet::new();
-    let mut witness: Vec<String> = Vec::new();
+    // `MODULAR_RULES.md` §7. Before the encoder reserve this asserted **one** layout across
+    // every ruleset. It now asserts something more precise and more useful: there are exactly
+    // **two**, and which one a ruleset gets is decided entirely by
+    // `GameConfig::extended_encoder()`.
+    //
+    // Both halves matter.
+    //
+    // - Every ruleset that needs no reserve feature shares the *pre-reserve* layout, so every
+    //   checkpoint and shard in the repository still loads and a rules experiment is still a
+    //   3-hour warm start rather than a 24-hour run.
+    // - Every ruleset that needs one shares a *single* extended layout, whatever it claims.
+    //   That is §7's batching argument made mechanical: one break buys the whole reserve, and
+    //   the tenth flag-using ruleset costs no more than the first.
+    //
+    // A third layout appearing here means somebody made a reserve feature conditional on
+    // something finer than `extended_encoder()`, which fragments checkpoints across rulesets
+    // and is the failure this suite exists to catch.
+    let mut seen: BTreeMap<bool, BTreeSet<(usize, usize, u64, u64)>> = BTreeMap::new();
+    let mut witness: BTreeMap<bool, Vec<String>> = BTreeMap::new();
     for (name, config) in registry() {
         // Only rulesets that agree on `encoding_slots` are comparable: that field sizes the
         // tensor and is deliberately *not* part of `rules_hash`.
         if config.encoding_slots != GameConfig::default().encoding_slots {
             continue;
         }
-        seen.insert((
+        let extended = config.extended_encoder();
+        seen.entry(extended).or_default().insert((
             obs_dim(&config),
             action_dim(&config),
             obs_layout_hash(&config),
             action_layout_hash(&config),
         ));
-        witness.push(name);
+        witness.entry(extended).or_default().push(name);
     }
-    assert_eq!(
-        seen.len(),
-        1,
-        "the encoder layout differs across rulesets, so a checkpoint cannot warm-start \
-         across them. Rulesets compared: {witness:?}; layouts seen: {seen:?}"
+
+    for (extended, layouts) in &seen {
+        let kind = if *extended { "extended" } else { "base" };
+        assert_eq!(
+            layouts.len(),
+            1,
+            "the {kind} encoder layout differs across rulesets, so a checkpoint cannot \
+             warm-start across them. Rulesets compared: {:?}; layouts seen: {layouts:?}",
+            witness[extended]
+        );
+    }
+
+    // The base layout is the canonical one, stated as an equality rather than left implicit:
+    // this is the line that would fail if the reserve ever leaked into a ruleset that did not
+    // ask for it.
+    let canonical = GameConfig::default();
+    assert!(!canonical.extended_encoder());
+    if let Some(base) = seen.get(&false) {
+        assert_eq!(
+            base.iter().next().copied(),
+            Some((
+                obs_dim(&canonical),
+                action_dim(&canonical),
+                obs_layout_hash(&canonical),
+                action_layout_hash(&canonical),
+            )),
+            "the base layout is no longer the canonical one"
+        );
+    }
+
+    // Not vacuous in either direction: the registry has to hold at least one of each, or this
+    // test passes without having compared anything.
+    assert!(
+        seen.contains_key(&false) && seen.contains_key(&true),
+        "the registry needs at least one base ruleset and one reserve ruleset for this \
+         invariant to mean anything; saw {:?}",
+        witness
     );
 }

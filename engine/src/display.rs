@@ -795,6 +795,19 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             }
         ),
 
+        // Under `view_choose` the destination is a separate decision, so this node commits
+        // only to *which* card leaves the hand. Describing it as a bottoming here would name
+        // a destination the player has not picked yet.
+        Action::GiveBack { rank }
+            if state.config.power(Rank::TWO) == crate::powers::PowerId::TwoViewChoose =>
+        {
+            if entitled {
+                format!("BACK  give back {rank}")
+            } else {
+                "BACK  give back a card from hand".to_string()
+            }
+        }
+
         Action::GiveBack { rank } => match state.config.two_power {
             // §5: the identity of a card you bottom is private, so only its owner is told.
             crate::config::TwoPower::Bottom if entitled => {
@@ -819,6 +832,27 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
                 num(lane as u8, them, slot),
                 token(lane, them, slot as usize)
             )
+        }
+
+        // ------------------------------------------- the encoder reserve (§7) --
+        Action::ChooseLane { side, lane } => {
+            let whose = match side {
+                Side::Mine if entitled => "your",
+                Side::Mine => "their",
+                Side::Theirs if entitled => "their",
+                Side::Theirs => "your",
+            };
+            format!("LANE  choose {whose} lane {}", lane_label(lane))
+        }
+
+        // The option's *meaning* lives on the pending node, not in the action — one block
+        // serves every modal power, so this is the only place that can name it.
+        Action::ChooseOption { option } => {
+            let label = match state.pending.last() {
+                Some(Pending::ChooseOption { kind, .. }) => kind.label(option),
+                _ => "(no option node)",
+            };
+            format!("OPT   {label}")
         }
     }
 }

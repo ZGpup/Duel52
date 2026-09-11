@@ -104,6 +104,29 @@ pub enum Action {
     /// halves of the split land simultaneously and retaliate resolution has no ambiguous
     /// ordering.
     SplitTarget { slot: u8 },
+
+    // ------------------------------------------------------- the encoder reserve (§7) --
+    /// Pick a **lane**, on either side of the board.
+    ///
+    /// `MODULAR_RULES.md` §7, reserve item 2. Nothing in the canonical ruleset opens this;
+    /// it exists so that a power whose target is a lane rather than a card — "empower a lane
+    /// of your choice", "freeze a lane", "all cards in one enemy lane take 1" — is a Tier 2
+    /// change rather than a layout break.
+    ///
+    /// `side` is carried even though a given power usually wants only one of the two,
+    /// because the **legality mask is what restricts it**: a power that picks one of your own
+    /// lanes emits only `Side::Mine` and the other three logits are never legal, and a power
+    /// that picks an enemy lane emits only `Side::Theirs`. One block covers both, which is
+    /// why it is `2·L` wide rather than `L`.
+    ChooseLane { side: Side, lane: u8 },
+
+    /// Pick one of up to [`crate::encode::OPTION_COUNT`] unnamed, power-defined options.
+    ///
+    /// `MODULAR_RULES.md` §7, reserve item 2. The meaning of an option index belongs
+    /// entirely to the power that opened the node — the encoder deliberately knows nothing
+    /// about it, which is what makes one block serve every modal power. A power that offers
+    /// two choices makes two of the four legal and the rest are masked off.
+    ChooseOption { option: u8 },
 }
 
 impl Action {
@@ -150,6 +173,8 @@ impl fmt::Display for Action {
             }
             Action::GiveBack { rank } => write!(f, "give back {rank} from hand"),
             Action::SplitTarget { slot } => write!(f, "twinstrike second target: enemy slot {slot}"),
+            Action::ChooseLane { side, lane } => write!(f, "choose {side} lane {lane}"),
+            Action::ChooseOption { option } => write!(f, "choose option {option}"),
         }
     }
 }
@@ -174,6 +199,36 @@ pub enum Phase {
     SplitTarget,
     /// The game is over.
     Terminal,
+    /// A power is asking which lane to act on (`MODULAR_RULES.md` §7, reserve item 1+2).
+    ChooseLane,
+    /// A power is asking which of its options to take (§7, reserve item 1+2).
+    ChooseOption,
+}
+
+impl Phase {
+    /// Every phase, in [`crate::encode::phase_index`] order. The index of a phase in this
+    /// list **is** its one-hot position, so a phase added in the middle would move every
+    /// later one — append, never insert.
+    pub const ALL: &'static [Phase] = &[
+        Phase::Main,
+        Phase::Foresight,
+        Phase::ResolveOrder,
+        Phase::QueenSource,
+        Phase::GiveBack,
+        Phase::SplitTarget,
+        Phase::Terminal,
+        Phase::ChooseLane,
+        Phase::ChooseOption,
+    ];
+
+    /// True for the phases only an extended-encoder ruleset can reach.
+    ///
+    /// `MODULAR_RULES.md` §7: the base layout's `phase_onehot` is exactly seven wide, so a
+    /// ruleset that can enter one of these needs the wider one. [`crate::powers::PowerId`]
+    /// is where that is declared, and `engine/tests/reserve.rs` checks the two agree.
+    pub const fn needs_extended_encoder(self) -> bool {
+        matches!(self, Phase::ChooseLane | Phase::ChooseOption)
+    }
 }
 
 impl fmt::Display for Phase {
@@ -186,6 +241,8 @@ impl fmt::Display for Phase {
             Phase::GiveBack => "view (2): choose a card to give back",
             Phase::SplitTarget => "twinstrike (10): choose the second target",
             Phase::Terminal => "terminal",
+            Phase::ChooseLane => "choose a lane",
+            Phase::ChooseOption => "choose an option",
         };
         f.write_str(s)
     }

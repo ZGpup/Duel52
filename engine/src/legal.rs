@@ -13,7 +13,7 @@ use crate::action::{Action, Phase, Side};
 use crate::card::CardId;
 use crate::player::Player;
 use crate::rank::Rank;
-use crate::state::{GameState, Pending, ResolveKind};
+use crate::state::{GameState, LaneChoice, OptionChoice, Pending, ResolveKind};
 
 impl GameState {
     /// Every action the acting player may take right now.
@@ -42,6 +42,8 @@ impl GameState {
             Some(Pending::SplitTarget { lane, primary, .. }) => {
                 self.legal_split_targets(*lane, *primary)
             }
+            Some(Pending::ChooseLane { player, kind }) => self.legal_lane_choices(*player, *kind),
+            Some(Pending::ChooseOption { kind, .. }) => self.legal_options(*kind),
         }
     }
 
@@ -241,6 +243,42 @@ impl GameState {
         self.twinstrike_split_candidates(lane as usize, defender, primary_slot)
             .into_iter()
             .map(|slot| Action::SplitTarget { slot: slot as u8 })
+            .collect()
+    }
+
+    // ------------------------------------------------- the encoder reserve (§7) --
+
+    /// Which lanes a [`Pending::ChooseLane`] node will accept.
+    ///
+    /// `MODULAR_RULES.md` §7: the `CHOOSE_LANE` block is `2·L` wide — a lane on *either*
+    /// side — and **this is what narrows it**. A power that acts on one of your own lanes
+    /// emits only [`Side::Mine`], so the three `Theirs` logits are never legal and the mask
+    /// removes them; a power that targets an enemy lane would emit only `Theirs`. One block
+    /// therefore serves both shapes without either power being able to name a lane it has
+    /// no business naming.
+    fn legal_lane_choices(&self, player: Player, kind: LaneChoice) -> Vec<Action> {
+        match kind {
+            // A King reactivates *its owner's* cards, so only `Mine` is ever offered. A lane
+            // with nothing to reactivate is not offered either — an empty queue would be a
+            // choice with no consequence, and `game_rules.md` §8 fizzles a power with no
+            // legal target rather than making the player pick anyway.
+            LaneChoice::KingEmpower { king } => (0..self.config.lanes)
+                .filter(|&lane| !self.king_reactivation_targets(player, lane, king).is_empty())
+                .map(|lane| Action::ChooseLane {
+                    side: Side::Mine,
+                    lane: lane as u8,
+                })
+                .collect(),
+        }
+    }
+
+    /// Which options a [`Pending::ChooseOption`] node will accept: `0..kind.count()`.
+    ///
+    /// The remaining logits of the `CHOOSE_OPTION` block are masked off, the same way most
+    /// of `CHOOSE_SLOT` is masked off in any given position.
+    fn legal_options(&self, kind: OptionChoice) -> Vec<Action> {
+        (0..kind.count())
+            .map(|option| Action::ChooseOption { option })
             .collect()
     }
 

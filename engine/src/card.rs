@@ -99,7 +99,36 @@ pub struct Card {
     /// - Face-up → known to both.
     /// - A 4's Foresight sets the peeker's bit. That knowledge is private and persistent.
     pub known_to: u8,
+
+    /// The reserve's eight per-slot status flags, as a bitmask.
+    ///
+    /// `MODULAR_RULES.md` §7, reserve item 3. Nothing in the canonical ruleset sets a bit
+    /// here, so under canonical rules this field is always `0` and the encoder does not
+    /// emit it at all — see [`crate::config::GameConfig::extended_encoder`].
+    ///
+    /// **A status is public**, like `damage` and unlike `known_to`. That is not an
+    /// incidental choice: the observation has to be a function of the information set
+    /// (`phase3_observation_is_a_function_of_the_information_set`), so a flag that only one
+    /// player could see would have to be encoded per-observer, which the slot block has no
+    /// room for. Model a status as a token sitting on the card, visible to both players.
+    ///
+    /// Flags are claimed by name in `powers/` — see [`STATUS_SHIELDED`] — and a power
+    /// declares the ones it uses in [`crate::powers::PowerId::status_flags_used`].
+    pub status: u8,
 }
+
+/// Status flag 0 — **shielded**: the card ignores the next damage it would take, and the
+/// flag clears when it does.
+///
+/// Set by [`crate::powers::PowerId::SevenShieldAll`]. Read in `apply.rs`'s `apply_one_hit`,
+/// which is the single point every hit in the engine passes through.
+pub const STATUS_SHIELDED: u8 = 0;
+
+/// Flags the reserve provides. Eight, per `MODULAR_RULES.md` §7: they cost the same as four
+/// on the metric that matters (they are zero almost always, so they add nothing to the
+/// non-zero count the search path is proportional to), and a second layout break is
+/// expensive.
+pub const STATUS_FLAG_COUNT: usize = 8;
 
 impl Card {
     /// A card entering play from a hand: face-down, undamaged, known to its owner.
@@ -117,6 +146,7 @@ impl Card {
             attack_allowance: 1,
             pair_id: None,
             known_to: owner.bit(),
+            status: 0,
         }
     }
 
@@ -135,7 +165,27 @@ impl Card {
             attack_allowance: 1,
             pair_id: None,
             known_to: 0,
+            status: 0,
         }
+    }
+
+    /// Is status flag `flag` set? See [`Card::status`].
+    #[inline]
+    pub const fn has_status(&self, flag: u8) -> bool {
+        self.status & (1 << flag) != 0
+    }
+
+    /// Set status flag `flag`.
+    #[inline]
+    pub fn set_status(&mut self, flag: u8) {
+        debug_assert!((flag as usize) < STATUS_FLAG_COUNT, "status flag {flag} is outside the reserve's {STATUS_FLAG_COUNT}");
+        self.status |= 1 << flag;
+    }
+
+    /// Clear status flag `flag`.
+    #[inline]
+    pub fn clear_status(&mut self, flag: u8) {
+        self.status &= !(1 << flag);
     }
 
     /// Maximum hit points **right now**.

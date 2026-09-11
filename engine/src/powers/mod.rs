@@ -34,6 +34,7 @@
 //!    is the whole reason this is an enum, so do not add a `_ =>` arm to silence it.
 //! 5. Give it a named test in the rank's module, per `CLAUDE.md`.
 
+use crate::action::Phase;
 use crate::card::CardId;
 use crate::damage::DamageSource;
 use crate::player::Player;
@@ -98,6 +99,7 @@ pub enum PowerId {
     AceAction,
     // ---- 2 ----
     TwoView,
+    TwoViewChoose,
     // ---- 3 ----
     ThreeTrap,
     ThreeTrapVengeance1,
@@ -111,6 +113,7 @@ pub enum PowerId {
     SixFreeze,
     // ---- 7 ----
     SevenHealAll,
+    SevenShieldAll,
     // ---- 8 ----
     EightRetaliate,
     EightRetaliateOnSurvival,
@@ -125,6 +128,7 @@ pub enum PowerId {
     QueenMove,
     // ---- K ----
     KingEmpower,
+    KingEmpowerAnyLane,
 }
 
 impl PowerId {
@@ -132,6 +136,7 @@ impl PowerId {
     pub const ALL: &'static [PowerId] = &[
         PowerId::AceAction,
         PowerId::TwoView,
+        PowerId::TwoViewChoose,
         PowerId::ThreeTrap,
         PowerId::ThreeTrapVengeance1,
         PowerId::ThreeTrapVengeance2,
@@ -140,6 +145,7 @@ impl PowerId {
         PowerId::FiveFlip,
         PowerId::SixFreeze,
         PowerId::SevenHealAll,
+        PowerId::SevenShieldAll,
         PowerId::EightRetaliate,
         PowerId::EightRetaliateOnSurvival,
         PowerId::EightNone,
@@ -148,13 +154,14 @@ impl PowerId {
         PowerId::JackTaunt,
         PowerId::QueenMove,
         PowerId::KingEmpower,
+        PowerId::KingEmpowerAnyLane,
     ];
 
     /// The rank this power belongs to. A power is never legal on another rank.
     pub const fn rank(self) -> Rank {
         match self {
             PowerId::AceAction => Rank::ACE,
-            PowerId::TwoView => Rank::TWO,
+            PowerId::TwoView | PowerId::TwoViewChoose => Rank::TWO,
             PowerId::ThreeTrap
             | PowerId::ThreeTrapVengeance1
             | PowerId::ThreeTrapVengeance2
@@ -162,7 +169,7 @@ impl PowerId {
             PowerId::FourForesight => Rank::FOUR,
             PowerId::FiveFlip => Rank::FIVE,
             PowerId::SixFreeze => Rank::SIX,
-            PowerId::SevenHealAll => Rank::SEVEN,
+            PowerId::SevenHealAll | PowerId::SevenShieldAll => Rank::SEVEN,
             PowerId::EightRetaliate
             | PowerId::EightRetaliateOnSurvival
             | PowerId::EightNone => Rank::EIGHT,
@@ -170,7 +177,7 @@ impl PowerId {
             PowerId::TenTwinstrike => Rank::TEN,
             PowerId::JackTaunt => Rank::JACK,
             PowerId::QueenMove => Rank::QUEEN,
-            PowerId::KingEmpower => Rank::KING,
+            PowerId::KingEmpower | PowerId::KingEmpowerAnyLane => Rank::KING,
         }
     }
 
@@ -202,6 +209,7 @@ impl PowerId {
         match self {
             PowerId::AceAction => "action",
             PowerId::TwoView => "view",
+            PowerId::TwoViewChoose => "view_choose",
             PowerId::ThreeTrap => "trap",
             PowerId::ThreeTrapVengeance1 => "trap_vengeance_one_damage",
             PowerId::ThreeTrapVengeance2 => "trap_vengeance_two_damage",
@@ -210,6 +218,7 @@ impl PowerId {
             PowerId::FiveFlip => "flip",
             PowerId::SixFreeze => "freeze",
             PowerId::SevenHealAll => "heal_all",
+            PowerId::SevenShieldAll => "shield_all",
             PowerId::EightRetaliate => "retaliate",
             PowerId::EightRetaliateOnSurvival => "retaliate_on_survival",
             PowerId::EightNone => "none",
@@ -218,6 +227,7 @@ impl PowerId {
             PowerId::JackTaunt => "taunt",
             PowerId::QueenMove => "move",
             PowerId::KingEmpower => "empower",
+            PowerId::KingEmpowerAnyLane => "empower_any_lane",
         }
     }
 
@@ -245,6 +255,7 @@ impl PowerId {
         match self {
             PowerId::AceAction => "Action",
             PowerId::TwoView => "View",
+            PowerId::TwoViewChoose => "View (your choice)",
             PowerId::ThreeTrap => "Trap",
             PowerId::ThreeTrapVengeance1 | PowerId::ThreeTrapVengeance2 => "Trap + Vengeance",
             PowerId::ThreeNone | PowerId::EightNone => "(none)",
@@ -252,6 +263,7 @@ impl PowerId {
             PowerId::FiveFlip => "Flip",
             PowerId::SixFreeze => "Freeze",
             PowerId::SevenHealAll => "Heal All",
+            PowerId::SevenShieldAll => "Shield All",
             PowerId::EightRetaliate => "Retaliate",
             PowerId::EightRetaliateOnSurvival => "Retaliate (on survival)",
             PowerId::NineNimble => "Nimble",
@@ -259,6 +271,7 @@ impl PowerId {
             PowerId::JackTaunt => "Taunt",
             PowerId::QueenMove => "Move",
             PowerId::KingEmpower => "Empower",
+            PowerId::KingEmpowerAnyLane => "Empower (any lane)",
         }
     }
 
@@ -270,6 +283,9 @@ impl PowerId {
             }
             PowerId::TwoView => {
                 "one-shot: draw 1 from your pile, then put a card from hand on the bottom"
+            }
+            PowerId::TwoViewChoose => {
+                "one-shot: draw 1, then give a card back — you choose bottom or discard"
             }
             PowerId::ThreeTrap => {
                 "if killed while FACE-DOWN, returns face-up at full HP in the same lane"
@@ -291,6 +307,9 @@ impl PowerId {
                 "one-shot: freeze enemy cards in this lane for one of their turns (not 9s)"
             }
             PowerId::SevenHealAll => "one-shot: heal all your damaged cards, in every lane",
+            PowerId::SevenShieldAll => {
+                "one-shot: shield all your cards — each ignores the next damage it takes"
+            }
             PowerId::EightRetaliate => {
                 "constant: any card that attacks this 8 takes damage (a 9 does not)"
             }
@@ -307,6 +326,9 @@ impl PowerId {
             PowerId::KingEmpower => {
                 "one-shot: all your other face-up cards in this lane refire their powers"
             }
+            PowerId::KingEmpowerAnyLane => {
+                "one-shot: choose one of your lanes; its face-up cards refire their powers"
+            }
         }
     }
 
@@ -321,12 +343,15 @@ impl PowerId {
             self,
             PowerId::AceAction
                 | PowerId::TwoView
+                | PowerId::TwoViewChoose
                 | PowerId::FourForesight
                 | PowerId::FiveFlip
                 | PowerId::SixFreeze
                 | PowerId::SevenHealAll
+                | PowerId::SevenShieldAll
                 | PowerId::QueenMove
                 | PowerId::KingEmpower
+                | PowerId::KingEmpowerAnyLane
         )
     }
 
@@ -351,7 +376,77 @@ impl PowerId {
     /// of `fires_on_flip` rather than being a second list to keep in sync — the King is the
     /// one hand-written exclusion, because it fires on flip and is still excluded.
     pub const fn is_king_reactivatable(self) -> bool {
-        self.fires_on_flip() && !matches!(self, PowerId::KingEmpower)
+        self.fires_on_flip() && !matches!(self, PowerId::KingEmpower | PowerId::KingEmpowerAnyLane)
+    }
+
+    /// True when this power needs the **extended encoder layout** — `MODULAR_RULES.md` §7's
+    /// reserve.
+    ///
+    /// This is the single declaration the whole gate reads. [`crate::config::GameConfig::
+    /// extended_encoder`] is `powers.iter().any(needs_extended_encoder)`, and every layout
+    /// width in [`crate::encode`] keys off that, so a ruleset made only of powers that
+    /// answer `false` here encodes **byte-identically to the pre-reserve build** and every
+    /// checkpoint trained before the reserve still loads.
+    ///
+    /// ⚠️ **Forgetting this on a new power is the one silent failure in the reserve.** A
+    /// power that writes a status flag while the config says `false` writes into a feature
+    /// the tensor does not have — in release builds, past the end of the slot. So it is
+    /// checked from three directions rather than trusted:
+    /// `reserve_declaration_matches_what_each_power_uses` walks every variant, the slot
+    /// writer asserts its own width, and `Phase::needs_extended_encoder` has to agree with
+    /// the phase each power can actually open.
+    pub const fn needs_extended_encoder(self) -> bool {
+        match self {
+            // Opens `Phase::ChooseOption` — a phase index past the base one-hot.
+            PowerId::TwoViewChoose => true,
+            // Writes a per-slot status flag.
+            PowerId::SevenShieldAll => true,
+            // Opens `Phase::ChooseLane`, and logits in the `CHOOSE_LANE` block.
+            PowerId::KingEmpowerAnyLane => true,
+
+            PowerId::AceAction
+            | PowerId::TwoView
+            | PowerId::ThreeTrap
+            | PowerId::ThreeTrapVengeance1
+            | PowerId::ThreeTrapVengeance2
+            | PowerId::ThreeNone
+            | PowerId::FourForesight
+            | PowerId::FiveFlip
+            | PowerId::SixFreeze
+            | PowerId::SevenHealAll
+            | PowerId::EightRetaliate
+            | PowerId::EightRetaliateOnSurvival
+            | PowerId::EightNone
+            | PowerId::NineNimble
+            | PowerId::TenTwinstrike
+            | PowerId::JackTaunt
+            | PowerId::QueenMove
+            | PowerId::KingEmpower => false,
+        }
+    }
+
+    /// The phases this power can put on the pending stack.
+    ///
+    /// Only the reserve phases are listed — this exists to cross-check
+    /// [`PowerId::needs_extended_encoder`] against what the power actually opens, not to be a
+    /// second copy of the pending machinery.
+    pub const fn opens_phases(self) -> &'static [Phase] {
+        match self {
+            PowerId::TwoViewChoose => &[Phase::ChooseOption],
+            PowerId::KingEmpowerAnyLane => &[Phase::ChooseLane],
+            _ => &[],
+        }
+    }
+
+    /// Per-slot status flags this power sets. Indices into the reserve's eight flags.
+    ///
+    /// Like [`PowerId::opens_phases`], this exists so the declaration above can be checked
+    /// rather than trusted, and so `duel52 powers` can say which flag a variant claims.
+    pub const fn status_flags_used(self) -> &'static [u8] {
+        match self {
+            PowerId::SevenShieldAll => &[crate::card::STATUS_SHIELDED],
+            _ => &[],
+        }
     }
 
     /// When this power hits back at whatever attacked it.
@@ -407,12 +502,15 @@ pub(crate) fn on_flip(state: &mut GameState, power: PowerId, ctx: PowerCtx) {
     match power {
         PowerId::AceAction => ace::action(state, ctx),
         PowerId::TwoView => two::view(state, ctx),
+        PowerId::TwoViewChoose => two::view_choose(state, ctx),
         PowerId::FourForesight => four::foresight(state, ctx),
         PowerId::FiveFlip => five::flip_lane(state, ctx),
         PowerId::SixFreeze => six::freeze(state, ctx),
         PowerId::SevenHealAll => seven::heal_all(state, ctx),
+        PowerId::SevenShieldAll => seven::shield_all(state, ctx),
         PowerId::QueenMove => queen::mv(state, ctx),
         PowerId::KingEmpower => king::empower(state, ctx),
+        PowerId::KingEmpowerAnyLane => king::empower_any_lane(state, ctx),
 
         // Conditional and constant powers do nothing at the moment of the flip.
         PowerId::ThreeTrap
@@ -447,10 +545,12 @@ pub(crate) fn on_lethal_damage(
         PowerId::ThreeNone
         | PowerId::AceAction
         | PowerId::TwoView
+        | PowerId::TwoViewChoose
         | PowerId::FourForesight
         | PowerId::FiveFlip
         | PowerId::SixFreeze
         | PowerId::SevenHealAll
+        | PowerId::SevenShieldAll
         | PowerId::EightRetaliate
         | PowerId::EightRetaliateOnSurvival
         | PowerId::EightNone
@@ -458,7 +558,8 @@ pub(crate) fn on_lethal_damage(
         | PowerId::TenTwinstrike
         | PowerId::JackTaunt
         | PowerId::QueenMove
-        | PowerId::KingEmpower => LethalOutcome::Die,
+        | PowerId::KingEmpower
+        | PowerId::KingEmpowerAnyLane => LethalOutcome::Die,
     }
 }
 

@@ -90,13 +90,15 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 398 tests: rules, determinism, information hiding,
+cargo test                               # 417 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, the
                                          # training corpus, the modded power variants, the
-                                         # cross-ruleset invariant suite, and the analysis
+                                         # cross-ruleset invariant suite, the encoder reserve
+                                         # and its checkpoint bridge, and the analysis
                                          # corpus's per-card log
-.venv/bin/python -m pytest py/tests -q   # 118 tests, including the analysis reader and the
-                                         # deal-clustered intervals every table carries
+.venv/bin/python -m pytest py/tests -q   # 129 tests, including the analysis reader, the
+                                         # deal-clustered intervals every table carries, and
+                                         # the proof that `nn widen` preserves the function
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
@@ -168,10 +170,23 @@ cargo test --test rules_mods                               # the named tests for
 # rank has an unseen copy left). The tool detects the thin sample and refuses to print.
 
 # A rules experiment is a 3-hour warm start, not a 24-hour run, because the encoder is
-# rank-agnostic and no ruleset moves a layout hash.
+# rank-agnostic and almost no ruleset moves a layout hash.
 .venv/bin/python -m duel52.train check --config configs/train-mod-3h.toml
 .venv/bin/python -m duel52.train run --config configs/train-mod-3h.toml \
     --run-dir runs/mod-three-vengeance --init-from models/duel52-split-lane-gen032.d52nn
+
+# ⚠️ **Three rulesets DO move it** — `seven-shield`, `king-any-lane` and `two-choose`, which
+# claim the **encoder reserve** (`MODULAR_RULES.md` §7): a per-card status flag, a new kind of
+# sub-decision, or a lane/option target. They share ONE extended layout between them, so the
+# break is paid once however many more arrive. `duel52 config <file>` prints
+# `reserve status_flags=8 phases=5` for those and nothing for the others.
+#
+# No shipped checkpoint plays them, and `--init-from` refuses one by name and number. `widen`
+# carries a base-layout checkpoint across exactly — every trained weight keeps its meaning and
+# the added rows are zero — so a reserve ruleset is still a 3-hour warm start.
+.venv/bin/python -m duel52.nn widen \
+    --in models/duel52-split-lane-gen032.d52nn --out models/lane-gen032-wide.d52nn \
+    --rules-file configs/rules/seven-shield.toml --encoding-slots 21
 
 # Rating agents. Budgets are part of the agent name, so a result row names the agent that
 # produced it: random · greedy · flatmc:600 · pimc:32x1 · ismcts:800.
@@ -525,6 +540,11 @@ There is **no `PASS` block**, and every logit is therefore something a player ch
 what makes a policy target a distribution over choices rather than a mixture of choices and
 bookkeeping.
 
+A ruleset that claims the **encoder reserve** (`MODULAR_RULES.md` §7) appends two more blocks
+— `CHOOSE_LANE(side, lane)` at `2·L` and `CHOOSE_OPTION(k)` at 4 — for 1334 at `S = 16`.
+Appended, never inserted, which is what keeps the base head an exact prefix of the extended
+one and makes `nn widen` a scatter rather than a re-derivation.
+
 **Observation encoding: 3300 floats per observer** at the default config, dominated by the
 board tensor of `3 lanes × 2 sides × 16 slots × 33 features = 3168`. Sides are ordered
 `[observer, opponent]`, so the tensor is always from the observer's point of view and the
@@ -574,6 +594,8 @@ clock evaluating itself. `configs/train-12h.toml` targets 55–60% and says how 
 | `MOVE` | A Queen's Move: pull an allied card from another lane into hers |
 | `PEEK` | A 4's Foresight: look privately at one face-down card, either side's |
 | `BACK` | A 2's View: bottom a card from hand (house rule) or discard it, per `two_power` |
+| `LANE` | Choose a lane. Reserve rulesets only (`MODULAR_RULES.md` §7) |
+| `OPT` | Choose one of a power's options. Reserve rulesets only |
 
 Numbering (`#1`, `#2`, …) is `display.rs`'s `column_slots` order, the same order the board
 draws a column in and the same order the CLI menus use. It is the one place in the codebase
@@ -640,14 +662,32 @@ Three structural points that are easy to undo by accident:
   `rank == Rank::EIGHT` in `state.rs` or `apply.rs` is a bug: it silently ignores the ruleset.
 
 - **`rules_hash` is not `obs_layout_hash`, and the difference is the point.** The encoder is
-  rank-agnostic, so **no ruleset moves a layout hash** — that is what lets `--init-from`
-  warm-start a rules experiment from the current champion and turns 24 hours into 3
-  (`engine/tests/rulesets.rs::no_ruleset_moves_the_encoder_layout` asserts it). It also means
-  a shard or checkpoint from another ruleset is *indistinguishable on shape alone*, which is
-  why `rules_hash` exists. It is checked where a cross-ruleset number would be read as a
-  result — `Shard::read`, `ladder`, `match`, `probe`, `card-value`, and the Python replay
-  buffer — and deliberately **not** in `Weights::load`, because generation 1 of every
-  warm-started run is legitimately cross-ruleset. `MODULAR_RULES.md` §6.
+  rank-agnostic, so **changing what a card does moves no layout hash** — that is what lets
+  `--init-from` warm-start a rules experiment from the current champion and turns 24 hours
+  into 3. It also means a shard or checkpoint from another ruleset is *indistinguishable on
+  shape alone*, which is why `rules_hash` exists. It is checked where a cross-ruleset number
+  would be read as a result — `Shard::read`, `ladder`, `match`, `probe`, `card-value`, and the
+  Python replay buffer — and deliberately **not** in `Weights::load`, because generation 1 of
+  every warm-started run is legitimately cross-ruleset. `MODULAR_RULES.md` §6.
+
+- **There are exactly two encoder layouts, and which one a ruleset gets is derived from its
+  powers.** `GameConfig::extended_encoder()` is true when some installed power claims the
+  **encoder reserve** (`MODULAR_RULES.md` §7): a per-card status flag, one of the five spare
+  `phase_onehot` positions, or the `CHOOSE_LANE` / `CHOOSE_OPTION` policy blocks. Everything
+  the reserve adds keys off that one predicate, so:
+  - **the canonical layout is byte-identical to the pre-reserve build** — `obs b1355a841a1fdc4a`
+    at 21 slots, the value in all six checkpoint headers in `models/`, so nothing that exists
+    today stops working;
+  - **every reserve ruleset shares one extended layout**, so the break is paid once however
+    many arrive (4290 → 5303, 2194 → 2204 at 21 slots).
+
+  `engine/tests/rulesets.rs::no_ruleset_moves_the_encoder_layout` asserts both halves, and
+  fails if the registry ever holds only one kind — an invariant that compares nothing is worse
+  than none. ⚠️ It is **derived, never a config key**: a ruleset that installed a flag-using
+  power but forgot to set a key would write a status nobody encodes, and the network would
+  simply never learn the mechanic. `reserve_declaration_matches_what_each_power_uses` is what
+  makes that unrepresentable — it requires each power's `needs_extended_encoder()` to be an
+  `==` with what the power actually uses, not merely to imply it.
 
 - **There is exactly one encoder, and it is in Rust.** `engine/src/encode.rs` owns the
   feature layout; Python reaches it through `Game.encode_observation()` and gets its

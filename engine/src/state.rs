@@ -169,6 +169,54 @@ pub enum Pending {
         attackers: Vec<CardId>,
         primary: CardId,
     },
+
+    // --------------------------------------------------- the encoder reserve (§7) --
+    /// A power is waiting for a lane. `MODULAR_RULES.md` §7, reserve item 2.
+    ChooseLane { player: Player, kind: LaneChoice },
+    /// A power is waiting for one of its options. §7, reserve item 2.
+    ChooseOption { player: Player, kind: OptionChoice },
+}
+
+/// What a [`Pending::ChooseLane`] node is choosing a lane *for*.
+///
+/// The encoder knows only "a lane, on one of the two sides"; this is where the meaning
+/// lives, so one action block serves every lane-targeting power.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LaneChoice {
+    /// [`crate::powers::PowerId::KingEmpowerAnyLane`] is choosing which of its owner's lanes
+    /// to reactivate. The King itself is excluded from the queue, so it is carried here.
+    KingEmpower { king: CardId },
+}
+
+/// What a [`Pending::ChooseOption`] node is choosing between.
+///
+/// The option *indices* are the power's business — see [`crate::action::Action::ChooseOption`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OptionChoice {
+    /// [`crate::powers::PowerId::TwoViewChoose`] is asking where the card already taken out
+    /// of hand should go: option 0 is the bottom of the draw pile, option 1 the discard.
+    GiveBackDestination { rank: Rank },
+}
+
+impl OptionChoice {
+    /// How many options this node offers. Never more than [`crate::encode::OPTION_COUNT`];
+    /// the rest of the block is masked off.
+    pub const fn count(self) -> u8 {
+        match self {
+            OptionChoice::GiveBackDestination { .. } => 2,
+        }
+    }
+
+    /// What option `i` means, for the CLI and for `replay`.
+    pub const fn label(self, option: u8) -> &'static str {
+        match self {
+            OptionChoice::GiveBackDestination { .. } => match option {
+                0 => "bottom of your draw pile",
+                1 => "discard pile",
+                _ => "(no such option)",
+            },
+        }
+    }
 }
 
 impl Pending {
@@ -180,7 +228,9 @@ impl Pending {
             | Pending::ResolveOrder { player, .. }
             | Pending::QueenSource { player, .. }
             | Pending::GiveBack { player }
-            | Pending::SplitTarget { player, .. } => *player,
+            | Pending::SplitTarget { player, .. }
+            | Pending::ChooseLane { player, .. }
+            | Pending::ChooseOption { player, .. } => *player,
         }
     }
 
@@ -191,6 +241,8 @@ impl Pending {
             Pending::QueenSource { .. } => Phase::QueenSource,
             Pending::GiveBack { .. } => Phase::GiveBack,
             Pending::SplitTarget { .. } => Phase::SplitTarget,
+            Pending::ChooseLane { .. } => Phase::ChooseLane,
+            Pending::ChooseOption { .. } => Phase::ChooseOption,
         }
     }
 }

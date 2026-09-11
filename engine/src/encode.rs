@@ -53,11 +53,16 @@ use crate::state::{GameState, Pending};
 
 // ===================================================================== the board block ==
 
-/// Per-slot features, in encoding order. The length of this list is [`SLOT_FEATURES`].
+/// Per-slot features of the **base** layout, in encoding order.
 ///
 /// Kept as names rather than as a bare count because [`obs_layout_hash`] hashes them: a
 /// reordering that left the width unchanged would otherwise be invisible to the checkpoint
 /// check, and it is exactly the kind of edit that silently breaks a trained network.
+///
+/// ⚠️ The reserve's status flags are **appended** to this list rather than inserted into it
+/// (see [`RESERVE_SLOT_FEATURE_NAMES`]). That is what makes a base slot a prefix of an
+/// extended one, which is in turn what makes [`reserve_embedding`] a monotonic map and the
+/// checkpoint bridge obviously correct. Do not insert a feature in the middle.
 pub const SLOT_FEATURE_NAMES: &[&str] = &[
     "occupied",
     "rank_onehot",       // R wide; all zero when the observer may not know the rank
@@ -74,6 +79,27 @@ pub const SLOT_FEATURE_NAMES: &[&str] = &[
     "paired",            //
     "is_mine",           //
 ];
+
+/// The reserve's per-slot status flags, appended to [`SLOT_FEATURE_NAMES`] in the extended
+/// layout. `MODULAR_RULES.md` §7, reserve item 3.
+///
+/// Unnamed on purpose. A flag's *meaning* belongs to the power that claims it
+/// ([`crate::card::STATUS_SHIELDED`] is flag 0), and naming them here would make every new
+/// status a change to the layout string — which is a hash move, which is the break the
+/// reserve exists to avoid. So the encoder knows only that there are eight bits.
+pub const RESERVE_SLOT_FEATURE_NAMES: &[&str] = &[
+    "status_0", "status_1", "status_2", "status_3", "status_4", "status_5", "status_6",
+    "status_7",
+];
+
+/// Per-slot feature names for this ruleset, base or extended.
+pub fn slot_feature_names(config: &GameConfig) -> Vec<&'static str> {
+    let mut names = SLOT_FEATURE_NAMES.to_vec();
+    if config.extended_encoder() {
+        names.extend_from_slice(RESERVE_SLOT_FEATURE_NAMES);
+    }
+    names
+}
 
 /// Damage one-hot width. A card in play always satisfies `damage < max_hp`, and the largest
 /// max HP is a face-up Jack's 3 (`game_rules.md` §5), so 0–2 is the whole live range. The
@@ -95,18 +121,54 @@ pub const ALLOWANCE_BUCKETS: usize = 4;
 /// not bounded by config — hence "3 or more" rather than an assertion.
 pub const ACTIONS_BUCKETS: usize = 4;
 
-/// Phase one-hot width — every variant of [`Phase`], `Terminal` included.
-pub const PHASE_COUNT: usize = 7;
+/// Phase one-hot width in the **base** layout — the seven phases the canonical ruleset can
+/// reach, `Terminal` included.
+pub const BASE_PHASE_COUNT: usize = 7;
 
-/// Floats per slot, for a given rank count.
+/// Phase one-hot width in the **extended** layout: `MODULAR_RULES.md` §7's reserve item 1.
+///
+/// Twelve rather than nine. Two of the spare five are used — [`Phase::ChooseLane`] and
+/// [`Phase::ChooseOption`] — and three are unclaimed, because §1c found that `PHASE_COUNT`
+/// is the constraint that actually binds when a new *kind* of sub-decision is added, and
+/// five floats of 4,290 is the cheapest structural option in the codebase. A phase that
+/// nothing reaches is simply a one-hot position never written.
+pub const EXTENDED_PHASE_COUNT: usize = 12;
+
+/// Number of unnamed options the `CHOOSE_OPTION` policy block offers a modal power.
+///
+/// Four. The meaning of an option index is the power's business, not the encoder's — see
+/// [`Action::ChooseOption`].
+pub const OPTION_COUNT: usize = 4;
+
+/// Phase one-hot width for this ruleset.
 #[inline]
-pub const fn slot_features(config: &GameConfig) -> usize {
+pub const fn phase_count(config: &GameConfig) -> usize {
+    if config.extended_encoder() {
+        EXTENDED_PHASE_COUNT
+    } else {
+        BASE_PHASE_COUNT
+    }
+}
+
+/// Floats per slot in the **base** layout, for a given rank count. 33 at 13 ranks.
+#[inline]
+pub const fn base_slot_features(config: &GameConfig) -> usize {
     // occupied + rank one-hot + rank_unknown + face_up + is_base + entered_as_base
     1 + config.rank_count() + 1 + 1 + 1 + 1
         // damage + max HP + frozen + allowance + attacks_used_frac + can_attack_now
         + DAMAGE_BUCKETS + MAX_HP_BUCKETS + 1 + ALLOWANCE_BUCKETS + 1 + 1
         // paired + is_mine
         + 1 + 1
+}
+
+/// Floats per slot for this ruleset: 33 at 13 ranks, or 41 with the reserve's status flags.
+#[inline]
+pub const fn slot_features(config: &GameConfig) -> usize {
+    if config.extended_encoder() {
+        base_slot_features(config) + crate::card::STATUS_FLAG_COUNT
+    } else {
+        base_slot_features(config)
+    }
 }
 
 /// Floats in the board block: `lanes × 2 sides × encoding_slots × slot_features`.
@@ -125,7 +187,7 @@ pub const fn board_len(config: &GameConfig) -> usize {
 pub fn scalar_fields(config: &GameConfig) -> Vec<(&'static str, usize)> {
     let r = config.rank_count();
     vec![
-        ("phase_onehot", PHASE_COUNT),
+        ("phase_onehot", phase_count(config)),
         ("actions_remaining_onehot", ACTIONS_BUCKETS),
         ("is_mine_to_move", 1),
         ("ply_frac", 1),
@@ -246,7 +308,7 @@ pub fn encode_observation(state: &GameState, observer: Player, out: &mut [f32]) 
     // ----------------------------------------------------------------- the scalars --
     let mut w = Writer::new(&mut out[board_len(config)..]);
 
-    w.one_hot(phase_index(state.phase()), PHASE_COUNT);
+    w.one_hot(phase_index(state.phase()), phase_count(config));
     w.one_hot(
         (state.actions_remaining as usize).min(ACTIONS_BUCKETS - 1),
         ACTIONS_BUCKETS,
@@ -385,6 +447,18 @@ fn encode_slot(state: &GameState, observer: Player, card: &Card, mine: bool, out
     w.bit(card.pair_id.is_some());
     w.bit(mine);
 
+    // The reserve's status flags (`MODULAR_RULES.md` §7). Appended after every base feature,
+    // so a base slot is a prefix of an extended one — see [`reserve_embedding`].
+    //
+    // A status is **public**, like damage: both players see the token on the card. That is
+    // what lets it be written here rather than per-observer, and it is asserted by
+    // `phase3_observation_is_a_function_of_the_information_set` like everything else.
+    if state.config.extended_encoder() {
+        for flag in 0..crate::card::STATUS_FLAG_COUNT {
+            w.bit(card.has_status(flag as u8));
+        }
+    }
+
     debug_assert_eq!(w.written(), slot_features(&state.config));
 }
 
@@ -460,6 +534,12 @@ const fn phase_index(phase: Phase) -> usize {
         Phase::GiveBack => 4,
         Phase::SplitTarget => 5,
         Phase::Terminal => 6,
+        // The reserve's phases (`MODULAR_RULES.md` §7). These indices exist only in the
+        // extended layout — `phase_count` is 7 under canonical rules, and no canonical
+        // ruleset can reach either phase, which `reserve_phases_need_the_extended_encoder`
+        // asserts by walking every power.
+        Phase::ChooseLane => 7,
+        Phase::ChooseOption => 8,
     }
 }
 
@@ -502,7 +582,7 @@ pub fn action_blocks(config: &GameConfig) -> Vec<ActionBlock> {
     let l = config.lanes;
     let s = config.encoding_slots;
     let r = config.rank_count();
-    let sizes = [
+    let mut sizes = vec![
         ("PLAY", r * l),
         ("FLIP", l * s),
         ("ATTACK", l * s * s),
@@ -510,6 +590,16 @@ pub fn action_blocks(config: &GameConfig) -> Vec<ActionBlock> {
         ("CHOOSE_SLOT", 2 * l * s),
         ("CHOOSE_RANK", r),
     ];
+    // `MODULAR_RULES.md` §7's reserve, item 2. **Appended**, not inserted: that keeps the
+    // base policy head an exact prefix of the extended one, so [`reserve_embedding`]'s
+    // action map is the identity and a widened checkpoint's existing logits do not move.
+    // The price is that `global_action` in [`lane_structure`] stops being one contiguous
+    // range — `CHOOSE_LANE` is lane-owned and sits past `CHOOSE_RANK`, which is global — and
+    // that is paid there, once, behind `assert_partitions`.
+    if config.extended_encoder() {
+        sizes.push(("CHOOSE_LANE", 2 * l));
+        sizes.push(("CHOOSE_OPTION", OPTION_COUNT));
+    }
     let mut offset = 0;
     sizes
         .into_iter()
@@ -542,12 +632,17 @@ struct Offsets {
     pair: usize,
     choose_slot: usize,
     choose_rank: usize,
+    /// First index of `CHOOSE_LANE`, or `None` in the base layout. `MODULAR_RULES.md` §7.
+    choose_lane: Option<usize>,
+    /// First index of `CHOOSE_OPTION`, or `None` in the base layout.
+    choose_option: Option<usize>,
     total: usize,
 }
 
 impl Offsets {
     fn new(config: &GameConfig) -> Offsets {
         let b = action_blocks(config);
+        let last = b.last().expect("the policy head always has blocks");
         Offsets {
             lanes: config.lanes,
             slots: config.encoding_slots,
@@ -557,8 +652,24 @@ impl Offsets {
             pair: b[3].offset,
             choose_slot: b[4].offset,
             choose_rank: b[5].offset,
-            total: b[5].offset + b[5].len,
+            choose_lane: b.get(6).map(|x| x.offset),
+            choose_option: b.get(7).map(|x| x.offset),
+            total: last.offset + last.len,
         }
+    }
+
+    /// Index of `CHOOSE_LANE(side, lane)`. Lane-major within each side, so a lane
+    /// relabelling is [`relabel_lane_major`] with a stride of one.
+    fn choose_lane(&self, side: Side, lane: usize) -> usize {
+        let base = self.choose_lane.expect(
+            "a ChooseLane action needs the extended encoder — the ruleset installed a power \
+             that opens Phase::ChooseLane but PowerId::needs_extended_encoder said false",
+        );
+        let s = match side {
+            Side::Mine => 0,
+            Side::Theirs => 1,
+        };
+        base + s * self.lanes + lane
     }
 
     /// Index of the unordered pair `{a, b}` within one lane, for `a < b`.
@@ -690,6 +801,23 @@ pub fn encode_action(action: &Action, state: &GameState) -> usize {
             let (lane, slot) = checked(config, lane, slot as usize, "split target");
             o.choose_slot(Side::Theirs, lane, slot)
         }
+        Action::ChooseLane { side, lane } => {
+            let lane = lane as usize;
+            assert!(lane < o.lanes, "choose lane: lane {lane} is out of range");
+            o.choose_lane(side, lane)
+        }
+        Action::ChooseOption { option } => {
+            let base = o.choose_option.expect(
+                "a ChooseOption action needs the extended encoder — the ruleset installed a \
+                 power that opens Phase::ChooseOption but PowerId::needs_extended_encoder \
+                 said false",
+            );
+            assert!(
+                (option as usize) < OPTION_COUNT,
+                "choose option: option {option} is at or over the reserve's {OPTION_COUNT}"
+            );
+            base + option as usize
+        }
     }
 }
 
@@ -774,9 +902,34 @@ pub fn decode_action(index: usize, state: &GameState) -> Option<Action> {
             _ => None,
         };
     }
-    let i = index - o.choose_rank;
-    Some(Action::GiveBack {
-        rank: Rank::try_from_index(i)?,
+    // `CHOOSE_RANK` is the last base block, so in the base layout everything from here on is
+    // a give-back. In the extended layout the two reserve blocks follow it.
+    let choose_lane = o.choose_lane.unwrap_or(o.total);
+    if index < choose_lane {
+        let i = index - o.choose_rank;
+        return Some(Action::GiveBack {
+            rank: Rank::try_from_index(i)?,
+        });
+    }
+
+    // Like `CHOOSE_SLOT`, the reserve blocks are disambiguated by the phase, and decode to
+    // nothing outside it rather than to an action nobody can take.
+    let choose_option = o.choose_option.unwrap_or(o.total);
+    if index < choose_option {
+        if state.phase() != Phase::ChooseLane {
+            return None;
+        }
+        let i = index - choose_lane;
+        return Some(Action::ChooseLane {
+            side: if i / o.lanes == 0 { Side::Mine } else { Side::Theirs },
+            lane: (i % o.lanes) as u8,
+        });
+    }
+    if state.phase() != Phase::ChooseOption {
+        return None;
+    }
+    Some(Action::ChooseOption {
+        option: (index - choose_option) as u8,
     })
 }
 
@@ -927,7 +1080,20 @@ fn action_permutation(config: &GameConfig, sigma: &[usize]) -> Vec<u32> {
     for side in 0..2 {
         relabel_lane_major(&mut map, o.choose_slot + side * l * s, s, l, sigma);
     }
-    // `CHOOSE_RANK` names no lane.
+    // `CHOOSE_LANE` is `side * lanes + lane` — lane-major per side with a stride of one.
+    //
+    // ⚠️ Omitting this block would be **silent**. A permutation that left it fixed is still a
+    // bijection, so `lane_permutations_are_bijections_with_the_identity_first` would pass and
+    // the tables would still compose as S₃; the only thing that would break is the meaning,
+    // and the symptom would be an agent that is merely bad. The guard is
+    // `phase4_lane_permutation_commutes_with_the_encoder`, which checks against
+    // `encode_action` itself rather than against a second reading of the layout.
+    if let Some(base) = o.choose_lane {
+        for side in 0..2 {
+            relabel_lane_major(&mut map, base + side * l, 1, l, sigma);
+        }
+    }
+    // `CHOOSE_RANK` and `CHOOSE_OPTION` name no lane.
     map
 }
 
@@ -948,12 +1114,23 @@ pub fn global_obs_len(config: &GameConfig) -> usize {
 pub fn lane_action_len(config: &GameConfig) -> usize {
     let s = config.encoding_slots;
     // PLAY(·, lane) + FLIP + ATTACK + PAIR + CHOOSE_SLOT on both sides.
-    config.rank_count() + s + s * s + pairs_per_lane(s) + 2 * s
+    let base = config.rank_count() + s + s * s + pairs_per_lane(s) + 2 * s;
+    // …and `CHOOSE_LANE(side, lane)`, two per lane, when the reserve is on.
+    if config.extended_encoder() {
+        base + 2
+    } else {
+        base
+    }
 }
 
-/// Logits of the policy head that name no lane: `CHOOSE_RANK`.
+/// Logits of the policy head that name no lane: `CHOOSE_RANK`, and `CHOOSE_OPTION` when the
+/// reserve is on.
 pub fn global_action_len(config: &GameConfig) -> usize {
-    config.rank_count()
+    if config.extended_encoder() {
+        config.rank_count() + OPTION_COUNT
+    } else {
+        config.rank_count()
+    }
 }
 
 /// The lane-structured partition of the observation and policy vectors.
@@ -1033,11 +1210,27 @@ pub fn lane_structure(config: &GameConfig) -> LaneStructure {
                 let base = o.choose_slot + (side * l + lane) * s;
                 idx.extend((0..s).map(|slot| (base + slot) as u32));
             }
+            // CHOOSE_LANE is `side * lanes + lane`: one logit per side per lane, and the
+            // logit that *names* lane `l` is owned by lane `l`.
+            if let Some(base) = o.choose_lane {
+                idx.extend((0..2).map(|side| (base + side * l + lane) as u32));
+            }
             idx
         })
         .collect();
 
-    let global_action: Vec<u32> = (o.choose_rank..o.total).map(|i| i as u32).collect();
+    // `CHOOSE_RANK` plus, in the extended layout, `CHOOSE_OPTION`. Not one range: the
+    // reserve appends `CHOOSE_LANE` between them and that block is lane-owned, so this is a
+    // filter over the tail rather than the `o.choose_rank..o.total` it is in the base
+    // layout. `assert_partitions` below is what makes getting this wrong a build failure.
+    let claimed_lanes: Vec<usize> = match o.choose_lane {
+        Some(base) => (base..base + 2 * l).collect(),
+        None => Vec::new(),
+    };
+    let global_action: Vec<u32> = (o.choose_rank..o.total)
+        .filter(|i| !claimed_lanes.contains(i))
+        .map(|i| i as u32)
+        .collect();
 
     let structure = LaneStructure { lane_obs, global_obs, lane_action, global_action };
     structure.assert_partitions(config);
@@ -1098,7 +1291,7 @@ pub fn obs_layout_string(config: &GameConfig) -> String {
         config.encoding_slots,
         slot_features(config)
     ));
-    for name in SLOT_FEATURE_NAMES {
+    for name in slot_feature_names(config) {
         s.push_str(&format!("slot {name}\n"));
     }
     s.push_str(&format!(
@@ -1108,8 +1301,19 @@ pub fn obs_layout_string(config: &GameConfig) -> String {
         MAX_HP_BUCKETS,
         ALLOWANCE_BUCKETS,
         ACTIONS_BUCKETS,
-        PHASE_COUNT
+        phase_count(config)
     ));
+    // Written only in the extended layout, so the base string stays **byte-identical** to
+    // the pre-reserve build and every checkpoint in `models/` still loads. It is here so
+    // that `duel52 config` on a reserve ruleset says so in words rather than leaving a
+    // reader to infer it from the widths.
+    if config.extended_encoder() {
+        s.push_str(&format!(
+            "reserve status_flags={} phases={}\n",
+            crate::card::STATUS_FLAG_COUNT,
+            EXTENDED_PHASE_COUNT - BASE_PHASE_COUNT
+        ));
+    }
     for (name, width) in scalar_fields(config) {
         s.push_str(&format!("scalar {name} {width}\n"));
     }
@@ -1137,6 +1341,201 @@ pub fn obs_layout_hash(config: &GameConfig) -> u64 {
 /// Hash of [`action_layout_string`].
 pub fn action_layout_hash(config: &GameConfig) -> u64 {
     fnv1a64(action_layout_string(config).as_bytes())
+}
+
+// ==================================================================== the reserve bridge ==
+
+/// Where each **base**-layout index lands in the **extended** layout.
+///
+/// `MODULAR_RULES.md` §7. Both maps run base index → extended index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReserveEmbedding {
+    /// `obs[i]` is the extended-layout index of base observation float `i`. [`obs_dim`] of
+    /// the *base* layout long.
+    pub obs: Vec<u32>,
+    /// `action[i]` is the extended-layout index of base policy logit `i`.
+    pub action: Vec<u32>,
+    /// Width of the base layout these maps come from.
+    pub base_obs_dim: usize,
+    pub base_action_dim: usize,
+    /// Width of the extended layout they map into.
+    pub extended_obs_dim: usize,
+    pub extended_action_dim: usize,
+
+    // ---- the same embedding, expressed per lane-partition ----
+    //
+    // The lane-equivariant network (`PLAN.md` §4.2b) does not hold a `[width, obs_dim]`
+    // matrix: it holds `[width, lane_obs_len]` and `[width, global_obs_len]`, and gathers
+    // with [`lane_structure`]. So widening it needs the embedding stated in *those*
+    // coordinates — base position within a lane → extended position within a lane.
+    //
+    // Derived from `lane_structure` on both layouts rather than recomputed, so there is no
+    // second reading of the layout to drift.
+    /// Base position within a lane → extended position within a lane, for the observation.
+    /// Identical for every lane, which [`reserve_embedding`] asserts.
+    pub lane_obs: Vec<u32>,
+    /// Base position → extended position among the observation floats no lane owns.
+    pub global_obs: Vec<u32>,
+    /// Base position within a lane → extended position, for the policy head.
+    pub lane_action: Vec<u32>,
+    /// Base position → extended position among the logits no lane owns.
+    pub global_action: Vec<u32>,
+}
+
+/// Re-express a global-index embedding in the coordinates of one lane-partition list.
+///
+/// `base_list` and `ext_list` are the *same* partition of the two layouts (lane 0's
+/// observation floats, say). For each base position, follow the global embedding and find
+/// where that extended index sits in the extended list.
+fn positional_map(base_list: &[u32], ext_list: &[u32], global: &[u32], width: usize) -> Vec<u32> {
+    let mut position = vec![u32::MAX; width];
+    for (k, &i) in ext_list.iter().enumerate() {
+        position[i as usize] = k as u32;
+    }
+    base_list
+        .iter()
+        .map(|&b| {
+            let target = global[b as usize] as usize;
+            let at = position[target];
+            assert_ne!(
+                at,
+                u32::MAX,
+                "base index {b} embeds to extended index {target}, which the extended \
+                 layout assigns to a different partition — the reserve moved a feature \
+                 between a lane and the global set"
+            );
+            at
+        })
+        .collect()
+}
+
+/// The same board shape as `config`, with the canonical powers installed — i.e. `config`'s
+/// **base** layout.
+///
+/// Only the shape fields matter here (`lanes`, `encoding_slots`, `rank_count`), and swapping
+/// the powers is what turns [`GameConfig::extended_encoder`] off. Returning a real config
+/// rather than threading an `extended: bool` through every width function means the base
+/// layout is computed by exactly the same code that computes it for a canonical ruleset,
+/// instead of by a parallel path that could drift.
+fn with_base_layout(config: &GameConfig) -> GameConfig {
+    let mut base = *config;
+    for rank in Rank::ALL {
+        base.powers[rank.index()] = crate::powers::PowerId::canonical_for(rank);
+    }
+    debug_assert!(!base.extended_encoder());
+    base
+}
+
+/// How a base-layout checkpoint's weights move into the extended layout.
+///
+/// `MODULAR_RULES.md` §7. This is what makes the reserve affordable: without it the first
+/// ruleset to claim a status flag pays a 24-hour from-scratch run, and with it that run is a
+/// 3-hour warm start from the current champion.
+///
+/// # Why this is exact and not an approximation
+///
+/// Every reserve feature is **appended** — status flags after the base slot features, spare
+/// phase positions after the seven real ones, `CHOOSE_LANE` and `CHOOSE_OPTION` after
+/// `CHOOSE_RANK`. So the base layout embeds in the extended one monotonically, every base
+/// feature keeps its meaning, and the features that have no preimage are exactly the reserve
+/// ones, which are **zero** in any position a base ruleset could produce.
+///
+/// A checkpoint widened with this map therefore computes a *bit-identical* forward pass on
+/// any position both layouts can express: the input layer walks non-zeros
+/// ([`crate::nn`], `FINDINGS.md` F3.3), the same non-zeros reach the same weight rows in the
+/// same order, and the new rows are never visited. `reserve_embedding_preserves_the_encoding`
+/// asserts the tensor half of that directly against [`encode_observation`].
+///
+/// # Panics
+///
+/// If `config` is not an extended ruleset — there is nothing to embed into.
+pub fn reserve_embedding(config: &GameConfig) -> ReserveEmbedding {
+    assert!(
+        config.extended_encoder(),
+        "reserve_embedding needs an extended ruleset; `{}` uses the base layout, which is \
+         already what a shipped checkpoint is written against",
+        config.rules_label()
+    );
+    let base = with_base_layout(config);
+    let (s, l) = (config.encoding_slots, config.lanes);
+
+    // ---- the board: one slot at a time, base features first in both layouts ----
+    let (bf, ef) = (slot_features(&base), slot_features(config));
+    let mut obs = vec![0u32; obs_dim(&base)];
+    for chunk in 0..(l * 2 * s) {
+        for k in 0..bf {
+            obs[chunk * bf + k] = (chunk * ef + k) as u32;
+        }
+    }
+
+    // ---- the scalars: identical fields in identical order, `phase_onehot` wider ----
+    let (mut b_at, mut e_at) = (board_len(&base), board_len(config));
+    for ((b_name, b_w), (e_name, e_w)) in scalar_fields(&base).into_iter().zip(scalar_fields(config))
+    {
+        assert_eq!(
+            b_name, e_name,
+            "the reserve reordered the scalar block; the embedding assumes it only widens \
+             fields in place"
+        );
+        assert!(b_w <= e_w, "scalar field {b_name} shrank in the extended layout");
+        // A widened one-hot keeps its low positions, because `phase_index` appends.
+        for k in 0..b_w {
+            obs[b_at + k] = (e_at + k) as u32;
+        }
+        b_at += b_w;
+        e_at += e_w;
+    }
+    debug_assert_eq!(b_at, obs_dim(&base));
+    debug_assert_eq!(e_at, obs_dim(config));
+
+    // ---- the policy head: match blocks by name ----
+    let extended_blocks = action_blocks(config);
+    let mut action = vec![0u32; action_dim(&base)];
+    for b in action_blocks(&base) {
+        let e = extended_blocks
+            .iter()
+            .find(|e| e.name == b.name)
+            .unwrap_or_else(|| panic!("the extended layout dropped the `{}` block", b.name));
+        assert_eq!(e.len, b.len, "the `{}` block changed width", b.name);
+        for k in 0..b.len {
+            action[b.offset + k] = (e.offset + k) as u32;
+        }
+    }
+
+    // ---- the same maps, in lane-partition coordinates ----
+    let (bs, es) = (lane_structure(&base), lane_structure(config));
+    let (ow, aw) = (obs_dim(config), action_dim(config));
+    let lane_obs = positional_map(&bs.lane_obs[0], &es.lane_obs[0], &obs, ow);
+    let lane_action = positional_map(&bs.lane_action[0], &es.lane_action[0], &action, aw);
+    // The contract of `lane_structure` is that position `k` of every lane's list is the same
+    // feature of a different lane. If that holds, the per-lane embedding cannot depend on the
+    // lane — and if it does not hold, one shared weight matrix was never meaningful. Checked
+    // rather than assumed, because this is the table a widened checkpoint is gathered with.
+    for lane in 1..l {
+        assert_eq!(
+            positional_map(&bs.lane_obs[lane], &es.lane_obs[lane], &obs, ow),
+            lane_obs,
+            "the observation embedding differs between lane 0 and lane {lane}"
+        );
+        assert_eq!(
+            positional_map(&bs.lane_action[lane], &es.lane_action[lane], &action, aw),
+            lane_action,
+            "the policy embedding differs between lane 0 and lane {lane}"
+        );
+    }
+
+    ReserveEmbedding {
+        lane_obs,
+        global_obs: positional_map(&bs.global_obs, &es.global_obs, &obs, ow),
+        lane_action,
+        global_action: positional_map(&bs.global_action, &es.global_action, &action, aw),
+        obs,
+        action,
+        base_obs_dim: obs_dim(&base),
+        base_action_dim: action_dim(&base),
+        extended_obs_dim: obs_dim(config),
+        extended_action_dim: action_dim(config),
+    }
 }
 
 #[cfg(test)]

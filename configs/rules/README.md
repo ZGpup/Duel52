@@ -38,6 +38,36 @@ powers.three = "trap_vengeance_one_damage"
 | `eight-on-survival.toml` | 2 | The 8 retaliates **only if it survives** the attack — the exact inverse of the rules-as-written ruling that it "fires even if that damage killed the 8". |
 | `eight-none.toml` | 2 | Ablation: the 8 does not hit back. |
 | `jack-2hp.toml` | 1 | The Jack still taunts but has 2 HP, not 3. A pure config number — no code, no new power. |
+| `seven-shield.toml` | 2 ⚠️ | The 7 **shields** instead of healing: each of your cards ignores the next damage it takes. Claims reserve status flag 0. |
+| `king-any-lane.toml` | 2 ⚠️ | The King reactivates a lane **you choose**, not its own. Claims the reserve's `CHOOSE_LANE` block and a reserve phase. |
+| `two-choose.toml` | 2 ⚠️ | The 2 lets you pick bottom **or** discard, per use. Claims the reserve's `CHOOSE_OPTION` block — §10a's ruling becomes an in-game decision. |
+
+## ⚠️ The three marked rulesets move the encoder layout
+
+`MODULAR_RULES.md` §7. Most rulesets leave the tensors alone — the encoder is rank-agnostic,
+so changing what a card *does* changes no feature. The last three change what the game can
+*express*: a hidden per-card status, a new kind of sub-decision, a target that is a lane or an
+option rather than a card. Those need the **encoder reserve**, and a ruleset that claims any
+part of it gets the wider layout.
+
+What follows from that, in the order you will hit it:
+
+- **No shipped checkpoint plays them.** `models/*.d52nn` are all base-layout, and they are
+  refused by name and number rather than quietly mis-read. That is the layout hash working.
+- **One `python -m duel52.nn widen` fixes it**, exactly:
+
+  ```bash
+  .venv/bin/python -m duel52.nn widen \
+      --in models/duel52-split-lane-gen032.d52nn --out models/lane-gen032-wide.d52nn \
+      --rules-file configs/rules/seven-shield.toml --encoding-slots 21
+  ```
+
+  Every trained weight keeps its meaning and the new rows are zero, so the widened net plays
+  identically until the new rules actually fire. Then `--init-from` it as usual: a reserve
+  ruleset is still a **3-hour warm start**, not a 24-hour run.
+- **All three share one layout**, and so will the next ten. The break is paid once.
+- `duel52 config <file>` prints `reserve status_flags=8 phases=5` in the resolved layout for
+  these and nothing for the others, which is the quickest way to tell which kind you have.
 
 ## Adding one
 

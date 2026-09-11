@@ -270,7 +270,12 @@ pub fn permute_lanes(state: &GameState, sigma: &[usize]) -> GameState {
             | Pending::QueenSource { lane, .. }
             | Pending::SplitTarget { lane, .. } => *lane = sigma[*lane as usize] as u8,
             // A Foresight names a card only once it is chosen, and a give-back names a rank.
-            Pending::Foresight { .. } | Pending::GiveBack { .. } => {}
+            // A `ChooseLane` node names no lane *yet* — that is the decision it is asking
+            // for — and a `ChooseOption` node never names one.
+            Pending::Foresight { .. }
+            | Pending::GiveBack { .. }
+            | Pending::ChooseLane { .. }
+            | Pending::ChooseOption { .. } => {}
         }
     }
     out
@@ -289,8 +294,12 @@ pub fn permute_action(action: &Action, sigma: &[usize]) -> Action {
         | Action::DeclarePair { lane, .. }
         | Action::Peek { lane, .. }
         | Action::ResolveNext { lane, .. }
-        | Action::MoveHere { lane, .. } => *lane = sigma[*lane as usize] as u8,
-        Action::SplitTarget { .. } | Action::GiveBack { .. } => {}
+        | Action::MoveHere { lane, .. }
+        // `ChooseLane` names a lane outright, so it relabels like any other — this is the
+        // line whose absence would make the lane equivariance silently false for the
+        // reserve's block (`MODULAR_RULES.md` §7).
+        | Action::ChooseLane { lane, .. } => *lane = sigma[*lane as usize] as u8,
+        Action::SplitTarget { .. } | Action::GiveBack { .. } | Action::ChooseOption { .. } => {}
     }
     out
 }

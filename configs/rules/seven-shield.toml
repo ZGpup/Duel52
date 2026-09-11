@@ -1,0 +1,36 @@
+# The 7 shields instead of healing.
+#
+# **The first ruleset that needs the extended encoder layout** (`MODULAR_RULES.md` §7).
+#
+# Canonically the 7 is Heal All: every damaged card you own, in every lane, gets 2 HP back.
+# Here it instead puts a **shield** on every card you own — each ignores the next damage it
+# would take, once, and the shield is spent doing it.
+#
+# Why this is the interesting variant rather than just another number
+#
+# Heal and shield are the same *shape* — same targets, same lanes, same base-card rule — but
+# they are opposite in time. Healing is retrospective and rewards flipping the 7 late, after
+# damage has accumulated; a shield is prospective and rewards flipping it before a trade you
+# expect to lose. That makes the pair a clean experiment: whatever moves between them is
+# about timing, not about how much value the card carries.
+#
+# It is also the first mechanic in the project that the **base observation could not
+# express**. Healing is visible in the damage counter, which the encoder has always carried.
+# A shield is invisible until it is spent, so before the reserve there was nowhere to put it
+# and this was a Tier 3 change — a layout break and a 24-hour from-scratch run. It claims
+# reserve status flag 0 (`card::STATUS_SHIELDED`) and is now Tier 2.
+#
+# ⚠️ **This ruleset moves `obs_layout_hash`.** No checkpoint in `models/` can play it, and
+# `--init-from` refuses one directly. The bridge is
+# `python -m duel52.nn widen --rules configs/rules/seven-shield.toml`, which embeds a
+# base-layout checkpoint into the extended layout exactly — see `MODULAR_RULES.md` §7.
+#
+# Expected effect: 7s get better against a board that trades evenly and worse against one
+# that alpha-strikes, because a shield stops 1 damage whether the hit was for 1 or for 4.
+# Watch the 7's flip-timing curve move *earlier*, and watch whether pairs (2 damage in one
+# action) gain against it.
+
+include = "canonical.toml"
+
+rules_name = "seven-shield"
+powers.seven = "shield_all"

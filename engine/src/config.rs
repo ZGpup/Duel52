@@ -806,6 +806,41 @@ impl GameConfig {
         self.powers[rank.index()]
     }
 
+    /// Does this ruleset need the **extended encoder layout**? `MODULAR_RULES.md` §7.
+    ///
+    /// True exactly when some installed power declares
+    /// [`PowerId::needs_extended_encoder`]. Everything the reserve adds — five spare phase
+    /// one-hot positions, eight per-slot status flags, and the `CHOOSE_LANE` and
+    /// `CHOOSE_OPTION` policy blocks — is switched on and off by this one predicate, so
+    /// there are exactly **two** layouts in the codebase and never a spectrum of them.
+    ///
+    /// # Why it is derived rather than a config key
+    ///
+    /// A key would be a third thing to keep in step with the powers and the layout, and the
+    /// way it fails is silent: a ruleset that installs a flag-using power but forgets the
+    /// key writes a status nobody encodes, and the network simply never learns the mechanic.
+    /// Deriving it makes that state unrepresentable. It also means **the canonical ruleset
+    /// can never accidentally move**: no canonical power declares the reserve, so
+    /// `obs_layout_hash` is bit-identical to the pre-reserve build and every checkpoint and
+    /// shard in the repository still loads.
+    ///
+    /// The cost is that a reserve ruleset cannot warm-start from a base-layout checkpoint
+    /// directly — `encode::reserve_embedding` and `python -m duel52.nn widen` are the bridge
+    /// that makes that a 3-hour run instead of a 24-hour one.
+    #[inline]
+    pub const fn extended_encoder(&self) -> bool {
+        // A plain loop rather than `iter().any()` so this stays usable from `const fn`
+        // callers in `encode`, and because 13 entries is not worth an iterator.
+        let mut i = 0;
+        while i < self.powers.len() {
+            if self.powers[i].needs_extended_encoder() {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// A 64-bit fingerprint of **the game these rules describe**.
     ///
     /// `MODULAR_RULES.md` §6. This is the provenance the project did not have: nothing

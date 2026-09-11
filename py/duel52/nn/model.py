@@ -66,10 +66,18 @@ def spec_for(
     place to get it and no reason to hard-code a dimension.
 
     ``rules_file`` names a ``configs/rules/*.toml`` and replaces ``variant``, exactly as
-    ``--config`` replaces ``--variant`` on the CLI. It changes ``rules_name``/``rules_hash``
-    and **nothing else** — the encoder is rank-agnostic, so no ruleset moves a layout hash
-    (``MODULAR_RULES.md`` §1b). That is what lets ``--init-from`` warm-start a rules
-    experiment from the current champion.
+    ``--config`` replaces ``--variant`` on the CLI.
+
+    For almost every ruleset it changes ``rules_name``/``rules_hash`` and **nothing else** —
+    the encoder is rank-agnostic, so the layout does not move (``MODULAR_RULES.md`` §1b), and
+    that is what lets ``--init-from`` warm-start a rules experiment from the current champion
+    in three hours rather than twenty-four.
+
+    The exception is a ruleset that claims the **encoder reserve** (§7) — a per-card status
+    flag, a new kind of sub-decision, or a lane/option target. Those get a wider observation
+    and a wider policy head, ``extended_encoder`` is true, and the layout hashes move. There
+    are exactly two layouts and every reserve ruleset shares the second, so the break is paid
+    once; ``python -m duel52.nn widen`` carries a base-layout checkpoint across it.
     """
     from .._engine import encoding_spec
 
@@ -253,17 +261,30 @@ class LaneSpec:
     global_action_len: int
 
 
-def lane_spec_for(variant: str = "split", encoding_slots: int | None = None) -> LaneSpec:
-    """The lane partition for a configuration, from the engine."""
+def lane_spec_for(
+    variant: str = "split",
+    encoding_slots: int | None = None,
+    rules_file: str | None = None,
+) -> LaneSpec:
+    """The lane partition for a configuration, from the engine.
+
+    ``rules_file`` is not optional in practice once a ruleset claims the encoder reserve
+    (``MODULAR_RULES.md`` §7). The reserve adds a lane-owned ``CHOOSE_LANE`` block, so an
+    extended ruleset has a *different* partition — and asking by variant alone would hand
+    back the base-layout tables for it. That mismatch does not crash: it routes one lane's
+    logits through another lane's weights, which is the failure this class's docstring is
+    about. Pass the same ``rules_file`` the run is training under.
+    """
     import numpy as np
 
     from .._engine import lane_structure
 
-    raw = (
-        lane_structure(variant=variant)
-        if encoding_slots is None
-        else lane_structure(variant=variant, encoding_slots=encoding_slots)
-    )
+    kwargs: dict = {"variant": variant}
+    if encoding_slots is not None:
+        kwargs["encoding_slots"] = encoding_slots
+    if rules_file is not None:
+        kwargs["rules_file"] = rules_file
+    raw = lane_structure(**kwargs)
     as_long = lambda b: torch.from_numpy(  # noqa: E731
         np.frombuffer(b, dtype="<u4").astype("int64")
     )

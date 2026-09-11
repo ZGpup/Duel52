@@ -177,7 +177,9 @@ class TrainingLoop:
         #: The six lane relabellings, or ``None``. Built once from the engine — never in
         #: Python (``CLAUDE.md``: one encoder, and a permutation table is a reading of it).
         self.augment = (
-            LaneAugmenter.from_engine(config.game.variant, config.game.encoding_slots)
+            LaneAugmenter.from_engine(
+                config.game.variant, config.game.encoding_slots, config.game.rules_file
+            )
             if config.train.lane_augment
             else None
         )

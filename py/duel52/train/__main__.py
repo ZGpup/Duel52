@@ -177,7 +177,9 @@ def _check(args: argparse.Namespace) -> int:
     else:
         from .buffer import LaneAugmenter
 
-        aug = LaneAugmenter.from_engine(config.game.variant, config.game.encoding_slots)
+        aug = LaneAugmenter.from_engine(
+            config.game.variant, config.game.encoding_slots, config.game.rules_file
+        )
         aug.check(int(spec["obs_dim"]), int(spec["action_dim"]))
         print(
             f"augmentation:   lane permutations on — {aug.count} exact relabellings per sample, "

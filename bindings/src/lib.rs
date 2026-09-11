@@ -131,6 +131,22 @@ fn action_to_dict<'py>(py: Python<'py>, action: Action) -> PyResult<Bound<'py, P
             d.set_item("kind", "split_target")?;
             d.set_item("slot", slot)?;
         }
+        // The encoder reserve (`MODULAR_RULES.md` §7).
+        Action::ChooseLane { side, lane } => {
+            d.set_item("kind", "choose_lane")?;
+            d.set_item(
+                "side",
+                match side {
+                    Side::Mine => "mine",
+                    Side::Theirs => "theirs",
+                },
+            )?;
+            d.set_item("lane", lane)?;
+        }
+        Action::ChooseOption { option } => {
+            d.set_item("kind", "choose_option")?;
+            d.set_item("option", option)?;
+        }
     }
     Ok(d)
 }
@@ -206,6 +222,25 @@ fn action_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Action> {
         },
         "split_target" => Action::SplitTarget {
             slot: get(d, "slot")?,
+        },
+        // The encoder reserve (`MODULAR_RULES.md` §7).
+        "choose_lane" => {
+            let side: String = get(d, "side")?;
+            Action::ChooseLane {
+                side: match side.as_str() {
+                    "mine" => Side::Mine,
+                    "theirs" => Side::Theirs,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "choose_lane side must be 'mine' or 'theirs', got {other:?}"
+                        )))
+                    }
+                },
+                lane: get(d, "lane")?,
+            }
+        }
+        "choose_option" => Action::ChooseOption {
+            option: get(d, "option")?,
         },
         other => {
             return Err(PyValueError::new_err(format!(
@@ -771,10 +806,17 @@ fn random_play_stats<'py>(
     Ok(d)
 }
 
-/// The card-power reference as text.
+/// The card-power reference as text, **for a given ruleset**.
+///
+/// ⚠️ Reads the config, not the rulebook (`MODULAR_RULES.md` §5b). A reference that quietly
+/// described the canonical powers under a modded ruleset is worse than none, because the
+/// reader checks the engine against it and concludes the engine is wrong. `rules_file` names
+/// a `configs/rules/*.toml`, exactly as it does for [`encoding_spec`].
 #[pyfunction]
-fn power_reference() -> String {
-    display::power_reference()
+#[pyo3(signature = (variant="split", rules_file=None))]
+fn power_reference(variant: &str, rules_file: Option<&str>) -> PyResult<String> {
+    let config = resolve_layout_config(variant, None, rules_file)?;
+    Ok(display::power_reference(&config))
 }
 
 /// The frozen Phase 2 benchmark ladder, weakest first.
@@ -784,6 +826,38 @@ fn power_reference() -> String {
 #[pyfunction]
 fn ladder_agents() -> Vec<String> {
     AgentSpec::LADDER.iter().map(|s| s.name()).collect()
+}
+
+/// Resolve the config whose **layout** a caller is asking about.
+///
+/// Shared by [`encoding_spec`], [`lane_permutations`] and [`lane_structure`] so that all
+/// three answer for the same ruleset. That sharing is load-bearing since the encoder reserve
+/// (`MODULAR_RULES.md` §7): the layout used to depend only on the board shape, so asking by
+/// `variant` was enough, and it now also depends on whether the ruleset claims the reserve.
+/// A `lane_structure` that took only a variant would hand back **base**-layout tables for an
+/// extended ruleset — and a wrong lane table does not crash, it routes one lane's features
+/// through another lane's weights and produces an agent that is merely bad.
+fn resolve_layout_config(
+    variant: &str,
+    encoding_slots: Option<usize>,
+    rules_file: Option<&str>,
+) -> PyResult<GameConfig> {
+    let mut config = match rules_file {
+        Some(path) => GameConfig::from_config_file(std::path::Path::new(path))
+            .map_err(PyValueError::new_err)?,
+        None => {
+            let v = Variant::parse(variant)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
+            GameConfig::preset(v)
+        }
+    };
+    if let Some(n) = encoding_slots {
+        config.encoding_slots = n;
+    }
+    config
+        .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+    Ok(config)
 }
 
 /// The tensor shapes and layout hashes the training side must build against.
@@ -810,21 +884,7 @@ fn encoding_spec<'py>(
     encoding_slots: Option<usize>,
     rules_file: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let mut config = match rules_file {
-        Some(path) => GameConfig::from_config_file(std::path::Path::new(path))
-            .map_err(PyValueError::new_err)?,
-        None => {
-            let v = Variant::parse(variant)
-                .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
-            GameConfig::preset(v)
-        }
-    };
-    if let Some(n) = encoding_slots {
-        config.encoding_slots = n;
-    }
-    config
-        .validate()
-        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+    let config = resolve_layout_config(variant, encoding_slots, rules_file)?;
 
     let d = PyDict::new(py);
     d.set_item("variant", config.variant.label())?;
@@ -834,6 +894,17 @@ fn encoding_spec<'py>(
     d.set_item("lanes", config.lanes)?;
     d.set_item("ranks", config.rank_count())?;
     d.set_item("slot_features", encode::slot_features(&config))?;
+    // `MODULAR_RULES.md` §7. False for every canonical ruleset, and the reason a shipped
+    // checkpoint still loads: the base layout is byte-identical to the pre-reserve build.
+    d.set_item("extended_encoder", config.extended_encoder())?;
+    d.set_item("phase_count", encode::phase_count(&config))?;
+    // The lane partition's widths. Also on `lane_structure`, but a caller that only needs
+    // the numbers — sizing a widened checkpoint's header, say — should not have to pull
+    // several megabytes of index tables to read four integers.
+    d.set_item("lane_obs_len", encode::lane_obs_len(&config))?;
+    d.set_item("global_obs_len", encode::global_obs_len(&config))?;
+    d.set_item("lane_action_len", encode::lane_action_len(&config))?;
+    d.set_item("global_action_len", encode::global_action_len(&config))?;
     // Rendered as 16 hex characters, the same way they appear in a checkpoint header, so a
     // mismatch can be read straight off the two strings.
     d.set_item("obs_layout_hash", format!("{:016x}", encode::obs_layout_hash(&config)))?;
@@ -864,6 +935,68 @@ fn encoding_spec<'py>(
     Ok(d)
 }
 
+/// How a base-layout checkpoint's weights move into the extended layout.
+///
+/// `MODULAR_RULES.md` §7. The reserve is opt-in, so a ruleset that claims a status flag, a
+/// reserve phase or a reserve action block gets a wider observation and a wider policy head
+/// — and every checkpoint in `models/` was written against the narrower ones. Without this,
+/// the first such ruleset costs a 24-hour from-scratch run. With it, it is a 3-hour warm
+/// start: `python -m duel52.nn widen` gathers the old weights into the new shape and the
+/// forward pass is unchanged on every position both layouts can express.
+///
+/// Returns a dict:
+///
+/// - ``obs`` / ``action``: flat little-endian ``u32`` buffers to wrap with
+///   ``numpy.frombuffer``, mapping **base index → extended index**. Both are monotone, which
+///   is what makes the widened forward pass bit-identical rather than merely equal: the input
+///   layer accumulates over non-zeros in index order.
+/// - ``base_obs_dim`` / ``base_action_dim`` / ``extended_obs_dim`` / ``extended_action_dim``:
+///   the two shapes, so the caller can check the checkpoint it was handed.
+///
+/// `rules_file` must name an **extended** ruleset; asking for the embedding of a base one is
+/// an error, because a shipped checkpoint is already written against that layout.
+#[pyfunction]
+#[pyo3(signature = (rules_file, encoding_slots=None))]
+fn reserve_embedding<'py>(
+    py: Python<'py>,
+    rules_file: &str,
+    encoding_slots: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use pyo3::types::PyBytes;
+
+    let config = resolve_layout_config("split", encoding_slots, Some(rules_file))?;
+    if !config.extended_encoder() {
+        return Err(PyValueError::new_err(format!(
+            "`{rules_file}` uses the base encoder layout, which is what shipped checkpoints \
+             are already written against — there is nothing to widen into. Only a ruleset \
+             that claims the reserve (a status flag, a reserve phase, or CHOOSE_LANE / \
+             CHOOSE_OPTION) has an extended layout. See MODULAR_RULES.md §7."
+        )));
+    }
+
+    let e = encode::reserve_embedding(&config);
+    let bytes = |v: &[u32]| {
+        let raw =
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+        PyBytes::new(py, raw)
+    };
+    let d = PyDict::new(py);
+    d.set_item("obs", bytes(&e.obs))?;
+    d.set_item("action", bytes(&e.action))?;
+    d.set_item("base_obs_dim", e.base_obs_dim)?;
+    d.set_item("base_action_dim", e.base_action_dim)?;
+    d.set_item("extended_obs_dim", e.extended_obs_dim)?;
+    d.set_item("extended_action_dim", e.extended_action_dim)?;
+    // The same embedding in lane-partition coordinates, for `arch = "lane"` — which holds
+    // `[width, lane_obs_len]` and `[width, global_obs_len]` rather than one `[width,
+    // obs_dim]`, so it cannot be widened with the flat maps above.
+    d.set_item("lane_obs", bytes(&e.lane_obs))?;
+    d.set_item("global_obs", bytes(&e.global_obs))?;
+    d.set_item("lane_action", bytes(&e.lane_action))?;
+    d.set_item("global_action", bytes(&e.global_action))?;
+    Ok(d)
+}
+
 /// The lane relabellings, as index maps the trainer can gather with.
 ///
 /// `PLAN.md` §4.2a: the game is invariant under any permutation of its three lanes, so every
@@ -881,23 +1014,16 @@ fn encoding_spec<'py>(
 /// drift from the real one without anything crashing. See
 /// `engine/tests/encoding.rs::phase4_lane_permutation_commutes_with_the_encoder`.
 #[pyfunction]
-#[pyo3(signature = (variant="split", encoding_slots=None))]
+#[pyo3(signature = (variant="split", encoding_slots=None, rules_file=None))]
 fn lane_permutations<'py>(
     py: Python<'py>,
     variant: &str,
     encoding_slots: Option<usize>,
+    rules_file: Option<&str>,
 ) -> PyResult<Bound<'py, PyList>> {
     use pyo3::types::PyBytes;
 
-    let v = Variant::parse(variant)
-        .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
-    let mut config = GameConfig::preset(v);
-    if let Some(n) = encoding_slots {
-        config.encoding_slots = n;
-    }
-    config
-        .validate()
-        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+    let config = resolve_layout_config(variant, encoding_slots, rules_file)?;
 
     let out = PyList::empty(py);
     for p in encode::lane_permutations(&config) {
@@ -932,24 +1058,16 @@ fn lane_permutations<'py>(
 /// `engine/tests/encoding.rs::phase4_lane_structure_agrees_with_the_permutations`, which
 /// checks these against the permutation tables rather than against a second transcription.
 #[pyfunction]
-#[pyo3(signature = (variant="split", encoding_slots=None))]
+#[pyo3(signature = (variant="split", encoding_slots=None, rules_file=None))]
 fn lane_structure<'py>(
     py: Python<'py>,
     variant: &str,
     encoding_slots: Option<usize>,
+    rules_file: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
     use pyo3::types::PyBytes;
 
-    let v = Variant::parse(variant)
-        .ok_or_else(|| PyValueError::new_err(format!("unknown variant {variant:?}")))?;
-    let mut config = GameConfig::preset(v);
-    if let Some(n) = encoding_slots {
-        config.encoding_slots = n;
-    }
-    config
-        .validate()
-        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
-
+    let config = resolve_layout_config(variant, encoding_slots, rules_file)?;
     let s = encode::lane_structure(&config);
     let bytes = |v: &[u32]| {
         let raw =
@@ -1079,6 +1197,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoding_spec, m)?)?;
     m.add_function(wrap_pyfunction!(lane_permutations, m)?)?;
     m.add_function(wrap_pyfunction!(lane_structure, m)?)?;
+    m.add_function(wrap_pyfunction!(reserve_embedding, m)?)?;
     m.add_function(wrap_pyfunction!(replay_shard, m)?)?;
     Ok(())
 }

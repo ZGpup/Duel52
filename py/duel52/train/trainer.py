@@ -93,8 +93,11 @@ class Trainer:
         # The lane partition, when the architecture needs it. Built from the engine every
         # time rather than cached on the config — `CLAUDE.md`'s encoder rule, and it costs
         # microseconds.
+        # `rules_file` matters here since the encoder reserve (`MODULAR_RULES.md` §7): an
+        # extended ruleset has a lane-owned `CHOOSE_LANE` block, so its partition differs
+        # from the canonical one and building the net against the wrong table is silent.
         lanes = lambda: lane_spec_for(  # noqa: E731
-            config.game.variant, config.game.encoding_slots
+            config.game.variant, config.game.encoding_slots, config.game.rules_file
         )
 
         if checkpoint is not None:
