@@ -36,6 +36,7 @@ fn main() {
         "ladder" => cmd_ladder(&args[1..]),
         "match" => cmd_match(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
+        "analyze" => cmd_analyze(&args[1..]),
         "nn-dump" => cmd_nn_dump(&args[1..]),
         "selfplay" => cmd_selfplay(&args[1..]),
         "shard" => cmd_shard(&args[1..]),
@@ -75,6 +76,8 @@ USAGE
   duel52 ladder  [options]        round-robin Elo over the agent ladder (Phase 2)
   duel52 match   [options]        one head-to-head, with behavioural statistics
   duel52 probe   [options]        self-play instrumentation per agent (Phase 2 findings)
+  duel52 analyze [options]        write the self-play corpus one agent at a time, for
+                                  `python -m duel52.analysis` to turn into a report
   duel52 nn-dump [options]        encode + forward-pass dump for the Python parity test
   duel52 selfplay [options]       one generation of self-play, written as a .d52sp shard
   duel52 shard   <file>           print a shard's header and replay it as an integrity check
@@ -171,6 +174,29 @@ OPTIONS
                                   measured against.
   --a <agent> --b <agent>         the two sides of a `match`
   --markdown                      emit Markdown, for pasting into FINDINGS.md
+
+  analyze only:
+  --agents <a,b,...>              each one plays ITSELF, and gets its own corpus directory.
+                                  One agent is fine here, unlike ladder
+  --out <dir>                     where the corpora go (default: analysis). One chunk lands
+                                  in <dir>/<dataset>/<agent>/s<seed>-g<games>/, where
+                                  <dataset> names the variant plus, if the ruleset is
+                                  modded, its rules hash. The reader merges every chunk
+                                  under an agent, so a long extraction can be run in pieces
+                                  and more games can be added later by moving --seed on
+  --dataset <name>                override the <dataset> directory, which otherwise names
+                                  the variant. Use it to keep a corpus that differs in
+                                  something the rules hash does not capture — the search
+                                  budget, most usefully — in its own document rather than
+                                  merged into the variant's
+  --games <n>                     games per agent, rounded up to even (default 2000). The
+                                  per-rank win-rate tables are what needs the sample: a rank
+                                  is exclusively held at the deal in ~0.46 player-games per
+                                  game, so 5,000 games is ±0.010 on one and 20,000 is ±0.005
+  --force                         re-play an agent whose corpus is already there. Without
+                                  it, an existing corpus with the same agent, game count,
+                                  seed and rules hash is left alone — which is what makes
+                                  adding a fourth agent cost one agent's games
 
   nn-dump only:
   --checkpoint <file>             the .d52nn checkpoint to run (required)
@@ -379,8 +405,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 for name in v.split(',').filter(|s| !s.trim().is_empty()) {
                     roster.push(AgentSpec::parse(name)?);
                 }
-                if roster.len() < 2 {
-                    return Err("--agents needs at least two agents".to_string());
+                // One is legitimate for `probe` and `analyze`, which play each agent against
+                // itself. `ladder` needs a pairing and checks for itself.
+                if roster.is_empty() {
+                    return Err("--agents needs at least one agent".to_string());
                 }
                 opts.roster = Some(roster);
             }
@@ -964,6 +992,9 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
     let roster = opts.roster();
     let games = opts.games_or(400);
     refuse_cross_ruleset(&roster, &opts.config)?;
+    if roster.len() < 2 {
+        return Err("a ladder needs at least two agents in --agents".to_string());
+    }
 
     // An anchor that is not in the roster would silently fall back to whichever agent was
     // listed first, and the whole table would be measured against something nobody named.
@@ -1166,6 +1197,192 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Write the self-play corpus for each agent in the roster.
+///
+/// The command that does not decide what it is measuring: it plays the games and writes down
+/// what happened, one row per player-game and one row per card. `analysis.rs`'s module header
+/// is the argument for why. Everything downstream is a fold over those two files, which is
+/// what makes a new question a Python function rather than another four hours of games.
+fn cmd_analyze(args: &[String]) -> Result<(), String> {
+    use duel52_engine::analysis;
+
+    let mut out_dir: Option<String> = None;
+    let mut dataset_override: Option<String> = None;
+    let mut force = false;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => out_dir = Some(next_value(args, &mut i, "--out")?),
+            "--dataset" => dataset_override = Some(next_value(args, &mut i, "--dataset")?),
+            "--force" => force = true,
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let opts = parse_options(&rest)?;
+    let roster = opts.roster();
+    let games = opts.games_or(2000);
+    refuse_cross_ruleset(&roster, &opts.config)?;
+
+    let root = PathBuf::from(out_dir.unwrap_or_else(|| "analysis".to_string()));
+    let dataset = match dataset_override {
+        Some(name) => {
+            // It becomes one path segment and the name of a document, so anything that could
+            // escape the directory or split the path is refused rather than sanitised —
+            // silently renaming what the caller asked for is worse than saying no.
+            if name.is_empty()
+                || name.starts_with('.')
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(format!(
+                    "--dataset `{name}` must be one path segment of letters, digits, `-` or \
+                     `_`, and may not begin with a dot"
+                ));
+            }
+            name
+        }
+        None => dataset_name(&opts.config),
+    };
+    let rules_hash = format!("{:016x}", opts.config.rules_hash());
+
+    println!(
+        "Analysis corpus — {} agent(s), {} self-play games each\n  config: {}\n  out: {}",
+        roster.len(),
+        games + (games % 2),
+        opts.config.summary(),
+        root.join(&dataset).display(),
+    );
+    if opts.eval_batch == 1 {
+        // Worth saying once: unlike a gate, self-play holds ONE checkpoint, so every game in
+        // flight waits on the same network and the batch does not split in half.
+        println!(
+            "  note: --eval-batch 1. Both seats share one evaluator here, so batching is\n\
+             \x20       worth more than it is in a gate (FINDINGS.md F4.8) — try --eval-batch 64."
+        );
+    }
+    println!();
+
+    for spec in &roster {
+        // One level per *chunk*, named for the seed range it covers, so a long extraction
+        // can be run in pieces and a killed piece costs only itself. The reader merges every
+        // chunk under an agent, so "2,000 more games" and "resume after a crash" are the
+        // same operation.
+        let dir = root
+            .join(&dataset)
+            .join(agent_slug(spec))
+            .join(format!("s{}-g{}", opts.seed, games + (games % 2)));
+        let name = spec.name();
+        if !force {
+            if let Some(existing) = corpus_stamp(&dir) {
+                if existing == (name.clone(), games + (games % 2), opts.seed, rules_hash.clone())
+                {
+                    println!("  {name}: already in {} — skipped", dir.display());
+                    continue;
+                }
+                if existing.0 != name {
+                    return Err(format!(
+                        "{} already holds a corpus for `{}`, not `{name}` — two agents whose \
+                         checkpoints share a filename. Move one, or use --out.",
+                        dir.display(),
+                        existing.0,
+                    ));
+                }
+            }
+        }
+        println!("  {name}: playing …");
+        let run = analysis::extract(
+            opts.config,
+            spec.clone(),
+            opts.seed,
+            games,
+            opts.threads,
+            opts.eval_batch,
+            &dir,
+        )?;
+        println!(
+            "  {name}: {} games in {:.1}s ({:.2} games/sec), {} card rows → {}",
+            run.counts.games,
+            run.elapsed_secs,
+            run.games_per_sec(),
+            run.counts.card_rows,
+            dir.display(),
+        );
+    }
+    println!(
+        "\nRender it:\n  .venv/bin/python -m duel52.analysis --dir {}",
+        root.display()
+    );
+    Ok(())
+}
+
+/// The directory one comparison lives in: the variant, plus the rules hash when the ruleset
+/// is not the canonical one, so a modded run cannot land on top of the baseline corpus.
+fn dataset_name(config: &GameConfig) -> String {
+    if config.is_canonical_rules() {
+        config.variant.to_string()
+    } else {
+        format!("{}-{:08x}", config.variant, config.rules_hash())
+    }
+}
+
+/// A directory name for an agent: the checkpoint's filename and its budget, rather than the
+/// full spec, which carries a path and would nest.
+fn agent_slug(spec: &AgentSpec) -> String {
+    let name = spec.name();
+    let base = match spec.checkpoint() {
+        Some(path) => {
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("checkpoint");
+            match name.split_once('@') {
+                Some((_, budget)) => format!("{stem}-{budget}"),
+                None => stem.to_string(),
+            }
+        }
+        None => name.clone(),
+    };
+    base.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// What a corpus directory says it holds: `(agent, games, first_seed, rules_hash)`.
+///
+/// Read back out of `meta.json` by looking for the four keys, which is enough because this
+/// process wrote the file three lines of code ago. `None` if there is no corpus there or it
+/// is not readable — both mean "play the games".
+fn corpus_stamp(dir: &std::path::Path) -> Option<(String, usize, u64, String)> {
+    let text = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+    let field = |key: &str| -> Option<String> {
+        let at = text.find(&format!("\"{key}\": "))? + key.len() + 4;
+        let rest = &text[at..];
+        let end = rest.find('\n')?;
+        Some(
+            rest[..end]
+                .trim()
+                .trim_end_matches(',')
+                .trim_matches('"')
+                .to_string(),
+        )
+    };
+    Some((
+        field("agent")?,
+        field("games")?.parse().ok()?,
+        field("first_seed")?.parse().ok()?,
+        field("rules_hash")?,
+    ))
 }
 
 /// Watch one random game. Useful for eyeballing whether the engine's *sequences* look sane,

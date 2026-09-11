@@ -30,6 +30,12 @@ venv/
 /data/
 /replay_buffers/
 
+# The analysis corpora: the raw per-game and per-card CSVs `duel52 analyze` writes. Hours of
+# play at a thousand simulations, but reproducible from the agent, the seed range and the
+# rules hash, all of which are in the meta.json beside them. The **documents** built from
+# them — analysis/<variant>.md and .html — are tracked, because those are the deliverable.
+/analysis/*/
+
 # Logs and profiling
 *.log
 /wandb/

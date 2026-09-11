@@ -11,7 +11,8 @@ the instrument.
 |---|---|
 | `game_rules.md` | **The spec.** Canonical, disambiguated ruleset. The engine implements this. |
 | `PLAN.md` | What is done, and in detail what is next and why. Update as items close. |
-| `FINDINGS.md` | Strategy insights as they emerge. This is the actual output of the project. |
+| `FINDINGS.md` | Strategy insights as they emerge. This is the actual output of the project. **Prose, argued.** |
+| `analysis/<variant>.md`, `.html` | The comparison document: the same measurements for every agent, side by side, with almost no prose. Regenerated in seconds from the corpora by `python -m duel52.analysis`, so it is never edited by hand. `FINDINGS.md` is where a number from it becomes a claim. |
 | `README.md` | The public front door, and where `duel52 replay` is documented. |
 | `RENTING.md` | How to rent a box and run `PLAN.md` item 7 on it, written for someone who has never rented one. Provider choice, the two ways to lose the run, and the Stage 1 measurements. |
 | `MODULAR_RULES.md` | **The rules-mod system.** Where rules live, the three tiers a change falls into, and what each costs. Read §2 before pricing any rule change and §6 before trusting any number. |
@@ -89,10 +90,13 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 388 tests: rules, determinism, information hiding,
+cargo test                               # 398 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, the
-                                         # training corpus, the modded power variants, and
-                                         # the cross-ruleset invariant suite
+                                         # training corpus, the modded power variants, the
+                                         # cross-ruleset invariant suite, and the analysis
+                                         # corpus's per-card log
+.venv/bin/python -m pytest py/tests -q   # 118 tests, including the analysis reader and the
+                                         # deal-clustered intervals every table carries
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
@@ -194,6 +198,60 @@ netmcts:models/duel52-split-lane-gen032.d52nn@256
 # probe is self-play instrumentation and it is where FINDINGS.md's strong-play tables come
 # from. Keep `random` in the roster: lane and attack concentration have no absolute scale, so
 # a number like 0.907 is meaningless without uniform play's 0.777 in the same table.
+
+# The comparison document (analysis/). `probe` decides what it is measuring before the games
+# are played; this does not. `duel52 analyze` plays an agent against **itself** and writes
+# down what happened — one row per player-game in games.csv, one row per card that entered
+# play in cards.csv, plus a meta.json naming the agent, the seed range and the rules hash.
+# Then one Python script folds those into a document with a column per model.
+#
+# The point is that a new question costs a function in py/duel52/analysis/metrics.py and a
+# re-render, never another run of the games — which at a thousand simulations is hours.
+.venv/bin/python -m duel52.analysis \
+    --agents netmcts:models/duel52-split-gen031.d52nn@1000,\
+netmcts:models/duel52-split-lane-gen032.d52nn@1000 \
+    --games 2000 --chunk 250 --encoding-slots 21 --eval-batch 32
+.venv/bin/python -m duel52.analysis            # render what is on disk, play nothing
+./target/release/duel52 analyze --agents random --games 20000   # the extractor on its own
+# `--dataset <name>` overrides the directory the corpus lands in, which otherwise names the
+# variant. It is how a corpus that differs in something the **rules hash does not capture**
+# — the search budget, most usefully — gets its own document instead of being merged into
+# the variant's. `analysis/split` is the 1000-sim study; `analysis/split-64` is the same
+# three models at 64.
+# `--agents` also fixes the **column order**, which is worth having in lineage order rather
+# than alphabetical. Pair it with `--render-only` to re-render without playing anything —
+# without that flag, naming agents starts an extraction.
+.venv/bin/python -m duel52.analysis --dataset split-64 --render-only \
+    --agents netmcts:models/duel52-split-gen031.d52nn@64,\
+netmcts:models/duel52-split-lane-gen032.d52nn@64,\
+netmcts:models/duel52-32c-24h-best.d52nn@64
+# Writes analysis/<variant>.md (tables) and analysis/<variant>.html (the same tables with
+# every figure inline). Both are regenerated from the corpora in seconds.
+# In the HTML every column heading **sorts** — once ascending, twice descending, a third
+# time back to the order the table was written in, which for a per-rank table is the deck and
+# is worth getting back. A right-aligned column sorts on the first number in each cell, so
+# `0.5170 ± 0.0250` sorts on the estimate and a `—` lands at the bottom either way; a
+# left-aligned one sorts on its text. A column whose text does not sort into the order it
+# means says so with `Table.sort_keys` — `rank` is the only one, since A, 2, … K would
+# otherwise fall 10 < 2 < A < J.
+#
+# ⚠️ **Chunked and resumable, and you want it that way.** A chunk is its own directory named
+# for its seed range, an existing one is skipped rather than replayed, and the reader merges
+# them — so a closed laptop costs the current chunk, and "2,000 more games" is the same
+# operation as "resume". Overlapping seed ranges are refused rather than double-counted.
+# ⚠️ **Unlike a gate, batching pays here.** Self-play holds ONE checkpoint, so both seats
+# wait on the same evaluator and `--eval-batch` is not halved the way FINDINGS.md F4.8's
+# gate is. Measured on the 8-core laptop at 1000 sims, uncapped, 250-game chunks at
+# `--eval-batch 32`: **lane-gen032 0.15 games/sec, gen031 0.38** — the lane trunk runs once
+# per lane and nothing here is playout-capped, which is the whole of the 2.5x between them.
+# ⚠️ **Size the chunk so the batch is not clamped.** `nn::batch_slots` spreads a worker's
+# games over the fewest whole waves, so a chunk of 64 over 8 threads gets 8 in flight and a
+# chunk of 250 gets 31. The same lane-gen032 measured 0.09 games/sec at the former and 0.15
+# at the latter — a 1.7x difference that is entirely chunk size, not the agent.
+# ⚠️ **Sample size is set by two tables and not by the rest.** Per-card and per-turn numbers
+# get ~40 observations a game and are tight at 2,000. The per-rank *win rates* get ~0.46
+# exclusive observations a game: ±0.010 at 5,000 games, ±0.005 at 20,000. Add games by
+# moving --seed past the last chunk.
 
 # Phase 3 step 1. A checkpoint is written in Python and played in Rust; the header's layout
 # hashes are what stop the two sides drifting apart.
@@ -542,13 +600,15 @@ where lanes and cards are numbered from 1.
 | `engine/src/nn/lane.rs` | The lane-equivariant forward pass. Its module header carries the equations both languages implement |
 | `engine/src/agents/` | The five ladder rungs plus `netpolicy` and `netmcts`, and the evaluation in `eval.rs` |
 | `engine/src/selfplay.rs` | Self-play generation and the `.d52sp` trajectory shard |
-| `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit |
-| `engine/src/probe.rs` | Instrumented play — where the Phase 2 findings come from |
+| `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit. `run_games` is the threaded, batched game loop; `GameSink` is how a second consumer gets whole games out of it without a second copy of the batching |
+| `engine/src/probe.rs` | Instrumented play — where the Phase 2 findings come from. Also `CardRecord`, the per-card life the analysis corpus is written from |
+| `engine/src/analysis.rs` | The analysis corpus: `games.csv`, `cards.csv`, `meta.json`. Writes down what happened rather than deciding what to measure |
 | `engine/tests/` | One named test per ruling, named for its rule section |
 | `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
 | `py/duel52/nn/` | The PyTorch model and checkpoint I/O. **Never an encoder** — see below |
 | `py/duel52/train/` | The AZ loop: replay buffer, trainer, generation driver. Gradients only |
 | `py/duel52/lanes.py` | `FINDINGS.md` F4.3's lane-symmetry metric, for one checkpoint. Analysis; the permutation tables it compares against come from `encode.rs` |
+| `py/duel52/analysis/` | The comparison document. `metrics.py` is the registry — **one function per question**, and that is the file to edit to add one. `stats.py` holds the deal-clustered intervals every table uses; `charts.py` is dependency-free SVG |
 
 Three structural points that are easy to undo by accident:
 
@@ -606,3 +666,21 @@ Three structural points that are easy to undo by accident:
   and produces an agent that is merely bad.
   `phase4_lane_structure_agrees_with_the_permutations` checks the two tables against each
   other rather than transcribing the layout a third time.
+
+- **The analysis corpus has three conventions, and breaking any of them is silent.**
+  1. **The opening hand is taken at the start of each player's *own* first turn**, not at
+     setup. `GameState::new` performs P0's opening draw (§2), so "the hand at setup" is six
+     cards for P0 and five for P1, and every per-rank win rate would carry that asymmetry as
+     if it were a fact about the card.
+     `analysis_the_opening_hand_is_taken_symmetrically` pins it.
+  2. **Turns in the document are the player's own turns, 1-based.** The engine counts plies
+     and P0 owns the even ones, so a mean over raw plies is half a turn later for P1 for no
+     reason anyone cares about. The CSV stores plies; `metrics.own_turn` converts.
+  3. **Every interval is clustered on the deal.** Both games of a colour-paired deal hold
+     the same cards and forty card rows come out of one shuffle, so an unclustered interval
+     is too narrow — by about √2 for the paired games alone. `stats.clustered` is the only
+     estimator, so no metric has to remember.
+  And one for the engine side: `GameSink::take_game` is called **in game order** within a
+  shard, which `ladder.rs` achieves by sorting the batched path's finished games. A sink that
+  averages per-game floats — `probe`'s concentration figures, and every clustered mean here —
+  would otherwise depend on `--eval-batch` in its last bits.

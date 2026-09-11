@@ -194,6 +194,7 @@ per turn.
 | [game_rules.md](game_rules.md) | The spec. The disambiguated ruleset the engine implements. |
 | [PLAN.md](PLAN.md) | What is done, and in detail what is next and why. |
 | [FINDINGS.md](FINDINGS.md) | What the trained agents have shown about the game. |
+| `analysis/<variant>.md` and `.html` | The comparison document: the same measurements for every agent, side by side. Built by `python -m duel52.analysis`, never edited by hand. The `.html` carries the figures, and its tables sort on any column — a third click puts the table back in the order it was written in. |
 | [models/README.md](models/README.md) | The shipped checkpoints: how each was trained, and what it scores. |
 | [CLAUDE.md](CLAUDE.md) | Commands, repo layout, architecture, and the facts that are easy to get wrong. |
 | [archive/](archive/) | The superseded working documents, frozen for provenance. |
@@ -208,6 +209,7 @@ py/duel52/   the Python package: training loop and analysis, never an encoder
 configs/     variant configs (split is the default) and training configs
 models/      trained checkpoints, tracked in git, with their provenance
 games/       recorded human games, a few hundred bytes each
+analysis/    the comparison document, plus the per-game and per-card corpora it is built from
 archive/     superseded working documents
 ```
 

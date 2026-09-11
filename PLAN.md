@@ -267,6 +267,43 @@ Two reasons to believe it, and three not to over-read it:
 - ⚠️ **`mirrored` cannot be measured this way at all** — 0.06% of positions survive, because
   §9b publishes the removed multiset. The tool detects the thin sample and refuses to print.
 
+### 4b. The comparison document — **built 2026-09-10**
+
+`duel52 analyze` and `python -m duel52.analysis`, writing `analysis/<variant>.md` and `.html`.
+The same measurements for every agent, side by side, with almost no prose: first-player
+advantage, when cards are played and flipped, how long they stay face-down, hand size at the
+unlock and what a bigger hand is worth, win rate per rank held at the deal and at the unlock,
+pairs, how cards die, and what becomes of a face-down card. Adding a model is one more
+`--agents` entry; adding a measurement is one function.
+
+**The design decision is that the engine does not compute statistics.** It plays an agent
+against itself and writes down what happened — one row per player-game, one row per card that
+entered play, plus a `meta.json` naming the agent, the seed range and the `rules_hash`.
+Everything in the document is a fold over those two files. That is what makes a question
+nobody anticipated cost a Python function and a re-render rather than another run of the
+games, which at a thousand simulations is hours per model.
+
+Four things it does that a first version would not have:
+
+- **Intervals are clustered on the deal.** Both games of a colour-paired deal hold the same
+  cards, and forty card rows come out of one shuffle. An unclustered interval is too narrow —
+  about √2 for the paired games alone, more for anything counted per card.
+- **The per-rank win rate is the *exclusive* one:** you held the card, the opponent did not.
+  Pooling in the games where both held it adds symmetric win/loss pairs that carry no
+  information about the card and drag every rank toward 0.500.
+- **The opening hand is taken at the start of each player's own first turn.** `GameState::new`
+  performs P0's opening draw (§2), so "the hand at setup" is six cards for P0 and five for P1.
+  Recording that would have put a first-player edge into all thirteen rows.
+- **Two card-value tables, side by side, in the same unit.** §4a's counterfactual, which needs
+  a value head, and a logistic fit of the result on how many more of each rank you were dealt
+  than your opponent, which needs nothing but the games. **The dealt hand is randomly
+  assigned**, so that fit is a randomised comparison rather than a correlation — the closest
+  thing in this project to an experiment, and it works for `random` too.
+
+Open: the per-rank win rates are the sample-size driver, at ~0.46 exclusive observations per
+game (±0.010 at 5,000 games, ±0.005 at 20,000), while everything per-card is tight by 2,000.
+Adding games is moving `--seed` past the last chunk; the reader merges them.
+
 ### 5. First player advantage and the variant comparison
 
 **Status: partly measured on one variant.**

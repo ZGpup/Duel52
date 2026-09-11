@@ -74,6 +74,7 @@
 
 pub mod action;
 pub mod agents;
+pub mod analysis;
 pub mod card;
 pub mod cardvalue;
 pub mod config;
