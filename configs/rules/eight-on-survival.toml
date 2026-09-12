@@ -1,0 +1,28 @@
+# The 8 only retaliates if it lives.
+#
+# The exact inverse of one of the sharper rulings in the spec. `game_rules.md` §6 + §8:
+# "Retaliate (8) resolves *after* the attacker's damage is applied, and fires even if that
+# damage killed the 8." That ruling has its own named test —
+# `rule_8_retaliate_fires_even_when_the_attack_kills_the_eight` — because it is the case
+# people get wrong.
+#
+# Here it fires only when the 8 is still standing once the attack's damage has landed, which
+# is what a player who had never read §8 would assume. In practice that means: a lone attacker
+# chipping a fresh 8 still takes the hit, but anything that *kills* the 8 walks away clean.
+#
+# Why this is a good test of the mod system rather than just a rule tweak
+#
+# It is the one canonical power whose rule is a genuine back-edge in the damage graph, with
+# three separate exceptions written around it — read-before-damage, the 9's immunity, and
+# both members of a pair paying (`MODULAR_RULES.md` §3b). Changing *when* it is read, without
+# disturbing the other two, is the thing a modular system has to be able to do. The engine
+# takes both readings in one place (`powers/eight.rs`) precisely so this is a mode and not a
+# rewrite.
+#
+# Expected effect: 8s become much weaker on defence and slightly better as a deterrent
+# against chip damage. Watch whether the flip-timing curve for the 8 moves later.
+
+include = "canonical.toml"
+
+rules_name = "eight-on-survival"
+powers.eight = "retaliate_on_survival"

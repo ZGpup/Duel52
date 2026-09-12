@@ -1,0 +1,42 @@
+# The 2 lets you choose: bottom the card, or discard it.
+#
+# Needs the extended encoder layout (`MODULAR_RULES.md` §7).
+#
+# `game_rules.md` §10a is the project's one genuinely contested ruling. The published rules
+# read as a discard; the house rule makes it a scry, on the grounds that a discard is a
+# parity lever — it shrinks your pile by one and hands the opponent a tempo the card was
+# never meant to grant. The engine has carried both readings since Phase 1 as `two_power`,
+# and `configs/split-raw-two.toml` is the control.
+#
+# But a config key means the *ruleset* decides, once, for every 2 in every game. This variant
+# hands the decision to the player, every time. Both readings become available inside one
+# game, which is the thing neither `two_power` setting can express — and it makes the
+# question empirical: if a strong agent picks `bottom` almost always, §10a's house rule was
+# right for reasons the agent can now demonstrate rather than argue.
+#
+# What it exercises structurally
+#
+# The first ruleset to claim §7's `CHOOSE_OPTION` block, and the interesting shape for it:
+# "bottom or discard" is **modal and nameless** — not a card, not a lane, not a rank — so
+# before the reserve there was no logit that could carry it. Two of the block's four logits
+# are legal and the other two are masked, which is the ordinary state of most of the policy
+# head.
+#
+# The choice is asked **after** the rank is out of hand, so the two sub-decisions are ordered
+# rank-then-destination and no fizzle can leave a card in limbo.
+#
+# ⚠️ Moves `obs_layout_hash` and `action_layout_hash`. See `seven-shield.toml`.
+#
+# ⚠️ `two_power` is **inert** under this ruleset — the player answers the question it used to
+# answer. It is still hashed into `rules_hash`, because it is still a config key with a
+# value; that is the §5a trap the named-variant rule exists to avoid, and it is accepted here
+# because `two_power` is a Tier 1 key that predates the rule rather than a new one.
+#
+# Expected effect: strictly better than either fixed reading, so 2s go up. The number worth
+# reading is not the win rate — it is *how often a strong agent discards*, which is §10a's
+# answer.
+
+include = "canonical.toml"
+
+rules_name = "two-choose"
+powers.two = "view_choose"

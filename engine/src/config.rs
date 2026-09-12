@@ -9,6 +9,102 @@
 
 use std::fmt;
 
+use crate::powers::PowerId;
+use crate::rank::Rank;
+
+/// The rules as written, plus this project's two house rules. Every other ruleset is
+/// described as a diff against this one.
+pub const CANONICAL_POWERS: [PowerId; Rank::COUNT] = [
+    PowerId::AceAction,
+    PowerId::TwoView,
+    PowerId::ThreeTrap,
+    PowerId::FourForesight,
+    PowerId::FiveFlip,
+    PowerId::SixFreeze,
+    PowerId::SevenHealAll,
+    PowerId::EightRetaliate,
+    PowerId::NineNimble,
+    PowerId::TenTwinstrike,
+    PowerId::JackTaunt,
+    PowerId::QueenMove,
+    PowerId::KingEmpower,
+];
+
+/// A short label naming a ruleset, e.g. `canonical-2026-09`.
+///
+/// A fixed-size buffer rather than a `String` because [`GameConfig`] is `Copy` and is cloned
+/// into every `GameState` — determinization clones states constantly, and a heap allocation
+/// per clone would show up in the search path.
+///
+/// **The name is not part of [`GameConfig::rules_hash`].** Two configs that play the same
+/// game are the same ruleset whatever they are called; renaming one must not make old
+/// artifacts look foreign.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RulesName([u8; RulesName::CAP]);
+
+impl RulesName {
+    pub const CAP: usize = 32;
+
+    /// The rules as written plus the project's house rules, frozen 2026-09-09. Every number
+    /// in `FINDINGS.md` that predates the mod system was measured under this.
+    pub const CANONICAL: RulesName = RulesName::from_ascii("canonical-2026-09");
+
+    /// Build from a string literal, truncating at [`RulesName::CAP`]. `const` so presets can
+    /// use it.
+    pub const fn from_ascii(s: &str) -> RulesName {
+        let b = s.as_bytes();
+        let mut out = [0u8; RulesName::CAP];
+        let mut i = 0;
+        while i < b.len() && i < RulesName::CAP {
+            out[i] = b[i];
+            i += 1;
+        }
+        RulesName(out)
+    }
+
+    /// Parse a name from a config file. Restricted to a conservative character set so the
+    /// name is safe in a file name, a shard header and a `FINDINGS.md` table cell alike.
+    pub fn parse(s: &str) -> Result<RulesName, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("rules_name must not be empty".into());
+        }
+        if s.len() > RulesName::CAP {
+            return Err(format!(
+                "rules_name is {} characters, the limit is {}",
+                s.len(),
+                RulesName::CAP
+            ));
+        }
+        if let Some(bad) = s
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'))
+        {
+            return Err(format!(
+                "rules_name may only hold letters, digits, `-`, `_` and `.`; found `{bad}`"
+            ));
+        }
+        Ok(RulesName::from_ascii(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        let end = self.0.iter().position(|&b| b == 0).unwrap_or(RulesName::CAP);
+        std::str::from_utf8(&self.0[..end]).unwrap_or("?")
+    }
+}
+
+impl fmt::Display for RulesName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for RulesName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RulesName({:?})", self.as_str())
+    }
+}
+
 /// Which of the three supported deck configurations is in play.
 ///
 /// `game_rules.md` §9. The split-deck variant is **this project's default**, not the
@@ -115,6 +211,53 @@ impl fmt::Display for TwoPower {
 pub struct GameConfig {
     pub variant: Variant,
     pub two_power: TwoPower,
+
+    // ---- Ruleset identity ----
+    /// A label for this ruleset. Provenance only — see [`RulesName`]. Excluded from
+    /// [`GameConfig::rules_hash`] on purpose.
+    pub rules_name: RulesName,
+
+    // ---- Card powers (`MODULAR_RULES.md` §5a) ----
+    /// One power variant per rank, indexed by [`Rank::index`].
+    ///
+    /// Always 13 entries; only `0..=max_rank_index` are reachable. `validate` checks that
+    /// each entry belongs to its own rank, so a config cannot put the King's Empower on the
+    /// 4.
+    pub powers: [PowerId; Rank::COUNT],
+
+    // ---- Tier-1 numeric knobs (`MODULAR_RULES.md` §2) ----
+    //
+    // Every magic constant the powers used to carry, named and defaulted to the value the
+    // rules as written use. Changing one is a config edit with no code change and no layout
+    // break, which is what makes Tier 1 the cheapest kind of balance experiment.
+    /// Hit points of a card with no HP-granting power, and of **every** face-down card
+    /// whatever its rank (`game_rules.md` §5).
+    pub default_hp: u8,
+    /// Hit points of a face-up card whose live power taunts. 3 in the rules as written.
+    ///
+    /// Setting this to `default_hp` is a complete ruleset: a Jack that still taunts but dies
+    /// as fast as anything else.
+    pub jack_hp: u8,
+    /// Damage a lone attacker deals (`game_rules.md` §5).
+    pub single_attack_damage: u8,
+    /// Damage a declared pair deals as one attack (§5).
+    pub pair_attack_damage: u8,
+    /// Multiplier a nimble attacker gets against a taunting target — the 9's "deals 2 damage
+    /// to Jacks" (§6). Applies to the pair total too, so a pair of 9s deals 4.
+    pub nimble_vs_taunt_multiplier: u8,
+    /// Damage each half of a twinstrike deals (§6).
+    pub twinstrike_split_damage: u8,
+    /// Damage one retaliate hit deals (§6).
+    pub eight_retaliate_damage: u8,
+    /// Extra actions an Ace grants when flipped (§6).
+    pub ace_bonus_actions: u32,
+    /// Attacks an Ace may make on the turn it is flipped (§6).
+    pub ace_attack_allowance: u8,
+    /// Turns a freeze lasts. 1 in the rules as written — "exactly one of their turns is
+    /// lost" (§8).
+    pub six_freeze_turns: u32,
+    /// Hit points a 7's Heal All restores per card (§6).
+    pub seven_heal_amount: u8,
 
     // ---- Board shape ----
     /// Number of lanes. 3 in every published configuration; a field because Duel52-mini
@@ -235,6 +378,22 @@ impl GameConfig {
             // The house rule is the default in *every* configuration, base game included
             // (`game_rules.md` §10a).
             two_power: TwoPower::Bottom,
+            rules_name: RulesName::CANONICAL,
+            powers: CANONICAL_POWERS,
+            // Every one of these is the rules-as-written value. `MODULAR_RULES.md` §11 step
+            // 2: naming a constant must not change it, and `config_round_trips_the_canonical
+            // _rules_hash` is what proves none of them moved.
+            default_hp: 2,
+            jack_hp: 3,
+            single_attack_damage: 1,
+            pair_attack_damage: 2,
+            nimble_vs_taunt_multiplier: 2,
+            twinstrike_split_damage: 1,
+            eight_retaliate_damage: 1,
+            ace_bonus_actions: 1,
+            ace_attack_allowance: 2,
+            six_freeze_turns: 1,
+            seven_heal_amount: 2,
             lanes: 3,
             lanes_to_win: 2,
             // 52 total, minus the 10 removed unseen, minus the opponent's opening 5 and
@@ -403,6 +562,35 @@ impl GameConfig {
                 self.encoding_slots, self.max_slots_per_side
             ));
         }
+        // A power must belong to the rank it is installed on. Without this, `powers.four =
+        // "empower"` would parse (both tokens exist) and produce a game nobody described.
+        for (i, power) in self.powers.iter().enumerate() {
+            let rank = Rank::from_index(i);
+            if power.rank() != rank {
+                return Err(format!(
+                    "powers.{} is `{}`, which belongs to the {}",
+                    rank.config_key(),
+                    power.token(),
+                    power.rank()
+                ));
+            }
+        }
+        if self.default_hp == 0 || self.jack_hp == 0 {
+            return Err("hit points must be at least 1".into());
+        }
+        if self.single_attack_damage == 0 || self.pair_attack_damage == 0 {
+            // A zero here would make attacking a no-op action, which reintroduces the pass
+            // that `game_rules.md` §4 does not have — see `FINDINGS.md` F2.4b.
+            return Err("attack damage must be at least 1, or attacking becomes a pass".into());
+        }
+        if self.nimble_vs_taunt_multiplier == 0 {
+            return Err("nimble_vs_taunt_multiplier must be at least 1".into());
+        }
+        if self.six_freeze_turns == 0 {
+            return Err(
+                "six_freeze_turns must be at least 1; use powers.six = \"none\" to remove it".into(),
+            );
+        }
         if !(0.0..=0.5).contains(&self.stalemate_value) {
             // Above 0.5 would make refusing to play *better* than a draw, which is the
             // pathology in `FINDINGS.md` F3.6 with the sign flipped and worse.
@@ -458,12 +646,51 @@ impl GameConfig {
                 .map_err(|_| format!("key `{k}`: `{v}` is not a valid number"))
         }
         for (k, v) in &pairs {
+            // `powers.<rank> = <token>`. The rank scopes the token, so `"none"` under
+            // `powers.three` and under `powers.eight` are different variants and both
+            // round-trip.
+            if let Some(rank_key) = k.strip_prefix("powers.") {
+                let rank = Rank::from_config_key(rank_key)
+                    .ok_or_else(|| format!("unknown rank `{rank_key}` in key `{k}`"))?;
+                let power = PowerId::parse(rank, v).ok_or_else(|| {
+                    let choices: Vec<&str> = PowerId::variants_for(rank)
+                        .iter()
+                        .map(|p| p.token())
+                        .collect();
+                    format!(
+                        "unknown power `{v}` for the {rank}; implemented: {}",
+                        choices.join(" | ")
+                    )
+                })?;
+                cfg.powers[rank.index()] = power;
+                continue;
+            }
             match k.as_str() {
                 "variant" => {}
+                "include" => {
+                    return Err(
+                        "`include` needs a file to resolve paths against; load this config \
+                         with `GameConfig::from_config_file` (the CLI's --config) rather \
+                         than from a bare string"
+                            .into(),
+                    )
+                }
+                "rules_name" => cfg.rules_name = RulesName::parse(v)?,
                 "two_power" => {
                     cfg.two_power =
                         TwoPower::parse(v).ok_or_else(|| format!("unknown two_power `{v}`"))?
                 }
+                "default_hp" => cfg.default_hp = num(k, v)?,
+                "jack_hp" => cfg.jack_hp = num(k, v)?,
+                "single_attack_damage" => cfg.single_attack_damage = num(k, v)?,
+                "pair_attack_damage" => cfg.pair_attack_damage = num(k, v)?,
+                "nimble_vs_taunt_multiplier" => cfg.nimble_vs_taunt_multiplier = num(k, v)?,
+                "twinstrike_split_damage" => cfg.twinstrike_split_damage = num(k, v)?,
+                "eight_retaliate_damage" => cfg.eight_retaliate_damage = num(k, v)?,
+                "ace_bonus_actions" => cfg.ace_bonus_actions = num(k, v)?,
+                "ace_attack_allowance" => cfg.ace_attack_allowance = num(k, v)?,
+                "six_freeze_turns" => cfg.six_freeze_turns = num(k, v)?,
+                "seven_heal_amount" => cfg.seven_heal_amount = num(k, v)?,
                 "lanes" => cfg.lanes = num(k, v)?,
                 "lanes_to_win" => cfg.lanes_to_win = num(k, v)?,
                 "max_slots_per_side" => cfg.max_slots_per_side = num(k, v)?,
@@ -492,9 +719,14 @@ impl GameConfig {
 
     /// Render back out in the same format `from_config_str` reads. Used to stamp the exact
     /// configuration into a results file, so a finding is reproducible.
+    ///
+    /// **Fully resolved**: `include` lines never appear here, because this string is what
+    /// goes into the shard and the game record and it has to be self-contained
+    /// (`MODULAR_RULES.md` §5d).
     pub fn to_config_string(&self) -> String {
-        format!(
-            "variant = \"{}\"\n\
+        let mut s = format!(
+            "rules_name = \"{}\"\n\
+             variant = \"{}\"\n\
              two_power = \"{}\"\n\
              lanes = {}\n\
              lanes_to_win = {}\n\
@@ -510,7 +742,19 @@ impl GameConfig {
              draws_per_turn = {}\n\
              stalemate_quiet_plies = {}\n\
              stalemate_value = {}\n\
-             max_plies = {}\n",
+             max_plies = {}\n\
+             default_hp = {}\n\
+             jack_hp = {}\n\
+             single_attack_damage = {}\n\
+             pair_attack_damage = {}\n\
+             nimble_vs_taunt_multiplier = {}\n\
+             twinstrike_split_damage = {}\n\
+             eight_retaliate_damage = {}\n\
+             ace_bonus_actions = {}\n\
+             ace_attack_allowance = {}\n\
+             six_freeze_turns = {}\n\
+             seven_heal_amount = {}\n",
+            self.rules_name,
             self.variant,
             self.two_power,
             self.lanes,
@@ -528,7 +772,183 @@ impl GameConfig {
             self.stalemate_quiet_plies,
             self.stalemate_value,
             self.max_plies,
-        )
+            self.default_hp,
+            self.jack_hp,
+            self.single_attack_damage,
+            self.pair_attack_damage,
+            self.nimble_vs_taunt_multiplier,
+            self.twinstrike_split_damage,
+            self.eight_retaliate_damage,
+            self.ace_bonus_actions,
+            self.ace_attack_allowance,
+            self.six_freeze_turns,
+            self.seven_heal_amount,
+        );
+        // One line per card, always all thirteen, in rank order. Emitting the whole table
+        // rather than only the diffs is what makes a stamped config answer "what were the
+        // rules" without needing to know what the defaults were on the day it was written.
+        for rank in Rank::ALL {
+            let _ = std::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(
+                    "powers.{} = \"{}\"\n",
+                    rank.config_key(),
+                    self.powers[rank.index()].token()
+                ),
+            );
+        }
+        s
+    }
+
+    /// The power installed on `rank` in this ruleset.
+    #[inline]
+    pub fn power(&self, rank: Rank) -> PowerId {
+        self.powers[rank.index()]
+    }
+
+    /// Does this ruleset need the **extended encoder layout**? `MODULAR_RULES.md` §7.
+    ///
+    /// True exactly when some installed power declares
+    /// [`PowerId::needs_extended_encoder`]. Everything the reserve adds — five spare phase
+    /// one-hot positions, eight per-slot status flags, and the `CHOOSE_LANE` and
+    /// `CHOOSE_OPTION` policy blocks — is switched on and off by this one predicate, so
+    /// there are exactly **two** layouts in the codebase and never a spectrum of them.
+    ///
+    /// # Why it is derived rather than a config key
+    ///
+    /// A key would be a third thing to keep in step with the powers and the layout, and the
+    /// way it fails is silent: a ruleset that installs a flag-using power but forgets the
+    /// key writes a status nobody encodes, and the network simply never learns the mechanic.
+    /// Deriving it makes that state unrepresentable. It also means **the canonical ruleset
+    /// can never accidentally move**: no canonical power declares the reserve, so
+    /// `obs_layout_hash` is bit-identical to the pre-reserve build and every checkpoint and
+    /// shard in the repository still loads.
+    ///
+    /// The cost is that a reserve ruleset cannot warm-start from a base-layout checkpoint
+    /// directly — `encode::reserve_embedding` and `python -m duel52.nn widen` are the bridge
+    /// that makes that a 3-hour run instead of a 24-hour one.
+    #[inline]
+    pub const fn extended_encoder(&self) -> bool {
+        // A plain loop rather than `iter().any()` so this stays usable from `const fn`
+        // callers in `encode`, and because 13 entries is not worth an iterator.
+        let mut i = 0;
+        while i < self.powers.len() {
+            if self.powers[i].needs_extended_encoder() {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// A 64-bit fingerprint of **the game these rules describe**.
+    ///
+    /// `MODULAR_RULES.md` §6. This is the provenance the project did not have: nothing
+    /// recorded which ruleset produced a number, so a checkpoint trained on the split deck
+    /// would play `--variant base` at full speed with no warning, and the resulting score
+    /// looked exactly like a result.
+    ///
+    /// # What is in, and what is out
+    ///
+    /// In: the variant, every card power, every Tier-1 number, deck composition, the deal,
+    /// and turn structure — everything that changes what a legal game looks like.
+    ///
+    /// Out, deliberately:
+    ///
+    /// - [`GameConfig::rules_name`], because a label is not a rule.
+    /// - [`GameConfig::stalemate_value`], because it is a *learning* weight and never
+    ///   reaches [`crate::Outcome`]. Two runs that differ only here played the same game.
+    /// - [`GameConfig::encoding_slots`], because it sizes a tensor rather than the game, and
+    ///   the layout hashes in `encode.rs` already pin it.
+    ///
+    /// ⚠️ Do **not** extend that exclusion list on a judgment call about relevance. A field
+    /// wrongly excluded makes two different rulesets hash the same, which is the silent
+    /// collision this exists to prevent; a field wrongly included merely makes two identical
+    /// rulesets look different, which is a labelling annoyance you will notice.
+    pub fn rules_hash(&self) -> u64 {
+        // FNV-1a, the same construction `encode.rs` uses for the layout hashes. Chosen for
+        // the same reason: it is four lines, has no dependencies, and this is a fingerprint
+        // rather than a security primitive.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.rules_string().bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The exact text [`GameConfig::rules_hash`] fingerprints. Public so a mismatch can be
+    /// diffed rather than guessed at.
+    pub fn rules_string(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(512);
+        let _ = writeln!(s, "variant={}", self.variant);
+        let _ = writeln!(s, "two_power={}", self.two_power);
+        for rank in Rank::ALL {
+            let _ = writeln!(
+                s,
+                "power.{}={}",
+                rank.config_key(),
+                self.powers[rank.index()].token()
+            );
+        }
+        let _ = writeln!(s, "default_hp={}", self.default_hp);
+        let _ = writeln!(s, "jack_hp={}", self.jack_hp);
+        let _ = writeln!(s, "single_attack_damage={}", self.single_attack_damage);
+        let _ = writeln!(s, "pair_attack_damage={}", self.pair_attack_damage);
+        let _ = writeln!(
+            s,
+            "nimble_vs_taunt_multiplier={}",
+            self.nimble_vs_taunt_multiplier
+        );
+        let _ = writeln!(s, "twinstrike_split_damage={}", self.twinstrike_split_damage);
+        let _ = writeln!(s, "eight_retaliate_damage={}", self.eight_retaliate_damage);
+        let _ = writeln!(s, "ace_bonus_actions={}", self.ace_bonus_actions);
+        let _ = writeln!(s, "ace_attack_allowance={}", self.ace_attack_allowance);
+        let _ = writeln!(s, "six_freeze_turns={}", self.six_freeze_turns);
+        let _ = writeln!(s, "seven_heal_amount={}", self.seven_heal_amount);
+        let _ = writeln!(s, "lanes={}", self.lanes);
+        let _ = writeln!(s, "lanes_to_win={}", self.lanes_to_win);
+        let _ = writeln!(s, "max_slots_per_side={}", self.max_slots_per_side);
+        let _ = writeln!(s, "max_rank_index={}", self.max_rank_index);
+        let _ = writeln!(s, "copies_per_rank={}", self.copies_per_rank);
+        let _ = writeln!(s, "hand_size={}", self.hand_size);
+        let _ = writeln!(s, "base_cards_per_player={}", self.base_cards_per_player);
+        let _ = writeln!(s, "removal_count={}", self.removal_count);
+        let _ = writeln!(s, "actions_per_turn={}", self.actions_per_turn);
+        let _ = writeln!(s, "first_turn_actions={}", self.first_turn_actions);
+        let _ = writeln!(s, "draws_per_turn={}", self.draws_per_turn);
+        let _ = writeln!(s, "stalemate_quiet_plies={}", self.stalemate_quiet_plies);
+        let _ = writeln!(s, "max_plies={}", self.max_plies);
+        s
+    }
+
+    /// `name/hash`, the form that goes in a result header and a `FINDINGS.md` row.
+    pub fn rules_label(&self) -> String {
+        format!("{}/{:016x}", self.rules_name, self.rules_hash())
+    }
+
+    /// True when this is the rules as written plus the project's house rules — the ruleset
+    /// every pre-2026-09-09 number in `FINDINGS.md` was measured under.
+    pub fn is_canonical_rules(&self) -> bool {
+        self.rules_hash() == GameConfig::preset(self.variant).rules_hash()
+    }
+
+    /// Load a config file, resolving `include` directives relative to the file's own
+    /// directory.
+    ///
+    /// `MODULAR_RULES.md` §5d. Semantics:
+    ///
+    /// - Includes are pulled in **where they appear**, depth first.
+    /// - Later keys win, so a key written in the including file overrides the same key from
+    ///   an include above it.
+    /// - A file may be included more than once in one resolution as long as it does not
+    ///   include itself, directly or through a chain. A cycle is an error rather than a
+    ///   truncation, because a silently-dropped include is a ruleset nobody described.
+    pub fn from_config_file(path: &std::path::Path) -> Result<GameConfig, String> {
+        let mut stack = Vec::new();
+        let text = resolve_includes(path, &mut stack)?;
+        GameConfig::from_config_str(&text).map_err(|e| format!("`{}`: {e}", path.display()))
     }
 
     /// What `outcome` is worth **to a learner**, for `player`, on the `0.0..=1.0` scale.
@@ -561,10 +981,77 @@ impl GameConfig {
     /// One-line summary for log headers.
     pub fn summary(&self) -> String {
         format!(
-            "variant={} two_power={} stalemate={}plies",
-            self.variant, self.two_power, self.stalemate_quiet_plies
+            "rules={} variant={} two_power={} stalemate={}plies",
+            self.rules_label(),
+            self.variant,
+            self.two_power,
+            self.stalemate_quiet_plies
         )
     }
+
+    /// The cards whose power differs from the rules as written, as `3=trap_vengeance…`.
+    /// Empty when nothing was modded. Used by result headers, which want the diff rather
+    /// than all thirteen rows.
+    pub fn power_diff(&self) -> Vec<String> {
+        Rank::ALL
+            .into_iter()
+            .filter(|r| r.index() <= self.max_rank_index)
+            .filter(|r| self.powers[r.index()] != CANONICAL_POWERS[r.index()])
+            .map(|r| format!("{r}={}", self.powers[r.index()].token()))
+            .collect()
+    }
+}
+
+/// Read `path` and splice in every `include`, depth first, returning one flat config text.
+///
+/// `stack` carries the chain of files currently being resolved, which is both the cycle
+/// guard and the error message.
+fn resolve_includes(
+    path: &std::path::Path,
+    stack: &mut Vec<std::path::PathBuf>,
+) -> Result<String, String> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&canonical) {
+        let chain: Vec<String> = stack
+            .iter()
+            .chain(std::iter::once(&canonical))
+            .map(|p| p.display().to_string())
+            .collect();
+        return Err(format!("include cycle: {}", chain.join(" -> ")));
+    }
+    stack.push(canonical);
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+
+    let mut out = String::with_capacity(text.len() * 2);
+    for raw in text.lines() {
+        let line = match raw.find('#') {
+            Some(i) => &raw[..i],
+            None => raw,
+        }
+        .trim();
+        let included = line.split_once('=').and_then(|(k, v)| {
+            (k.trim().eq_ignore_ascii_case("include"))
+                .then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        });
+        match included {
+            Some(rel) => {
+                let child = dir.join(&rel);
+                out.push_str(&format!("# --- begin include {rel} ---\n"));
+                out.push_str(&resolve_includes(&child, stack)?);
+                out.push_str(&format!("# --- end include {rel} ---\n"));
+            }
+            None => {
+                out.push_str(raw);
+                out.push('\n');
+            }
+        }
+    }
+
+    stack.pop();
+    Ok(out)
 }
 
 impl Default for GameConfig {

@@ -276,6 +276,11 @@ fn phase3_action_encoding_round_trips() {
             Action::MoveHere { .. } => "MoveHere",
             Action::GiveBack { .. } => "GiveBack",
             Action::SplitTarget { .. } => "SplitTarget",
+            // The reserve's actions (`MODULAR_RULES.md` §7). Unreachable here because this
+            // test plays the canonical ruleset, whose powers never open either phase; the
+            // extended layout has its own round-trip test in `engine/tests/reserve.rs`.
+            Action::ChooseLane { .. } => "ChooseLane",
+            Action::ChooseOption { .. } => "ChooseOption",
         }
     }
     const ALL_VARIANTS: [&str; 9] = [

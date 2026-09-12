@@ -46,7 +46,9 @@
 
 use crate::action::{Action, Side};
 use crate::card::{Card, CardId};
+use crate::config::GameConfig;
 use crate::player::Player;
+use crate::powers::RetaliateMode;
 use crate::rank::Rank;
 use crate::state::{GameState, Pending};
 
@@ -235,13 +237,13 @@ pub const TOKEN_WIDTH: usize = 6;
 ///
 /// The number is the hit points **remaining**, which is public for every card: §5 makes a
 /// face-down card a blank 2 HP whatever its rank, so this leaks nothing.
-pub fn card_token(card: &Card, observer: Observer) -> String {
+pub fn card_token(card: &Card, observer: Observer, config: &GameConfig) -> String {
     let label = if knows(card, observer) {
         card.rank.label()
     } else {
         "?"
     };
-    let hp = HP_GLYPH[card.hp_remaining().min(3) as usize];
+    let hp = HP_GLYPH[card.hp_remaining(config).min(3) as usize];
     let (open, close) = if card.face_up { ('[', ']') } else { ('(', ')') };
     format!("{open}{label:<2}{hp}♥{close}")
 }
@@ -416,7 +418,7 @@ pub fn render_focus(state: &GameState, observer: Observer, focus: &Focus) -> Str
                     card.id,
                     format!(
                         "  {}{}",
-                        card_token(card, observer),
+                        card_token(card, observer, &state.config),
                         card_status(state, lane, owner, slot)
                     ),
                 )
@@ -564,23 +566,39 @@ pub(crate) fn combat_notes(
 ) -> Vec<String> {
     let me = state.acting_player();
     let mut notes: Vec<String> = Vec::new();
+    let cfg = &state.config;
     if let Some(atk) = state.at(lane, me, attacker) {
-        if atk.has_live_power(Rank::TEN) {
+        if atk.live_power(cfg).is_some_and(|p| p.twinstrikes()) {
             notes.push("twinstrike".to_string());
         }
-        if atk.has_live_power(Rank::NINE) {
+        if atk.live_power(cfg).is_some_and(|p| p.is_nimble()) {
             notes.push("nimble".to_string());
         }
     }
     if let Some(def) = state.at(lane, me.other(), target) {
-        if def.has_live_power(Rank::EIGHT) {
-            notes.push("8 retaliates for 1".to_string());
+        // Reads the configured numbers rather than the rulebook's, so the prompt stays
+        // truthful under a modded ruleset instead of quietly describing the default.
+        match def.live_power(cfg).map(|p| p.retaliate_mode()) {
+            Some(RetaliateMode::Always) => notes.push(format!(
+                "{} retaliates for {}",
+                def.rank, cfg.eight_retaliate_damage
+            )),
+            Some(RetaliateMode::OnSurvival) => notes.push(format!(
+                "{} retaliates for {} if it survives",
+                def.rank, cfg.eight_retaliate_damage
+            )),
+            Some(RetaliateMode::Never) | None => {}
         }
-        if def.has_live_power(Rank::JACK) {
-            notes.push(format!("Jack, {} HP left of 3", def.hp_remaining()));
+        if def.live_power(cfg).is_some_and(|p| p.taunts()) {
+            notes.push(format!(
+                "{}, {} HP left of {}",
+                def.rank,
+                def.hp_remaining(cfg),
+                def.max_hp(cfg)
+            ));
         }
-        if def.has_live_power(Rank::NINE) {
-            notes.push("9 blocks the twinstrike split".to_string());
+        if def.live_power(cfg).is_some_and(|p| p.is_nimble()) {
+            notes.push(format!("{} blocks the twinstrike split", def.rank));
         }
     }
     notes
@@ -630,7 +648,7 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
 
     let token = |lane: usize, owner: Player, slot: usize| -> String {
         match state.at(lane, owner, slot) {
-            Some(card) => card_token(card, observer),
+            Some(card) => card_token(card, observer, &state.config),
             None => "<gone>".to_string(),
         }
     };
@@ -777,6 +795,19 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
             }
         ),
 
+        // Under `view_choose` the destination is a separate decision, so this node commits
+        // only to *which* card leaves the hand. Describing it as a bottoming here would name
+        // a destination the player has not picked yet.
+        Action::GiveBack { rank }
+            if state.config.power(Rank::TWO) == crate::powers::PowerId::TwoViewChoose =>
+        {
+            if entitled {
+                format!("BACK  give back {rank}")
+            } else {
+                "BACK  give back a card from hand".to_string()
+            }
+        }
+
         Action::GiveBack { rank } => match state.config.two_power {
             // §5: the identity of a card you bottom is private, so only its owner is told.
             crate::config::TwoPower::Bottom if entitled => {
@@ -802,41 +833,90 @@ fn describe(state: &GameState, action: Action, observer: Observer, detail: Detai
                 token(lane, them, slot as usize)
             )
         }
+
+        // ------------------------------------------- the encoder reserve (§7) --
+        Action::ChooseLane { side, lane } => {
+            let whose = match side {
+                Side::Mine if entitled => "your",
+                Side::Mine => "their",
+                Side::Theirs if entitled => "their",
+                Side::Theirs => "your",
+            };
+            format!("LANE  choose {whose} lane {}", lane_label(lane))
+        }
+
+        // The option's *meaning* lives on the pending node, not in the action — one block
+        // serves every modal power, so this is the only place that can name it.
+        Action::ChooseOption { option } => {
+            let label = match state.pending.last() {
+                Some(Pending::ChooseOption { kind, .. }) => kind.label(option),
+                _ => "(no option node)",
+            };
+            format!("OPT   {label}")
+        }
     }
 }
 
 /// The card-power reference, for the CLI's `powers` command.
-pub fn power_reference() -> String {
+///
+/// ⚠️ Reads `config`, not the rulebook. Under a modded ruleset this must describe the game
+/// actually being played — a teaching screen that quietly describes the defaults is worse
+/// than no teaching screen, because the player checks the engine against it and concludes
+/// the *engine* is wrong (`MODULAR_RULES.md` §5b).
+pub fn power_reference(config: &GameConfig) -> String {
     let mut out = String::from("Card powers (game_rules.md §6). Powers are inert face-down.\n");
+    if !config.is_canonical_rules() {
+        out.push_str(&format!(
+            "⚠️  MODDED RULESET: {}. This is the game as configured, not the rules as \
+             written.\n",
+            config.rules_label()
+        ));
+    }
     out.push_str(&format!(
-        "{:>4}  {:<11} {:<9} {}\n",
+        "{:>4}  {:<24} {:<9} {}\n",
         "rank", "name", "type", "effect"
     ));
     for rank in Rank::ALL {
-        let kind = if rank == Rank::THREE {
-            "condition"
-        } else if rank.is_constant_power() {
+        if rank.index() > config.max_rank_index {
+            continue;
+        }
+        let power = config.power(rank);
+        let kind = if power.is_constant() {
             "constant"
-        } else {
+        } else if power.fires_on_flip() {
             "one-shot"
+        } else if power.has_death_trigger() {
+            "condition"
+        } else {
+            "none"
         };
         out.push_str(&format!(
-            "{:>4}  {:<11} {:<9} {}\n",
+            "{:>4}  {:<24} {:<9} {}\n",
             rank.label(),
-            rank.power_name(),
+            power.display_name(),
             kind,
-            rank.power_text()
+            power.text()
         ));
     }
-    out.push_str(
-        "\nHit points: every FACE-DOWN card is a blank 2 HP card, whatever its rank. Face-up, \
-         a card has 2 HP — 3 for the Jack. So flipping a Jack raises its ceiling, and a \
-         face-down Jack dies to two hits like anything else.\n",
-    );
-    out.push_str(
+    out.push_str(&format!(
+        "\nHit points: every FACE-DOWN card is a blank {} HP card, whatever its rank. \
+         Face-up, a card has {} HP — {} for a card that taunts. So flipping a Jack {}, and a \
+         face-down Jack dies to {} hits like anything else.\n",
+        config.default_hp,
+        config.default_hp,
+        config.jack_hp,
+        if config.jack_hp > config.default_hp {
+            "raises its ceiling"
+        } else {
+            "does not change its hit points"
+        },
+        config.default_hp,
+    ));
+    out.push_str(&format!(
         "Lane wins need ALL of: opponent's side of the lane empty, every draw pile empty, \
-         and the opponent's hand empty. Win two lanes to win.\n",
-    );
+         and the opponent's hand empty. Win {} lanes to win.\n",
+        config.lanes_to_win,
+    ));
     out
 }
 
@@ -1035,7 +1115,7 @@ mod tests {
 
         for observer in [Some(Player::P0), Some(Player::P1), None] {
             for card in state.lanes[0].side(Player::P0) {
-                let token = card_token(card, observer);
+                let token = card_token(card, observer, &state.config);
                 assert_eq!(
                     token.chars().count(),
                     TOKEN_WIDTH,
@@ -1066,9 +1146,10 @@ mod tests {
         let state = p.build();
         let side = state.lanes[0].side(Player::P0);
 
-        assert_eq!(card_token(&side[0], None), "[J ²♥]", "3 HP less 1 damage");
+        let cfg = &state.config;
+        assert_eq!(card_token(&side[0], None, cfg), "[J ²♥]", "3 HP less 1 damage");
         assert_eq!(
-            card_token(&side[1], None),
+            card_token(&side[1], None, cfg),
             "(J ²♥)",
             "a face-down Jack is a blank 2-HP card"
         );

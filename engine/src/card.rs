@@ -4,8 +4,13 @@
 //! pile, or the removed-unseen pool a card is just a [`Rank`], because nothing else about it
 //! can differ. See `DESIGN.md` §3.
 
+use crate::config::GameConfig;
 use crate::player::Player;
+use crate::powers::PowerId;
 use crate::rank::Rank;
+
+/// Bitmask meaning "both players know this card's rank".
+pub const KNOWN_TO_BOTH: u8 = 0b11;
 
 /// Stable identifier for a card *while it is in play*.
 ///
@@ -94,7 +99,36 @@ pub struct Card {
     /// - Face-up → known to both.
     /// - A 4's Foresight sets the peeker's bit. That knowledge is private and persistent.
     pub known_to: u8,
+
+    /// The reserve's eight per-slot status flags, as a bitmask.
+    ///
+    /// `MODULAR_RULES.md` §7, reserve item 3. Nothing in the canonical ruleset sets a bit
+    /// here, so under canonical rules this field is always `0` and the encoder does not
+    /// emit it at all — see [`crate::config::GameConfig::extended_encoder`].
+    ///
+    /// **A status is public**, like `damage` and unlike `known_to`. That is not an
+    /// incidental choice: the observation has to be a function of the information set
+    /// (`phase3_observation_is_a_function_of_the_information_set`), so a flag that only one
+    /// player could see would have to be encoded per-observer, which the slot block has no
+    /// room for. Model a status as a token sitting on the card, visible to both players.
+    ///
+    /// Flags are claimed by name in `powers/` — see [`STATUS_SHIELDED`] — and a power
+    /// declares the ones it uses in [`crate::powers::PowerId::status_flags_used`].
+    pub status: u8,
 }
+
+/// Status flag 0 — **shielded**: the card ignores the next damage it would take, and the
+/// flag clears when it does.
+///
+/// Set by [`crate::powers::PowerId::SevenShieldAll`]. Read in `apply.rs`'s `apply_one_hit`,
+/// which is the single point every hit in the engine passes through.
+pub const STATUS_SHIELDED: u8 = 0;
+
+/// Flags the reserve provides. Eight, per `MODULAR_RULES.md` §7: they cost the same as four
+/// on the metric that matters (they are zero almost always, so they add nothing to the
+/// non-zero count the search path is proportional to), and a second layout break is
+/// expensive.
+pub const STATUS_FLAG_COUNT: usize = 8;
 
 impl Card {
     /// A card entering play from a hand: face-down, undamaged, known to its owner.
@@ -112,6 +146,7 @@ impl Card {
             attack_allowance: 1,
             pair_id: None,
             known_to: owner.bit(),
+            status: 0,
         }
     }
 
@@ -130,7 +165,27 @@ impl Card {
             attack_allowance: 1,
             pair_id: None,
             known_to: 0,
+            status: 0,
         }
+    }
+
+    /// Is status flag `flag` set? See [`Card::status`].
+    #[inline]
+    pub const fn has_status(&self, flag: u8) -> bool {
+        self.status & (1 << flag) != 0
+    }
+
+    /// Set status flag `flag`.
+    #[inline]
+    pub fn set_status(&mut self, flag: u8) {
+        debug_assert!((flag as usize) < STATUS_FLAG_COUNT, "status flag {flag} is outside the reserve's {STATUS_FLAG_COUNT}");
+        self.status |= 1 << flag;
+    }
+
+    /// Clear status flag `flag`.
+    #[inline]
+    pub fn clear_status(&mut self, flag: u8) {
+        self.status &= !(1 << flag);
     }
 
     /// Maximum hit points **right now**.
@@ -150,26 +205,49 @@ impl Card {
     ///   hit points. The reverse transition cannot happen — §7 notes that "nothing ever
     ///   turns a card face-down again" — so a card can never be retroactively killed by
     ///   losing hit points it had already spent.
+    /// The extra hit point is a property of the **power**, not the rank: it is `jack_hp`
+    /// for a card whose live power taunts, and `default_hp` for everything else. Setting
+    /// `jack_hp = default_hp` is a coherent ruleset — a Jack that still taunts but dies as
+    /// fast as anything else (`MODULAR_RULES.md` §2, Tier 1).
     #[inline]
-    pub fn max_hp(&self) -> u8 {
-        if self.face_up {
-            self.rank.face_up_max_hp()
-        } else {
-            2
+    pub fn max_hp(&self, config: &GameConfig) -> u8 {
+        match self.live_power(config) {
+            Some(p) if p.taunts() => config.jack_hp,
+            _ => config.default_hp,
         }
     }
 
     /// Remaining hit points.
     #[inline]
-    pub fn hp_remaining(&self) -> u8 {
-        self.max_hp().saturating_sub(self.damage)
+    pub fn hp_remaining(&self, config: &GameConfig) -> u8 {
+        self.max_hp(config).saturating_sub(self.damage)
     }
 
     /// True once damage has reached max HP. Note that a face-down 3 in this condition does
-    /// not die — its Trap fires instead (`game_rules.md` §6).
+    /// not necessarily die — its Trap fires instead (`game_rules.md` §6), which is decided
+    /// by [`crate::powers::on_lethal_damage`] rather than here.
     #[inline]
-    pub fn is_dead(&self) -> bool {
-        self.damage >= self.max_hp()
+    pub fn is_dead(&self, config: &GameConfig) -> bool {
+        self.damage >= self.max_hp(config)
+    }
+
+    /// The power this card carries under `config`, whether or not it is currently live.
+    #[inline]
+    pub fn power(&self, config: &GameConfig) -> PowerId {
+        config.power(self.rank)
+    }
+
+    /// The card's power **if it is currently active**, i.e. if the card is face-up.
+    ///
+    /// `game_rules.md` §6: "Powers are inert while a card is face-down." So a face-down 8
+    /// does not retaliate, a face-down Jack does not taunt (and has no third hit point), a
+    /// face-down 9 is not Nimble, and a face-down 10 does not twinstrike.
+    ///
+    /// Every rule that keys on what a card *is* goes through this rather than reading
+    /// `self.rank`, which is what makes a rules mod a config change.
+    #[inline]
+    pub fn live_power(&self, config: &GameConfig) -> Option<PowerId> {
+        self.face_up.then(|| config.power(self.rank))
     }
 
     /// Frozen as of `ply`?
@@ -191,16 +269,6 @@ impl Card {
     #[inline]
     pub fn can_attack(&self, ply: u32) -> bool {
         self.face_up && !self.is_frozen(ply) && self.attacks_used < self.attack_allowance
-    }
-
-    /// True if this card's *constant* power is live: it must be face-up.
-    ///
-    /// `game_rules.md` §6: "Powers are inert while a card is face-down." So a face-down 8
-    /// does not retaliate, a face-down Jack does not taunt, a face-down 9 is not Nimble,
-    /// and a face-down 10 does not twinstrike.
-    #[inline]
-    pub fn has_live_power(&self, rank: Rank) -> bool {
-        self.face_up && self.rank == rank
     }
 
     /// Reset the per-turn attack budget. Called at the start of the owner's turn.

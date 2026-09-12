@@ -1,0 +1,25 @@
+# The Jack taunts, but dies like everything else.
+#
+# **Tier 1** (`MODULAR_RULES.md` §2): one config number, no code change, no new power. This is
+# the cheapest kind of balance experiment there is, and this file exists partly to show what
+# that tier looks like next to the Tier-2 files beside it.
+#
+# The extra hit point is a property of the *power*, not the rank — `game_rules.md` §5 gives
+# the Jack 3 HP only while face-up, exactly as it gets its taunt only while face-up, so
+# `Card::max_hp` reads `jack_hp` when the live power taunts and `default_hp` otherwise.
+# Setting them equal is therefore a coherent ruleset rather than a special case.
+#
+# Two consequences that are easy to miss:
+#
+#   - A **face-down** Jack was always a blank 2-HP card (§5), so this changes nothing about
+#     face-down play, and nothing about belief: a Jack still cannot be identified by chipping
+#     it, which is the property `rule_5_you_cannot_identify_a_face_down_jack_by_damaging_it`
+#     protects.
+#   - The 9's double damage against a taunter now **one-shots a lone Jack**, where before it
+#     took a pair. `nimble_vs_taunt_multiplier` is a separate Tier-1 knob if that turns out to
+#     be too sharp.
+
+include = "canonical.toml"
+
+rules_name = "jack-2hp"
+jack_hp = 2

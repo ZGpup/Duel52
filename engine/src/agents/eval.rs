@@ -151,7 +151,7 @@ fn side_score(state: &GameState, p: Player, view: View, w: &EvalWeights) -> f32 
     let mut pairs = 0.0;
 
     for (_, _, card) in state.cards_of(p) {
-        total += w.hit_point * card.hp_remaining() as f32;
+        total += w.hit_point * card.hp_remaining(&state.config) as f32;
         total += if card.face_up {
             FACE_UP_POWER[card.rank.index()]
         } else if view.reads(card) {
@@ -177,7 +177,7 @@ fn side_score(state: &GameState, p: Player, view: View, w: &EvalWeights) -> f32 
         .map(|lane| {
             lane.side(p)
                 .iter()
-                .map(|c| c.hp_remaining() as f32)
+                .map(|c| c.hp_remaining(&state.config) as f32)
                 .sum::<f32>()
         })
         .collect();

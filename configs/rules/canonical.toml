@@ -1,0 +1,11 @@
+# The rules as written, plus this project's two house rules.
+#
+# `game_rules.md` is the spec; §9a makes the split deck the project default and §10a makes
+# the 2 a scry rather than a discard. Every other file in this directory is a diff against
+# this one, and every number in `FINDINGS.md` from before 2026-09-09 was measured under it.
+#
+# Nothing here overrides a default — it is the defaults, written out, so that a diff against
+# it is readable.
+
+rules_name = "canonical-2026-09"
+variant = "split"

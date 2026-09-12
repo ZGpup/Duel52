@@ -49,7 +49,7 @@ fn rule_5_a_face_down_jack_is_a_blank_two_hp_card() {
     p.face_down(0, P1, Rank::JACK);
     let mut s = p.build();
 
-    assert_eq!(card_at(&s, 0, P1, 0).max_hp(), 2);
+    assert_eq!(card_at(&s, 0, P1, 0).max_hp(&s.config), 2);
     go(&mut s, atk(0, 0));
     go(&mut s, atk(1, 0));
     assert_eq!(occupancy(&s, 0, P1), 0, "two hits kill a face-down Jack");
@@ -69,8 +69,12 @@ fn rule_5_you_cannot_identify_a_face_down_jack_by_damaging_it() {
 
     let jack = card_at(&s, 0, P1, 0);
     let four = card_at(&s, 0, P1, 1);
-    assert_eq!(jack.max_hp(), four.max_hp(), "indistinguishable");
-    assert_eq!(jack.hp_remaining(), four.hp_remaining());
+    assert_eq!(
+        jack.max_hp(&s.config),
+        four.max_hp(&s.config),
+        "indistinguishable"
+    );
+    assert_eq!(jack.hp_remaining(&s.config), four.hp_remaining(&s.config));
 }
 
 /// §5: "Damage persists through flipping" — and flipping a Jack *raises* its ceiling from
@@ -83,13 +87,17 @@ fn rule_5_flipping_a_damaged_jack_raises_its_ceiling_and_keeps_the_damage() {
     p.damage(0, P0, 0, 1);
     let mut s = p.build();
 
-    assert_eq!(card_at(&s, 0, P0, 0).hp_remaining(), 1, "1 of 2 while face-down");
+    assert_eq!(
+        card_at(&s, 0, P0, 0).hp_remaining(&s.config),
+        1,
+        "1 of 2 while face-down"
+    );
 
     go(&mut s, Action::Flip { lane: 0, slot: 0 });
     let jack = card_at(&s, 0, P0, 0);
     assert_eq!(jack.damage, 1, "the damage persists");
-    assert_eq!(jack.max_hp(), 3, "but the ceiling rose");
-    assert_eq!(jack.hp_remaining(), 2, "so it now has 2 of 3");
+    assert_eq!(jack.max_hp(&s.config), 3, "but the ceiling rose");
+    assert_eq!(jack.hp_remaining(&s.config), 2, "so it now has 2 of 3");
 }
 
 /// §4: "**Each card may attack only once per turn.**"

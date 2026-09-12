@@ -74,8 +74,11 @@
 
 pub mod action;
 pub mod agents;
+pub mod analysis;
 pub mod card;
+pub mod cardvalue;
 pub mod config;
+pub mod damage;
 pub mod display;
 pub mod elo;
 pub mod encode;
@@ -84,6 +87,7 @@ pub mod menu;
 pub mod nn;
 pub mod outcome;
 pub mod player;
+pub mod powers;
 pub mod probe;
 pub mod rank;
 pub mod record;

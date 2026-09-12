@@ -1,0 +1,40 @@
+# The King empowers a lane of your choosing.
+#
+# Needs the extended encoder layout (`MODULAR_RULES.md` §7).
+#
+# Canonically a King reactivates the face-up cards in **its own** lane, so the whole of a
+# King's value is decided when you play it — three actions and a guess about where the game
+# will be, made before you know. Here the King asks which of your lanes to reactivate when it
+# is flipped, so the decision moves to the moment you have the information.
+#
+# Why this is the interesting variant
+#
+# It separates two things the canonical King bundles: *having* a King and *having put it in
+# the right lane*. `FINDINGS.md`'s card-value table measures the bundle. If the King's value
+# is mostly the second half, this ruleset should move it a long way; if it is mostly the
+# first, barely at all — and that is a fact about the card the canonical rules cannot ask.
+#
+# What it exercises structurally
+#
+# This is the ruleset that claims §7's `CHOOSE_LANE` block **and** a reserve phase. It is
+# also the demonstration that one `2·L` block covers a power restricted to one side: a King
+# reactivates its owner's cards, so `legal_lane_choices` emits only `Side::Mine` and the
+# three `Theirs` logits are never legal here. A power that targeted an **enemy** lane would
+# use the same block from the other end, which is why the block is `2·L` and not two blocks
+# of `L`.
+#
+# `game_rules.md` §6's "does not affect other Kings" is untouched, so §7's finiteness
+# argument holds exactly as before: choosing the lane changes which cards refire, not whether
+# a King can refire a King. A lane with nothing to reactivate is not offered (§8 fizzles a
+# power with no legal target), so a King with no targets anywhere fizzles rather than asking
+# a question with one answer.
+#
+# ⚠️ Moves `obs_layout_hash` and `action_layout_hash`. See `seven-shield.toml`.
+#
+# Expected effect: Kings get better, and later — there is no longer a reason to commit one
+# early. Watch the King's `gap` in the card-value table (in hand vs on board) narrow.
+
+include = "canonical.toml"
+
+rules_name = "king-any-lane"
+powers.king = "empower_any_lane"

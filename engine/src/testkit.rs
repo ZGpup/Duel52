@@ -107,13 +107,14 @@ impl Position {
     /// Note the ceiling depends on face-up state: a face-down Jack is a blank 2-HP card
     /// (`game_rules.md` §5), so 2 damage kills it and only a *face-up* Jack can sit on 2.
     pub fn damage(&mut self, lane: usize, owner: Player, slot: usize, damage: u8) -> &mut Self {
+        let config = self.state.config;
         let card = &mut self.state.lanes[lane].side_mut(owner)[slot];
         assert!(
-            damage < card.max_hp(),
+            damage < card.max_hp(&config),
             "{damage} damage would kill a {} {} ({} HP)",
             if card.face_up { "face-up" } else { "face-down" },
             card.rank,
-            card.max_hp()
+            card.max_hp(&config)
         );
         card.damage = damage;
         self
@@ -269,7 +270,12 @@ pub fn permute_lanes(state: &GameState, sigma: &[usize]) -> GameState {
             | Pending::QueenSource { lane, .. }
             | Pending::SplitTarget { lane, .. } => *lane = sigma[*lane as usize] as u8,
             // A Foresight names a card only once it is chosen, and a give-back names a rank.
-            Pending::Foresight { .. } | Pending::GiveBack { .. } => {}
+            // A `ChooseLane` node names no lane *yet* — that is the decision it is asking
+            // for — and a `ChooseOption` node never names one.
+            Pending::Foresight { .. }
+            | Pending::GiveBack { .. }
+            | Pending::ChooseLane { .. }
+            | Pending::ChooseOption { .. } => {}
         }
     }
     out
@@ -288,8 +294,12 @@ pub fn permute_action(action: &Action, sigma: &[usize]) -> Action {
         | Action::DeclarePair { lane, .. }
         | Action::Peek { lane, .. }
         | Action::ResolveNext { lane, .. }
-        | Action::MoveHere { lane, .. } => *lane = sigma[*lane as usize] as u8,
-        Action::SplitTarget { .. } | Action::GiveBack { .. } => {}
+        | Action::MoveHere { lane, .. }
+        // `ChooseLane` names a lane outright, so it relabels like any other — this is the
+        // line whose absence would make the lane equivariance silently false for the
+        // reserve's block (`MODULAR_RULES.md` §7).
+        | Action::ChooseLane { lane, .. } => *lane = sigma[*lane as usize] as u8,
+        Action::SplitTarget { .. } | Action::GiveBack { .. } | Action::ChooseOption { .. } => {}
     }
     out
 }

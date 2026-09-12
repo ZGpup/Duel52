@@ -38,6 +38,14 @@ class GameSettings:
     """Which game is being learned. Passed to both the engine CLI and ``encoding_spec()``."""
 
     variant: str = "split"
+    #: A ruleset file from ``configs/rules/`` (``MODULAR_RULES.md`` §5d). When set, it is
+    #: passed as ``--config`` **instead of** ``--variant`` — the CLI rejects both together,
+    #: since it is never clear which should win, and that rejection was the one thing
+    #: blocking a training run from using a custom ruleset at all.
+    #:
+    #: The file's own ``variant`` key decides the deck, so a ruleset that wants the base game
+    #: says so in the file rather than here.
+    rules_file: str | None = None
     #: ``FINDINGS.md`` F3.1: 16 survives self-play and does *not* survive a ladder against
     #: `random`, which is the permanent anchor rung. 21 is the theoretical maximum, so the
     #: encoder provably cannot assert. Training runs pay the 30% tensor cost and sleep.
@@ -52,8 +60,11 @@ class GameSettings:
     stalemate_value: float = 0.0
 
     def cli_flags(self) -> list[str]:
+        # ``--config`` and ``--variant`` are mutually exclusive in the CLI, so a ruleset file
+        # replaces the variant flag rather than joining it.
+        base = ["--config", self.rules_file] if self.rules_file else ["--variant", self.variant]
         flags = [
-            "--variant", self.variant,
+            *base,
             "--encoding-slots", str(self.encoding_slots),
             "--stalemate-value", str(self.stalemate_value),
         ]

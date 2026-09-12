@@ -24,15 +24,14 @@
 //! lane" (`game_rules.md` §8) come out in the right order.
 
 use crate::action::{Action, IllegalAction, Side};
-use crate::card::{Card, CardId};
+use crate::card::{Card, CardId, KNOWN_TO_BOTH};
 use crate::config::TwoPower;
+use crate::damage::{DamageQueue, DamageSource, Hit};
 use crate::outcome::{DrawReason, Outcome};
 use crate::player::Player;
+use crate::powers::{self, LethalOutcome, PowerCtx, PowerId};
 use crate::rank::Rank;
-use crate::state::{GameState, Pending, ResolveKind};
-
-/// Bitmask meaning "both players know this card's rank".
-const KNOWN_TO_BOTH: u8 = 0b11;
+use crate::state::{GameState, LaneChoice, OptionChoice, Pending, ResolveKind};
 
 impl GameState {
     // =================================================================== public entry ==
@@ -113,6 +112,8 @@ impl GameState {
             Action::MoveHere { lane, slot } => self.do_move_here(lane as usize, slot as usize),
             Action::GiveBack { rank } => self.do_give_back(rank),
             Action::SplitTarget { slot } => self.do_split_target(slot as usize),
+            Action::ChooseLane { side, lane } => self.do_choose_lane(side, lane as usize),
+            Action::ChooseOption { option } => self.do_choose_option(option),
         }
 
         self.settle();
@@ -176,10 +177,14 @@ impl GameState {
 
         let attackers = self.attack_group(lane, me, attacker_slot);
         let is_pair = attackers.len() == 2;
-        let attacker_rank = self.lanes[lane].side(me)[attacker_slot].rank;
+        let attacker_power = self.lanes[lane].side(me)[attacker_slot].live_power(&self.config);
         let primary = self.lanes[lane].side(opponent)[target_slot].id;
+        let source = DamageSource::Attack {
+            attacker: attackers[0],
+            partner: attackers.get(1).copied(),
+        };
 
-        if attacker_rank == Rank::TEN {
+        if attacker_power.is_some_and(|p| p.twinstrikes()) {
             let candidates = self.twinstrike_split_candidates(lane, opponent, target_slot);
             if !candidates.is_empty() {
                 // Both targets are collected *before* any damage lands, so the two halves
@@ -196,14 +201,18 @@ impl GameState {
             // §5: "Damage is never lost — whenever the split cannot happen ... the full 2
             // lands on that single card." That promise is about the *pair*; a lone 10's
             // second point of damage was the twinstrike bonus, so it goes away with it.
-            let damage = if is_pair { 2 } else { 1 };
-            self.resolve_attack(attackers, &[(primary, damage)]);
+            let damage = if is_pair {
+                self.config.pair_attack_damage
+            } else {
+                self.config.single_attack_damage
+            };
+            self.resolve_attack(attackers, &[(primary, damage)], source);
             return;
         }
 
         let target = &self.lanes[lane].side(opponent)[target_slot];
-        let damage = self.attack_damage(attacker_rank, target, is_pair);
-        self.resolve_attack(attackers, &[(primary, damage)]);
+        let damage = self.attack_damage(attacker_power, target, is_pair);
+        self.resolve_attack(attackers, &[(primary, damage)], source);
     }
 
     /// The second half of a 10's twinstrike: 1 damage to each of the two targets.
@@ -223,7 +232,12 @@ impl GameState {
         };
         let opponent = self.to_move.other();
         let secondary = self.lanes[lane as usize].side(opponent)[slot].id;
-        self.resolve_attack(attackers, &[(primary, 1), (secondary, 1)]);
+        let half = self.config.twinstrike_split_damage;
+        let source = DamageSource::Attack {
+            attacker: attackers[0],
+            partner: attackers.get(1).copied(),
+        };
+        self.resolve_attack(attackers, &[(primary, half), (secondary, half)], source);
     }
 
     /// Land an attack: spend the attackers' budget, apply every hit, then resolve retaliate.
@@ -239,7 +253,12 @@ impl GameState {
     ///   it. **[ASSUMED]** — §6 says "any card that attacks this 8 takes 1 damage" and the
     ///   10 has attacked both, so the damage adds. Nothing in the rules addresses the case
     ///   directly.
-    fn resolve_attack(&mut self, attackers: Vec<CardId>, hits: &[(CardId, u8)]) {
+    fn resolve_attack(
+        &mut self,
+        attackers: Vec<CardId>,
+        hits: &[(CardId, u8)],
+        source: DamageSource,
+    ) {
         // Each card may attack only once per turn (§4); a pair attack is one attack for
         // both members' budget (§5).
         for &id in &attackers {
@@ -248,74 +267,137 @@ impl GameState {
             }
         }
 
-        let attacker_rank = self.card(attackers[0]).map(|c| c.rank);
+        let attacker_power = self.card(attackers[0]).and_then(|c| c.live_power(&self.config));
 
-        // Read retaliate *before* damage: an 8 that dies to this attack still retaliates.
-        let retaliations = hits
-            .iter()
-            .filter(|(id, _)| {
-                self.card(*id)
-                    .is_some_and(|c| c.has_live_power(Rank::EIGHT))
-            })
-            .count();
+        // Read retaliate *before* damage: under the rules as written an 8 that dies to this
+        // attack still retaliates. `retaliate_on_survival` asks again afterwards instead;
+        // both readings are taken here so the attack has one place that owns the ordering.
+        let retaliation = powers::eight::read(self, hits);
 
+        // The attack's own damage, and everything it triggers, resolves in full first.
         for &(id, amount) in hits {
-            self.damage_card(id, amount);
+            self.enqueue_damage(Hit {
+                target: id,
+                amount,
+                source,
+            });
         }
+        self.drain_damage();
 
-        if retaliations > 0 && attacker_rank != Some(Rank::NINE) {
-            for &id in &attackers {
-                for _ in 0..retaliations {
-                    if self.card(id).is_some() {
-                        self.damage_card(id, 1);
-                    }
-                }
+        // Nimble takes no retaliate damage, and "pairing does not forfeit Nimble", so a
+        // 9-pair kills an 8 outright for free (§5).
+        if attacker_power.is_some_and(|p| p.is_nimble()) {
+            return;
+        }
+        let owed = powers::eight::settle(self, &retaliation);
+        if owed.is_empty() {
+            return;
+        }
+        let per_hit = powers::eight::damage_per_hit(self);
+        // A pair attacking an 8: **both members take 1** (§5). A 10 whose twinstrike hits
+        // two 8s takes one from each, for 2 total, which kills it — **[ASSUMED]**, §6 says
+        // "any card that attacks this 8 takes 1 damage" and the 10 has attacked both.
+        for &attacker in &attackers {
+            for &eight in &owed {
+                self.enqueue_damage(Hit {
+                    target: attacker,
+                    amount: per_hit,
+                    source: DamageSource::Retaliate { from: eight },
+                });
             }
         }
+        self.drain_damage();
     }
 
-    /// Apply damage to one card, then handle death — including the 3's Trap.
+    // ======================================================================== damage ==
+
+    /// Add a hit to the queue. Lands when the current [`GameState::drain_damage`] reaches
+    /// it, or immediately after if none is running.
+    pub(crate) fn enqueue_damage(&mut self, hit: Hit) {
+        self.damage_queue.push(hit);
+    }
+
+    /// Apply every queued hit, including any a death trigger adds while we are draining.
     ///
-    /// `game_rules.md` §6, the 3: "If killed **while face-down**, it returns to play
-    /// face-up with full 2 HP instead of dying — immediately, in the same lane. It comes
-    /// back fully active with no waiting period, and it returns face-up so the Trap
-    /// **cannot re-trigger**." A base 3 killed post-unlock triggers this too and returns as
-    /// a normal, non-base card (§3).
-    ///
-    /// The card keeps its freeze, if it had one: the Trap is not a flip and nothing in §8
-    /// clears a freeze early. **[ASSUMED]**
-    pub(crate) fn damage_card(&mut self, id: CardId, amount: u8) {
-        let Some((lane, side, slot)) = self.locate(id) else {
+    /// Re-entrant by design: a power body that enqueues damage calls this indirectly through
+    /// `apply_one_hit`, and the nested call returns immediately rather than starting a
+    /// second drain. That is what keeps the order a single FIFO — `MODULAR_RULES.md` §3a
+    /// describes the bug the other way round, where a 10 twinstrikes two face-down 3s and
+    /// the second 3's vengeance is dropped because the loop that spawned it moved on.
+    pub(crate) fn drain_damage(&mut self) {
+        if self.damage_queue.is_draining() {
+            return;
+        }
+        self.damage_queue.set_draining(true);
+        let mut applied = 0usize;
+        while let Some(hit) = self.damage_queue.pop() {
+            applied += 1;
+            assert!(
+                applied <= DamageQueue::MAX_CASCADE,
+                "damage cascade exceeded {} hits — a ruleset has a cycle of death triggers. \
+                 `game_rules.md` §7's finiteness argument does not cover it.",
+                DamageQueue::MAX_CASCADE
+            );
+            self.apply_one_hit(hit);
+        }
+        self.damage_queue.set_draining(false);
+    }
+
+    /// Apply damage to one card, then ask its power what happens if that was lethal.
+    fn apply_one_hit(&mut self, hit: Hit) {
+        let Some((lane, side, slot)) = self.locate(hit.target) else {
             return; // already left play
         };
 
+        // A shield absorbs the whole hit and is spent doing it (`MODULAR_RULES.md` §7,
+        // reserve item 3 — set by `PowerId::SevenShieldAll`). Under the canonical ruleset no
+        // card ever carries a status bit, so this is one predictable-false test per hit.
+        //
+        // It returns **before** `damage_this_ply`, so a shielded hit does not reset §7's
+        // quiet-ply counter: nothing was damaged and nothing was killed, and treating it as
+        // action would let two shielded boards stall the stalemate detector forever.
         {
             let card = &mut self.lanes[lane].sides[side][slot];
-            card.damage = card.damage.saturating_add(amount);
+            if card.has_status(crate::card::STATUS_SHIELDED) {
+                card.clear_status(crate::card::STATUS_SHIELDED);
+                return;
+            }
+            card.damage = card.damage.saturating_add(hit.amount);
         }
         // §7: the quiet-ply counter "resets on damage or a kill and on nothing else".
         self.damage_this_ply = true;
 
-        if !self.lanes[lane].sides[side][slot].is_dead() {
+        if !self.lanes[lane].sides[side][slot].is_dead(&self.config) {
             return;
         }
 
-        let is_face_down_three = {
-            let card = &self.lanes[lane].sides[side][slot];
-            card.rank == Rank::THREE && !card.face_up
+        // The power is read whether or not it is *live*: the 3's Trap fires only while the
+        // card is face-down, which is the opposite of a constant power's condition, so the
+        // face-up test belongs to the power rather than to this dispatch.
+        let power = self.lanes[lane].sides[side][slot].power(&self.config);
+        let ctx = PowerCtx {
+            id: hit.target,
+            owner: Player::from_index(side),
+            lane,
+            side,
+            slot,
         };
-
-        if is_face_down_three {
-            let card = &mut self.lanes[lane].sides[side][slot];
-            card.damage = 0;
-            card.face_up = true;
-            card.known_to = KNOWN_TO_BOTH;
-            card.is_base = false;
-            card.attacks_used = 0;
-            card.attack_allowance = 1;
-        } else {
-            self.kill_card(lane, side, slot);
+        match powers::on_lethal_damage(self, power, ctx, hit.source) {
+            LethalOutcome::Restored => {}
+            LethalOutcome::Die => self.kill_card(lane, side, slot),
         }
+    }
+
+    /// Apply one hit with no attribution, immediately. For `testkit` positions and anything
+    /// the engine applies as bookkeeping rather than as a rule.
+    #[allow(dead_code)]
+    pub(crate) fn damage_card(&mut self, id: CardId, amount: u8) {
+        self.enqueue_damage(Hit {
+            target: id,
+            amount,
+            source: DamageSource::Unattributed,
+        });
+        self.drain_damage();
     }
 
     /// Remove a dead card from play.
@@ -379,160 +461,31 @@ impl GameState {
             "a power fired for a player who is not to move"
         );
 
-        match rank {
-            // ---- A · Action ---------------------------------------------------------
-            // "Gain 1 action this turn, usable however you like. On the turn it is
-            // flipped, the Ace itself may attack twice." (§6)
-            //
-            // A King reactivating an Ace grants the action again — once — and *resets* the
-            // attack counter rather than stacking it, so an Ace that attacked once and was
-            // then Kinged tops out at three attacks that turn, not four (§6).
-            Rank::ACE => {
-                self.actions_remaining += 1;
-                let card = &mut self.lanes[lane].sides[side][slot];
-                card.attacks_used = 0;
-                card.attack_allowance = 2;
-            }
-
-            // ---- 2 · View -----------------------------------------------------------
-            // "Draw a card, then put a card from your hand on the bottom of your draw
-            // pile — a scry, not a discard." (§6, house rule §10a)
-            //
-            // Gated on the pile **you** draw from, not the global `base_unlocked` flag
-            // (§3, §9): "if that pile is empty the power does nothing at all — no draw,
-            // and no bottoming either, so it cannot be used to refill an empty pile." So a
-            // 2 can go dead a turn before the global unlock.
-            Rank::TWO => {
-                if self.pile(owner).is_empty() {
-                    return;
-                }
-                self.draw_one(owner);
-                // The draw guarantees a non-empty hand, so this node always has an answer.
-                self.pending.push(Pending::GiveBack { player: owner });
-            }
-
-            // ---- 3 · Trap -----------------------------------------------------------
-            // Conditional, and only while face-down. Nothing happens on the flip; see
-            // `damage_card`.
-            Rank::THREE => {}
-
-            // ---- 4 · Foresight ------------------------------------------------------
-            // "Look at any one face-down card on the board — including base cards, yours
-            // or your opponent's. Private information." (§6)
-            Rank::FOUR => {
-                if !self.face_down_cards().is_empty() {
-                    self.pending.push(Pending::Foresight { player: owner });
-                }
-            }
-
-            // ---- 5 · Flip -----------------------------------------------------------
-            // "Flip all your face-down cards in its lane. You choose the order in which
-            // their powers resolve — one at a time, seeing each result before choosing the
-            // next." (§6) Includes your base card in that lane once the pile is empty.
-            //
-            // All-or-nothing: §8 stresses that post-unlock it flips your base card
-            // "whether you want it flipped or not", which is what makes a held 5 committal
-            // in the endgame. The sole exception is frozen cards, which it "simply skips".
-            //
-            // The list is snapshotted here, so a face-down card that a Queen brings into
-            // the lane *during* the cascade is not caught by it. **[ASSUMED]** — §8 says
-            // the player picks from a queue, which reads as a fixed set.
-            Rank::FIVE => {
-                let queue = self.five_flip_targets(owner, lane, id);
-                if !queue.is_empty() {
-                    self.pending.push(Pending::ResolveOrder {
-                        kind: ResolveKind::FiveFlip,
-                        player: owner,
-                        lane: lane as u8,
-                        remaining: queue,
-                    });
-                }
-            }
-
-            // ---- 6 · Freeze ---------------------------------------------------------
-            // "All enemy cards in the lane are frozen: they may not attack, and cannot be
-            // flipped at all. Cannot freeze a 9, ever." (§6)
-            //
-            // Per card, not per lane: "Cards that enter the lane *after* the 6 resolves are
-            // not frozen", and a frozen card a Queen relocates stays frozen (§8).
-            //
-            // The 9's immunity is Nimble, and powers are inert while face-down (§6), so a
-            // **face-down** 9 can be frozen. **[ASSUMED]** — the rulebook's "ever" is about
-            // timing (a 9 already in the lane is still immune), not about face-up-ness.
-            Rank::SIX => {
-                let ply = self.ply;
-                let enemy = owner.other();
-                for card in self.lanes[lane].side_mut(enemy) {
-                    if card.has_live_power(Rank::NINE) {
-                        continue;
-                    }
-                    // §8: unfrozen "at the end of the frozen player's next turn — so
-                    // exactly one of their turns is lost". Plies strictly alternate, so the
-                    // victim's next turn is `ply + 1`.
-                    card.frozen_until_ply = Some(ply + 1);
-                }
-            }
-
-            // ---- 7 · Heal All -------------------------------------------------------
-            // "Heal all your damaged cards 2 HP, in all lanes, face-up and face-down."
-            // (§6) Includes base cards once the pile is empty. "Healing is capped at the
-            // card's maximum HP — a Jack on 1 HP heals to 3, not 5", which is what
-            // `saturating_sub` on the damage counter expresses.
-            Rank::SEVEN => {
-                let unlocked = self.base_unlocked;
-                for lane_ref in self.lanes.iter_mut() {
-                    for card in lane_ref.side_mut(owner) {
-                        if card.is_base && !unlocked {
-                            continue;
-                        }
-                        card.damage = card.damage.saturating_sub(2);
-                    }
-                }
-            }
-
-            // ---- 8, 9, 10, J · constant powers --------------------------------------
-            // Nothing fires on the flip; these are read live during combat and targeting.
-            Rank::EIGHT | Rank::NINE | Rank::TEN | Rank::JACK => {}
-
-            // ---- Q · Move -----------------------------------------------------------
-            // "Move one allied card from another lane into the Queen's lane, face-down or
-            // face-up." (§6) Fizzles with no allied card elsewhere — and §8 notes that is
-            // often exactly why you flip her: "a Queen with no move available is still a
-            // body that can attack".
-            Rank::QUEEN => {
-                if !self.queen_move_sources(owner, lane).is_empty() {
-                    self.pending.push(Pending::QueenSource {
-                        player: owner,
-                        lane: lane as u8,
-                    });
-                }
-            }
-
-            // ---- K · Empower --------------------------------------------------------
-            // "All your face-up cards in this lane reactivate their powers. Does not affect
-            // other Kings. Does not affect constant powers." (§6)
-            //
-            // Because Kings cannot activate Kings, no infinite loop is possible — §6 says
-            // so explicitly, and it is worth noting the engine relies on it rather than on
-            // a depth limit.
-            Rank::KING => {
-                let queue = self.king_reactivation_targets(owner, lane, id);
-                if !queue.is_empty() {
-                    self.pending.push(Pending::ResolveOrder {
-                        kind: ResolveKind::KingEmpower,
-                        player: owner,
-                        lane: lane as u8,
-                        remaining: queue,
-                    });
-                }
-            }
-
-            _ => unreachable!("rank {rank} has no power branch"),
-        }
+        // `MODULAR_RULES.md` §5b: the thirteen-arm match on `Rank` that used to live here
+        // moved into `powers/`, one module per rank. The turn machinery no longer names a
+        // card, which is the property that makes changing the 3 touch `powers/three.rs` and
+        // nothing else.
+        let power = self.config.power(rank);
+        powers::on_flip(
+            self,
+            power,
+            PowerCtx {
+                id,
+                owner,
+                lane,
+                side,
+                slot,
+            },
+        );
     }
 
     /// Your face-down cards in `lane` that a 5 would flip.
-    fn five_flip_targets(&self, owner: Player, lane: usize, five_id: CardId) -> Vec<CardId> {
+    pub(crate) fn five_flip_targets(
+        &self,
+        owner: Player,
+        lane: usize,
+        five_id: CardId,
+    ) -> Vec<CardId> {
         self.lanes[lane]
             .side(owner)
             .iter()
@@ -548,7 +501,7 @@ impl GameState {
     }
 
     /// Your face-up cards in `lane` that a King would refire.
-    fn king_reactivation_targets(
+    pub(crate) fn king_reactivation_targets(
         &self,
         owner: Player,
         lane: usize,
@@ -559,8 +512,10 @@ impl GameState {
             .iter()
             .filter(|c| c.id != king_id)
             .filter(|c| c.face_up)
-            // Excludes 8/9/10/J (constant), K (excluded by rule) and 3 (conditional).
-            .filter(|c| c.rank.is_king_reactivatable())
+            // Excludes 8/9/10/J (constant), K (excluded by rule) and 3 (conditional) — but
+            // reads it off the *power*, so an ablated card is excluded too rather than
+            // being refired into a no-op.
+            .filter(|c| self.config.power(c.rank).is_king_reactivatable())
             .map(|c| c.id)
             .collect()
     }
@@ -655,9 +610,60 @@ impl GameState {
             .expect("legality guaranteed this rank is in hand");
         hand.remove(pos);
 
+        // `view_choose` puts the destination to the player instead of reading it off the
+        // config. The card is already out of hand either way, so the option node cannot
+        // fizzle and leave a card in limbo.
+        if self.config.power(Rank::TWO) == PowerId::TwoViewChoose {
+            self.pending.push(Pending::ChooseOption {
+                player,
+                kind: OptionChoice::GiveBackDestination { rank },
+            });
+            return;
+        }
         match self.config.two_power {
             TwoPower::Bottom => self.pile_mut(player).put_on_bottom(rank, player),
             TwoPower::Discard => self.discards[player.idx()].push(rank),
+        }
+    }
+
+    // ==================================================== the encoder reserve (§7) ==
+
+    /// Answer a [`Pending::ChooseLane`] node. `MODULAR_RULES.md` §7, reserve item 2.
+    ///
+    /// `side` is not read: `legal_lane_choices` is what decides which side a given power may
+    /// name, and it emits only the one that power is entitled to. Checking it again here
+    /// would be a second copy of that rule, which is exactly how legality and resolution
+    /// drift apart.
+    fn do_choose_lane(&mut self, _side: Side, lane: usize) {
+        let Some(Pending::ChooseLane { player, kind }) = self.pending.pop() else {
+            unreachable!("do_choose_lane called outside a ChooseLane node");
+        };
+        match kind {
+            LaneChoice::KingEmpower { king } => {
+                let queue = self.king_reactivation_targets(player, lane, king);
+                if !queue.is_empty() {
+                    self.pending.push(Pending::ResolveOrder {
+                        kind: ResolveKind::KingEmpower,
+                        player,
+                        lane: lane as u8,
+                        remaining: queue,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Answer a [`Pending::ChooseOption`] node. §7, reserve item 2.
+    fn do_choose_option(&mut self, option: u8) {
+        let Some(Pending::ChooseOption { player, kind }) = self.pending.pop() else {
+            unreachable!("do_choose_option called outside a ChooseOption node");
+        };
+        match kind {
+            OptionChoice::GiveBackDestination { rank } => match option {
+                0 => self.pile_mut(player).put_on_bottom(rank, player),
+                1 => self.discards[player.idx()].push(rank),
+                other => unreachable!("legality offers only 0..{}, got {other}", kind.count()),
+            },
         }
     }
 
@@ -675,7 +681,7 @@ impl GameState {
     /// bottomed card can only return to the player who put it there and nothing is lost.
     /// Recorded as a Phase 3 observation-encoding gap in `DESIGN.md` §5; it affects no
     /// legality or outcome.
-    fn draw_one(&mut self, player: Player) -> Option<Rank> {
+    pub(crate) fn draw_one(&mut self, player: Player) -> Option<Rank> {
         let (rank, _known_to) = self.pile_mut(player).draw()?;
         self.hands[player.idx()].push(rank);
         self.hands[player.idx()].sort_unstable();

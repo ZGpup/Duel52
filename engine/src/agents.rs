@@ -310,6 +310,16 @@ impl AgentSpec {
         }
     }
 
+    /// The checkpoint this agent plays, if it plays one.
+    pub fn checkpoint(&self) -> Option<&str> {
+        match self {
+            AgentSpec::NetPolicy { checkpoint } | AgentSpec::NetMcts { checkpoint, .. } => {
+                Some(checkpoint.as_str())
+            }
+            _ => None,
+        }
+    }
+
     /// Build an instance whose randomness is derived from `(seed, stream)`, so a whole
     /// match is reproducible from the game seed alone.
     ///

@@ -636,6 +636,13 @@ pub fn run(
         "action_layout_hash={:016x}",
         crate::encode::action_layout_hash(&config)
     );
+    // Which *game* this shard is of. Unlike the layout hashes, this one is not implied by
+    // anything else in the file: the encoder is rank-agnostic, so a shard generated under a
+    // modded ruleset has an identical layout and is indistinguishable without it
+    // (`MODULAR_RULES.md` §6). Python reads it back off the header and refuses to mix two
+    // rulesets in one replay buffer.
+    let _ = writeln!(header, "rules_name={}", config.rules_name);
+    let _ = writeln!(header, "rules_hash={:016x}", config.rules_hash());
 
     let config_text = config.to_config_string();
     let mut bytes: Vec<u8> = Vec::with_capacity(games * 12_000);
@@ -830,6 +837,22 @@ impl Shard {
                     "{}: {key} is {recorded} in the shard but {expected} in this build — the \
                      shard was generated against a different encoder and its action indices \
                      mean something else here. Regenerate it.",
+                    path.display()
+                ));
+            }
+        }
+
+        // Same shape for the ruleset, and for the same reason one level up: a shard written
+        // before `rules_hash` existed has no line and is accepted (it can only be canonical,
+        // since nothing else could be expressed then), but a shard whose stamp disagrees
+        // with its own embedded config has been edited and is refused.
+        if let Some((_, recorded)) = header.iter().find(|(k, _)| k == "rules_hash") {
+            let expected = format!("{:016x}", config.rules_hash());
+            if recorded != &expected {
+                return Err(format!(
+                    "{}: rules_hash is {recorded} in the shard header but its own embedded \
+                     config hashes to {expected}. The header and the config disagree about \
+                     which game was played.",
                     path.display()
                 ));
             }

@@ -97,7 +97,7 @@ use crate::display::{
 };
 use crate::player::Player;
 use crate::rank::Rank;
-use crate::state::{GameState, Pending, ResolveKind};
+use crate::state::{GameState, LaneChoice, OptionChoice, Pending, ResolveKind};
 
 /// One numbered line of a menu.
 pub struct Row {
@@ -394,7 +394,63 @@ pub fn build(state: &GameState, legal: &[Action], observer: Observer) -> Menu {
         Some(Pending::SplitTarget { lane, attackers, .. }) => {
             build_split_target(state, legal, observer, *lane, attackers.first().copied())
         }
+        Some(Pending::ChooseLane { kind, .. }) => build_choose_lane(state, legal, *kind),
+        Some(Pending::ChooseOption { kind, .. }) => build_choose_option(legal, *kind),
     }
+}
+
+// ------------------------------------------------- the encoder reserve (§7) --
+
+/// Pick a lane. `MODULAR_RULES.md` §7, reserve item 2.
+///
+/// The prompt comes from the [`LaneChoice`], not from the encoder: the `CHOOSE_LANE` block
+/// is deliberately nameless, so the pending node is the only thing that knows what the lane
+/// is being chosen *for*.
+fn build_choose_lane(state: &GameState, legal: &[Action], kind: LaneChoice) -> Menu {
+    let me = state.acting_player();
+    let (prompt, hint) = match kind {
+        LaneChoice::KingEmpower { .. } => (
+            "EMPOWER (K) — which of your lanes reactivates?",
+            "Face-up cards there refire their powers. Constant powers and Kings are skipped.",
+        ),
+    };
+    let mut b = Builder::new(prompt).hint(hint);
+    b.heading("LANE");
+    for &action in legal {
+        let Action::ChooseLane { side, lane } = action else {
+            continue;
+        };
+        let owner = match side {
+            Side::Mine => me,
+            Side::Theirs => me.other(),
+        };
+        let n = state.lanes[lane as usize].side(owner).len();
+        b.push(
+            format!("lane {}", crate::display::lane_label(lane)),
+            format!("{n} card(s)"),
+            Pick::Take(action),
+        );
+    }
+    b.done()
+}
+
+/// Pick one of a power's options. §7, reserve item 2.
+fn build_choose_option(legal: &[Action], kind: OptionChoice) -> Menu {
+    let (prompt, hint) = match kind {
+        OptionChoice::GiveBackDestination { rank } => (
+            format!("VIEW (2) — where does the {rank} go?"),
+            "The bottom of your pile is private to you; the discard pile is public.",
+        ),
+    };
+    let mut b = Builder::new(prompt).hint(hint);
+    b.heading("OPTION");
+    for &action in legal {
+        let Action::ChooseOption { option } = action else {
+            continue;
+        };
+        b.push("OPT", kind.label(option), Pick::Take(action));
+    }
+    b.done()
 }
 
 // =========================================================================== focus ==
@@ -494,6 +550,15 @@ fn focus_action(state: &GameState, action: Action, reach: Reach, focus: &mut Foc
         }
         // A card in hand is not on the board, so there is nothing to point at.
         Action::GiveBack { .. } => {}
+        // A lane choice lights the whole lane it would act on — but only once the row is
+        // settled, the same rule every other aimed action follows here.
+        Action::ChooseLane { lane, .. } => {
+            if settled {
+                focus.lane(lane as usize)
+            }
+        }
+        // An option names no card and no lane.
+        Action::ChooseOption { .. } => {}
     }
 }
 
@@ -508,8 +573,9 @@ fn lane_of(action: Action) -> Option<usize> {
         | Action::DeclarePair { lane, .. }
         | Action::Peek { lane, .. }
         | Action::ResolveNext { lane, .. }
-        | Action::MoveHere { lane, .. } => Some(lane as usize),
-        Action::GiveBack { .. } | Action::SplitTarget { .. } => None,
+        | Action::MoveHere { lane, .. }
+        | Action::ChooseLane { lane, .. } => Some(lane as usize),
+        Action::GiveBack { .. } | Action::SplitTarget { .. } | Action::ChooseOption { .. } => None,
     }
 }
 
@@ -562,7 +628,7 @@ fn card_menu(
     let mut b = Builder::new(prompt);
     for slot in column_slots(state, lane, owner, observer) {
         let card = &state.lanes[lane].side(owner)[slot];
-        let token = card_token(card, observer);
+        let token = card_token(card, observer, &state.config);
         let (text, pick) = detail(slot);
         let note = if text.is_empty() {
             token
@@ -768,7 +834,7 @@ fn copies_note(state: &GameState, observer: Observer, lane: usize, slots: &[usiz
     let me = state.acting_player();
     let tokens: Vec<String> = slots
         .iter()
-        .map(|&slot| card_token(&state.lanes[lane].side(me)[slot], observer))
+        .map(|&slot| card_token(&state.lanes[lane].side(me)[slot], observer, &state.config))
         .collect();
     let tokens = tokens.join(" ");
     if slots
@@ -1007,7 +1073,7 @@ fn attack_menu(state: &GameState, attacks: &[Action], observer: Observer) -> Men
             };
             let note = format!(
                 "{:<6} {:<11} {}",
-                card_token(&state.lanes[lane].side(me)[slot], observer),
+                card_token(&state.lanes[lane].side(me)[slot], observer, &state.config),
                 power_note(state, lane, me, slot, observer),
                 paired,
             );

@@ -178,6 +178,39 @@ impl Rank {
         matches!(self.0, 0 | 1 | 3 | 4 | 5 | 6 | 11)
     }
 
+    /// The word used to name this rank in a config key, as in `powers.three`.
+    ///
+    /// Spelled out rather than reusing [`Rank::label`], because `powers.10 = "twinstrike"`
+    /// reads like a number and `powers.a` reads like a typo. This is the one place a rank
+    /// has a long name.
+    pub const fn config_key(self) -> &'static str {
+        match self.0 {
+            0 => "ace",
+            1 => "two",
+            2 => "three",
+            3 => "four",
+            4 => "five",
+            5 => "six",
+            6 => "seven",
+            7 => "eight",
+            8 => "nine",
+            9 => "ten",
+            10 => "jack",
+            11 => "queen",
+            12 => "king",
+            _ => "?",
+        }
+    }
+
+    /// Inverse of [`Rank::config_key`]. Also accepts the short labels, so `powers.j` works.
+    pub fn from_config_key(s: &str) -> Option<Rank> {
+        let s = s.trim().to_ascii_lowercase();
+        Rank::ALL
+            .into_iter()
+            .find(|r| r.config_key() == s)
+            .or_else(|| Rank::parse(&s))
+    }
+
     /// Parse a rank from text the way a player would type it: `a`, `A`, `1`, `10`, `t`,
     /// `j`, `q`, `k`. Case-insensitive. Returns `None` if it is not a rank.
     pub fn parse(s: &str) -> Option<Rank> {

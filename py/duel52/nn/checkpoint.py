@@ -73,7 +73,14 @@ HEADER_KEYS = (
 #: ``mlp``; ``lanes``/``lane_obs``/``lane_action`` appear only for ``lane``. Bumping
 #: ``CHECKPOINT_VERSION`` would have been the obvious move and would have retired three
 #: shipped checkpoints for nothing.
-OPTIONAL_HEADER_KEYS = ("arch", "lanes", "lane_obs", "lane_action")
+OPTIONAL_HEADER_KEYS = (
+    "arch",
+    "lanes",
+    "lane_obs",
+    "lane_action",
+    "rules_name",
+    "rules_hash",
+)
 
 
 @dataclass
@@ -95,6 +102,26 @@ class Checkpoint:
     lanes: int = 0
     lane_obs: int = 0
     lane_action: int = 0
+    #: The ruleset this network was trained on (``MODULAR_RULES.md`` §6). ``None`` for a
+    #: checkpoint written before the field existed, which can only mean the canonical rules.
+    #:
+    #: ⚠️ Deliberately **not** part of :meth:`check_against`. Generation 1 of every
+    #: warm-started run loads a net trained under one ruleset to initialise training under
+    #: another, and that is the mechanism that makes a rules experiment cost three hours
+    #: rather than twenty-four. See :meth:`rules_note`.
+    rules_name: str | None = None
+    rules_hash: str | None = None
+
+    def rules_note(self, spec: dict[str, Any]) -> str | None:
+        """A one-line warning when this checkpoint was trained on a different game, or
+        ``None`` when it agrees with ``spec`` (or predates the stamp)."""
+        if self.rules_hash is None or self.rules_hash == spec.get("rules_hash"):
+            return None
+        return (
+            f"checkpoint was trained on rules {self.rules_name}/{self.rules_hash} but this "
+            f"run plays {spec.get('rules_name')}/{spec.get('rules_hash')} — expected for "
+            f"generation 1 of a warm start, a bug at any later generation"
+        )
 
     def named(self) -> dict[str, np.ndarray]:
         return dict(zip(self.param_order, self.tensors))
@@ -136,6 +163,8 @@ def _header_text(
     lanes: int = 0,
     lane_obs: int = 0,
     lane_action: int = 0,
+    rules_name: str | None = None,
+    rules_hash: str | None = None,
 ) -> str:
     """The header, in ``Weights::header_string``'s exact key order.
 
@@ -157,7 +186,17 @@ def _header_text(
     if arch == "lane":
         values |= {"lanes": lanes, "lane_obs": lane_obs, "lane_action": lane_action}
         keys += ["lanes", "lane_obs", "lane_action"]
-    keys += ["obs_layout_hash", "action_layout_hash", "param_order"]
+    keys += ["obs_layout_hash", "action_layout_hash"]
+    # Which game this network was trained on (``MODULAR_RULES.md`` §6). Written between the
+    # layout hashes and ``param_order`` to match ``Weights::header_string`` exactly — both
+    # sides write this file and it is byte-reproducible, so key order is part of the format.
+    #
+    # Omitted entirely when the caller has no ruleset to declare, which keeps a checkpoint
+    # written by an older ``encoding_spec()`` byte-identical to what it was before.
+    if rules_name is not None and rules_hash is not None:
+        values |= {"rules_name": rules_name, "rules_hash": rules_hash}
+        keys += ["rules_name", "rules_hash"]
+    keys += ["param_order"]
     return "".join(f"{key}={values[key]}\n" for key in keys)
 
 
@@ -188,6 +227,8 @@ def write_checkpoint(
         value_hidden=model.config.value_hidden,
         obs_layout_hash=spec["obs_layout_hash"],
         action_layout_hash=spec["action_layout_hash"],
+        rules_name=spec.get("rules_name"),
+        rules_hash=spec.get("rules_hash"),
         param_order=param_order,
         arch=arch,
         # Read off the module's own layers rather than recomputed here: they are the widths
@@ -291,6 +332,8 @@ def read_checkpoint(path: str | Path, *, arch: dict[str, int] | None = None) -> 
         lanes=lanes,
         lane_obs=lane_obs,
         lane_action=lane_action,
+        rules_name=fields.get("rules_name"),
+        rules_hash=fields.get("rules_hash"),
         tensors=tensors,
     )
 

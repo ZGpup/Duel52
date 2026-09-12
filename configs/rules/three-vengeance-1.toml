@@ -1,0 +1,24 @@
+# The 3 hits back.
+#
+# `MODULAR_RULES.md` §3 — the worked example the whole mod system was designed around: "make
+# the 3 not only flip when killed face down but also deal a damage to the attacker that
+# killed it."
+#
+# What it is expected to do. The Trap already makes attacking a face-down card a gamble;
+# vengeance makes it a *priced* gamble, because the attacker now pays a hit point for
+# guessing wrong. Two things worth watching in the probe:
+#
+#   - trap_springs/game should FALL, not rise. If attacking face-down cards gets more
+#     expensive, competent play attacks them less, so the Trap fires less often while being
+#     worth more each time. A rise means the agents have not noticed.
+#   - threes_face_down_at_end should RISE, for the same reason.
+#
+# Tier 2 (`MODULAR_RULES.md` §2): a named power variant, no layout break, so a run warm-starts
+# from the current champion.
+
+# ⚠️ `include` goes FIRST. Keys resolve last-wins, so an include below `rules_name` would
+# overwrite the name with the base's own. Read it as "start from this, then change these".
+include = "canonical.toml"
+
+rules_name = "three-vengeance-1"
+powers.three = "trap_vengeance_one_damage"

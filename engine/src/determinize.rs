@@ -293,6 +293,33 @@ impl GameState {
         (bag, slots)
     }
 
+    /// Can this position exist? That is: for every pool, do the cards the observer *cannot*
+    /// place exactly fill the positions they have to go in.
+    ///
+    /// This is the `debug_assert` in [`GameState::hidden_pool`] asked as a question rather
+    /// than asserted. It exists for [`crate::cardvalue`], which builds hypothetical positions
+    /// by substituting a rank into a hand or a lane and must not measure one the deck cannot
+    /// produce: an over-subscribed rank has its unseen count clamped at zero, which perturbs
+    /// the belief features **per rank** — a difference in the observation with nothing to do
+    /// with the card being measured.
+    ///
+    /// Asking rather than reasoning is the point. The split variants give each player their
+    /// own pool, so a rank can have room in one and none in the other, and a substitution's
+    /// effect on the count depends on whether the card is face-up, known, or hidden. Getting
+    /// that wrong by hand is exactly the bug this replaced.
+    pub fn deck_is_consistent(&self, observer: Player) -> bool {
+        if self.card_census() != self.expected_card_count() {
+            return true; // mid-deal; the accounting is not meant to balance yet
+        }
+        // `dealt = false` suppresses the assertion, so an inconsistent position returns a
+        // short bag instead of panicking. The bag and the slots balance by construction when
+        // the position is legal, so a short bag *is* the over-subscription.
+        (0..self.pool_count()).all(|pool| {
+            let (bag, slots) = self.hidden_pool(observer, pool, false);
+            bag.len() == slots.len()
+        })
+    }
+
     /// Write one sampled rank into its position.
     fn place_hidden(&mut self, slot: HiddenSlot, rank: Rank) {
         match slot {

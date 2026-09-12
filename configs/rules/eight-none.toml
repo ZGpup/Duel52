@@ -1,0 +1,11 @@
+# Ablation: the 8 does not hit back.
+#
+# The control for `eight-on-survival.toml`. `FINDINGS.md` has the 8 as the *earliest* card the
+# agent flips, spanning twenty-two turns to the Queen at the other end — so if any card's
+# power is load-bearing, this is the one, and an ablation says how much of that ordering is
+# the power rather than the body.
+
+include = "canonical.toml"
+
+rules_name = "eight-none"
+powers.eight = "none"

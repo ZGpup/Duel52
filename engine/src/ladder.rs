@@ -47,12 +47,106 @@ use crate::config::GameConfig;
 use crate::elo::{fit, EloTable, Pairing};
 use crate::encode::{action_dim, obs_dim};
 use crate::nn::BatchScratch;
-use crate::probe::{play_instrumented, MatchGame, MatchStats, AGENT_STREAM};
+use crate::probe::{play_instrumented, GameStats, MatchGame, MatchStats, AGENT_STREAM};
 
-/// Play `games` games between two agents, alternating who moves first.
+/// Something that consumes finished games. One per worker.
+///
+/// [`MatchStats`] is the sink that produces a score, and `analysis::Corpus` is the one that
+/// writes a game out to disk. They exist because the alternative — a second copy of
+/// [`run_games`]'s threading and batching for every new consumer — is where the batched path
+/// and the unbatched path drift apart, and the whole point of `--eval-batch` is that they
+/// cannot.
+///
+/// ⚠️ **`take_game` is called in game order within a shard, and that is load-bearing.** See
+/// [`play_shard_batched`]: games finish out of order once several are in flight, and a sink
+/// that averages per-game floats would otherwise report a mean whose last bits depend on the
+/// batch size.
+pub trait GameSink {
+    fn take_game(&mut self, index: usize, stats: &GameStats, seats: [usize; 2]);
+}
+
+impl GameSink for MatchStats {
+    fn take_game(&mut self, _index: usize, stats: &GameStats, seats: [usize; 2]) {
+        self.absorb(stats, seats);
+    }
+}
+
+/// Play `games` games between two agents, alternating who moves first, and hand each
+/// finished game to a per-worker sink.
 ///
 /// `games` is rounded up to an even number so every deal is played from both sides.
-/// `threads` of 0 or 1 runs single-threaded.
+/// `threads` of 0 or 1 runs single-threaded. `make_sink` is called once per worker with the
+/// worker's index, and the sinks come back in that order — so a caller that concatenates
+/// them gets the games in game order.
+pub fn run_games<S, F>(
+    config: GameConfig,
+    specs: &[AgentSpec; 2],
+    first_seed: u64,
+    games: usize,
+    threads: usize,
+    eval_batch: usize,
+    make_sink: F,
+) -> Vec<S>
+where
+    S: GameSink + Send,
+    F: Fn(usize) -> S + Sync,
+{
+    let games = games + (games % 2);
+    if games == 0 {
+        return Vec::new();
+    }
+    let eval_batch = eval_batch.max(1);
+    let shards = shards(games, threads);
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = shards
+            .iter()
+            .enumerate()
+            .map(|(w, &(lo, hi))| {
+                let make_sink = &make_sink;
+                scope.spawn(move || {
+                    let mut sink = make_sink(w);
+                    if eval_batch > 1 {
+                        play_shard_batched(
+                            config, specs, first_seed, lo, hi, eval_batch, &mut sink,
+                        );
+                    } else {
+                        for g in lo..hi {
+                            let stats = play_indexed(config, specs, first_seed, g);
+                            sink.take_game(g, &stats, seats(g));
+                        }
+                    }
+                    sink
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a ladder worker panicked"))
+            .collect()
+    })
+}
+
+/// The seed ranges the workers get, as `(lo, hi)` game indices.
+///
+/// Public via [`worker_count`] because a caller that has to build something per worker — the
+/// analysis corpus opens a file per worker — must agree with this exactly, and re-deriving
+/// the clamp at the call site is how the two come to disagree.
+fn shards(games: usize, threads: usize) -> Vec<(usize, usize)> {
+    let threads = threads.max(1).min(games.max(1));
+    (0..threads)
+        .map(|t| (games * t / threads, games * (t + 1) / threads))
+        .filter(|(lo, hi)| lo < hi)
+        .collect()
+}
+
+/// How many workers [`run_games`] will use, and so how many sinks it will ask for.
+pub fn worker_count(games: usize, threads: usize) -> usize {
+    shards(games + (games % 2), threads).len()
+}
+
+/// Play `games` games between two agents and score them — [`run_games`] with [`MatchStats`]
+/// as the sink.
 pub fn run_match(
     config: GameConfig,
     a: AgentSpec,
@@ -63,54 +157,21 @@ pub fn run_match(
     eval_batch: usize,
 ) -> MatchStats {
     let started = Instant::now();
-    let games = games + (games % 2);
-    let threads = threads.max(1).min(games.max(1));
-    let eval_batch = eval_batch.max(1);
-
     let mut total = MatchStats::empty(config, [a.clone(), b.clone()]);
-    if games == 0 {
-        return total;
-    }
     // `AgentSpec` stopped being `Copy` when `NetPolicy` gained a checkpoint path, so the
     // pair is borrowed into the workers rather than copied into them. Cloning per shard
     // would be harmless too — this is once per thread, not once per game.
     let specs = [a, b];
-
-    let shards: Vec<(usize, usize)> = (0..threads)
-        .map(|t| {
-            let lo = games * t / threads;
-            let hi = games * (t + 1) / threads;
-            (lo, hi)
-        })
-        .filter(|(lo, hi)| lo < hi)
-        .collect();
-
-    let results: Vec<MatchStats> = std::thread::scope(|scope| {
-        let handles: Vec<_> = shards
-            .iter()
-            .map(|&(lo, hi)| {
-                let specs = &specs;
-                scope.spawn(move || {
-                    if eval_batch > 1 {
-                        return play_shard_batched(
-                            config, specs, first_seed, lo, hi, eval_batch,
-                        );
-                    }
-                    let mut shard = MatchStats::empty(config, specs.clone());
-                    for g in lo..hi {
-                        shard.absorb(&play_indexed(config, specs, first_seed, g), seats(g));
-                    }
-                    shard
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("a ladder worker panicked"))
-            .collect()
-    });
-
-    for shard in &results {
+    let shards = run_games(
+        config,
+        &specs,
+        first_seed,
+        games,
+        threads,
+        eval_batch,
+        |_| MatchStats::empty(config, specs.clone()),
+    );
+    for shard in &shards {
         total.merge(shard);
     }
     total.elapsed_secs = started.elapsed().as_secs_f64();
@@ -146,14 +207,15 @@ fn build_seated(
 /// roughly evenly between the two sides — which is why the gate's speed-up is nearer 2x than
 /// self-play's 3.26x. A panel row against `random` or `greedy` has only one network and does
 /// not pay that, because the non-network agent never suspends at all.
-fn play_shard_batched(
+fn play_shard_batched<S: GameSink>(
     config: GameConfig,
     specs: &[AgentSpec; 2],
     first_seed: u64,
     lo: usize,
     hi: usize,
     batch: usize,
-) -> MatchStats {
+    sink: &mut S,
+) {
     let slots = crate::nn::batch_slots(hi - lo, batch);
     let (od, ad) = (obs_dim(&config), action_dim(&config));
 
@@ -278,11 +340,9 @@ fn play_shard_batched(
     }
 
     finished.sort_by_key(|(g, _)| *g);
-    let mut shard = MatchStats::empty(config, specs.clone());
     for (g, stats) in &finished {
-        shard.absorb(stats, seats(*g));
+        sink.take_game(*g, stats, seats(*g));
     }
-    shard
 }
 
 /// Which agent index sits in which seat for game `g`: even games put agent 0 first.
