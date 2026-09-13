@@ -26,7 +26,7 @@ when agent strength is the thing blocking a question, and right now it mostly is
 | 4. Scale up | Done. Four laptop runs, the fourth a from scratch architecture change; then the rented run — 24 h on 32 cores, `128 × 6` from noise, **+190 Elo** and the current default |
 | 5. Extract the insight | Started early, partly banked, and now the critical path |
 | 6. Verification | Not started |
-| 7. R-NaD | Held in reserve, on a tripwire |
+| 7. R-NaD | Built beside AlphaZero and tested on the laptop; the three-hour GPU run is next. Item 8 |
 
 ## What is done
 
@@ -565,27 +565,144 @@ gate is a tax and not a partner. Below roughly 6,000 games against a 600 game ga
 spends more than half its wall clock evaluating itself, which is compute that buys precision on
 a number the gate only needs to get roughly right.
 
+### 8. R-NaD, a second learner beside AlphaZero
+
+**Status: Stages 1 and 2 built 2026-09-13; Stage 3's smoke run passed on the laptop, and the
+three-hour run on a GPU is next.** Scope: implement R-NaD (Perolat et al., *Science* 2022) as a
+second learner beside the AlphaZero loop, test it on the laptop, and run it once for three hours
+on a GPU. The AlphaZero loop keeps working as it does today: no existing run, config, shard or
+checkpoint changes.
+
+**What gets built.** A search-free policy learner. The actor samples moves from the network's
+policy. The learner fits the policy with the NeuRD loss and the value against V-trace targets,
+on rewards transformed by `η·log(π/π_reg)` against a regularisation policy that is replaced on a
+fixed schedule. It holds four networks — online, an EMA target, and the last two regularisation
+policies — and its output checkpoint is the target net. Play uses the target net's policy with
+probabilities below a threshold zeroed and the rest rounded to a grid.
+
+**Reference.** OpenSpiel's `open_spiel/python/algorithms/rnad/rnad.py`, removed from master on
+2025-05-28 (`e165bbdd`). Pin the last version, **`d1dcdf5d`**. Starting values:
+
+| key | reference default | here |
+|---|---|---|
+| `eta_reward_transform` | 0.2 | kept [ASSUMED] |
+| `entropy_schedule_size` / `_repeats` | 20,000 / 1 learner steps | sized by `bench` for ~10 updates in the run's clock |
+| `target_network_avg` | 0.001 | **raised with the schedule**, to about `10 / entropy_schedule_size` — see Stage 3 |
+| `learning_rate` | 5e-5 | **5e-4** [ASSUMED] — see Stage 3 |
+| Adam `b1` / `b2` | 0.0 / 0.999 | kept |
+| `nerd.beta` / `nerd.clip`, `c_vtrace` | 2.0 / 10,000, 1.0 | kept |
+| `finetune.policy_threshold` / `_discretization` | 0.03 / 32 | kept, as `netsample`'s defaults |
+| `batch_size` / `trajectory_max` | 256 / 10 | whole games instead |
+
+**Layout.** The two learners share the engine, rulesets, encoder, the `.d52nn` format with both
+forward passes, and every agent and measuring command. R-NaD's own pieces are new files:
+
+| piece | where |
+|---|---|
+| batched games | `GameBatch` in `bindings/src/lib.rs`: the engine's rules and encoder, many games at once |
+| actor and learner | `py/duel52/rnad/`, beside `py/duel52/train/`, in one process on one device |
+| configs, runs | `configs/rnad-*.toml`, `runs/rnad-*` |
+
+There is no R-NaD shard: games are played and learned from in the same process, so `.d52sp`
+and `duel52 selfplay` are untouched. Code both learners need — config key checking,
+`resolve_device`, the network classes and checkpoint I/O — is imported from the existing
+modules rather than duplicated.
+
+**Tests that keep AlphaZero unchanged**, each landing before the code it protects:
+
+1. `rnad_leaves_the_alphazero_shard_byte_identical`: a golden hash of a small fixed-seed
+   `duel52 selfplay` shard, recorded before the first R-NaD commit.
+2. `obs b1355a841a1fdc4a` at 21 slots is unchanged, every checkpoint in `models/` loads, and one
+   rewritten by this build is byte-identical. New header keys are written only when they differ
+   from the default.
+3. Every existing `configs/train-*.toml` passes `train check`, and `duel52.train` imports nothing
+   from `duel52.rnad`.
+4. `train-fast` and `rnad-fast` both run at toy size in `py/tests`.
+
+**Stage 1 — engine plumbing.**
+
+- **`netsample:<path>`**, an agent: one forward pass, masked softmax, then the post-processing
+  above (threshold 0.03, grid 32); `netsample:<path>@raw` skips it. It draws one uniform per
+  decision from its own seeded stream, so `phase2_no_agent_reads_hidden_information` stays
+  exact. Add it to `TEST_ROSTER` by hand.
+- **`GameBatch`**, a binding holding `N` games. `observe(obs, mask, ids, players)` writes the
+  observation and legal mask of every game awaiting a decision straight into the caller's
+  numpy arrays, across threads with the GIL released. `apply(ids, actions)` takes encoded action
+  indices, which the engine decodes and checks for legality, then plays any forced decisions
+  itself, as `.d52sp` skips them. `returns()` gives each player's result on `-1..1` from
+  `learning_value`. The config is resolved from the same fields as the CLI flags.
+- **Optional checkpoint header keys**, absent meaning today's behaviour: `learner = rnad`, and
+  `value_head = linear`, since the reference value head is linear and every forward pass here
+  ends in `tanh`. `netmcts` clamps a linear value.
+
+Exit: `netsample` plays a match on `32c-24h-best`; tests 1 and 2 pass; a game driven through
+`GameBatch` reaches the same outcome as the same game driven through `Game`; and the actor's
+decisions per second is measured on the laptop.
+
+**Stage 2 — the learner.** Port `v_trace`, `get_loss_nerd` and the entropy schedule to PyTorch in
+`py/duel52/rnad/`.
+
+- `test_rnad_vtrace_matches_reference` and `test_rnad_nerd_matches_reference`: parity to 1e-6
+  against fixtures generated once from `d1dcdf5d` and committed as `.npz`, so the suite does not
+  depend on JAX. Include a trajectory with forced steps.
+- `test_rnad_kuhn_poker_converges`: exploitability, computed exactly, from 0.458 at a random
+  init to **0.007** after 3,000 steps; the test's bar is 0.02, because sampled games keep it
+  oscillating around 0.01. Kuhn is a test fixture for the learner, not a second rules engine.
+
+Exit: both green before any Duel 52 run.
+
+**Stage 3 — the first three-hour run.** `configs/rnad-fast.toml` for a smoke run on the laptop
+and `configs/rnad-3h.toml` for the real one on a GPU: lane `128 × 3`, from scratch, `split`,
+`encoding_slots = 21`, `device = "auto"`.
+
+```bash
+.venv/bin/python -m duel52.rnad check --config configs/rnad-3h.toml
+.venv/bin/python -m duel52.rnad run   --config configs/rnad-3h.toml --run-dir runs/rnad-3h
+```
+
+- **One process, strictly on-policy.** Each learner step plays a fresh batch of games in a
+  `GameBatch` with the online net on the device, sampling on the device, then takes one learner
+  step on exactly those games — the reference's own shape, so there is no policy lag to correct.
+- **No promotion gate.** Every so many steps the target net is written as a checkpoint and plays
+  `random` and `greedy` through `duel52 match --a netsample:<checkpoint>`, and the scores are
+  logged.
+- **Entropy schedule** sized in learner steps from the measured step rate, so that three hours
+  covers several regularisation updates [ASSUMED].
+- **Resume state**: all four networks, the optimiser, the step counter and the RNG state, in the
+  run directory.
+- ⚠️ **Games replay exactly from their seeds, but a GPU run does not reproduce bit for bit**, since
+  GPU kernels are not deterministic the way the Rust forward pass is.
+
+Exit: `rnad-fast` completes on the laptop and resumes after a stop; `rnad-3h` completes on a GPU
+and writes a target-net checkpoint that `netsample` plays.
+
+**Measured on the 8-core laptop, 2026-09-13** (MPS, lane `128 × 3`, from scratch):
+
+- **The smoke run passes.** 40 steps, two regularisation updates, an evaluation match through
+  `netsample`, Ctrl-C saves and `--resume` continues. On the CPU a resumed run is bit-identical to
+  an uninterrupted one.
+- **Speed.** A 256-game step is 3.2 s — 1.1 s acting, 2.0 s learning — so ~81 games per second,
+  and it fits in 16 GB. The engine is not the constraint: `GameBatch` encodes and applies ~359,000
+  decisions per second on eight threads.
+- ⚠️ **The target average has to move with the schedule.** Each regularisation update copies the
+  target net, which moves `target_network_avg` of the way to the online net per step. The
+  reference pairs 0.001 with 20,000-step iterations. Shortened to a laptop-sized schedule without
+  raising it, the regularisation policy stayed pinned to the random init and the policy did not
+  learn at all. 200 steps of 128 games, scored at step 200:
+
+  | `learning_rate` | `target_network_avg` × size | vs `random` | vs `greedy` |
+  |---|---:|---:|---:|
+  | 5e-5 | 0.05 | 0.435 | 0.050 |
+  | 5e-4 | 0.05 | 0.525 | 0.055 |
+  | 5e-4 | 5 | 0.935 | 0.295 |
+  | 1e-3 | 5 | **0.990** | **0.350** |
+
+  `check` now warns below 5, and `bench` prints both numbers for a machine's step rate.
+- **The value head's targets leave ±1** — to ±1.6 in those runs — so `value_head = linear` stays.
+
 ## Held in reserve
 
-**R-NaD**, swapping the learner while leaving the engine and encoders alone, for an
-approximate Nash policy rather than a merely strong one.
-
-AlphaZero over determinized search has a real ceiling in an imperfect information game: no
-equilibrium guarantee, and no way to learn to conceal or signal deliberately. Switch only on
-one of two signals, and neither is present today:
-
-1. Search keeps scaling but the network stops absorbing it, across a run whose gate has the
-   power to tell. That is a representation limit, not a compute one.
-2. Self play looks healthy while the score against a fixed external opponent flattens or
-   falls. That is the exploitability signature and no amount of compute fixes it.
-
-Signal 2 needs a detector that can still detect. Every hand written yardstick is now saturated,
-so the reference opponent has to be a frozen *trained* net, promoted whenever the incumbent
-reference stops losing.
-
-A third condition is more likely than either: the run succeeds and the owner still wins. That
-is not a reason to change learner. It is a reason to look hard at what the human does that the
-agent does not, which is item 1.
+Nothing. R-NaD, which waited here, is item 8.
 
 ## Constraints that shape every decision here
 

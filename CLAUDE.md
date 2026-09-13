@@ -90,15 +90,17 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 417 tests: rules, determinism, information hiding,
+cargo test                               # 436 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, the
                                          # training corpus, the modded power variants, the
                                          # cross-ruleset invariant suite, the encoder reserve
-                                         # and its checkpoint bridge, and the analysis
-                                         # corpus's per-card log
-.venv/bin/python -m pytest py/tests -q   # 129 tests, including the analysis reader, the
-                                         # deal-clustered intervals every table carries, and
-                                         # the proof that `nn widen` preserves the function
+                                         # and its checkpoint bridge, the analysis corpus's
+                                         # per-card log, and the R-NaD guards (the golden
+                                         # AlphaZero shard, netsample, the linear value head)
+.venv/bin/python -m pytest py/tests -q   # 168 tests, including the analysis reader, the
+                                         # deal-clustered intervals every table carries, the
+                                         # proof that `nn widen` preserves the function, and
+                                         # R-NaD's parity with its reference and Kuhn poker
 
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
@@ -343,6 +345,44 @@ netmcts:models/duel52-32c-24h-best.d52nn@64
 # Build a lane checkpoint by hand:
 .venv/bin/python -m duel52.nn init --arch lane --encoding-slots 21 \
     --width 128 --blocks 3 --value-hidden 128 --out checkpoints/lane.d52nn
+
+# R-NaD (PLAN.md item 8) — a second learner BESIDE the AlphaZero loop, not instead of it.
+# Search-free: each learner step plays a fresh batch of games with the online net through
+# the engine's `GameBatch`, then takes one R-NaD step (NeuRD policy loss, V-trace value
+# targets, a regularisation policy that moves on a schedule) on exactly those games. One
+# process, one device; `device = "auto"` is CUDA on a GPU box and MPS on the laptop.
+# `duel52.train` imports nothing from `duel52.rnad`, and no AlphaZero shard, config or
+# checkpoint changed — `rnad_leaves_the_alphazero_shard_byte_identical` is the guard.
+.venv/bin/python -m duel52.rnad check --config configs/rnad-3h.toml
+.venv/bin/python -m duel52.rnad bench --config configs/rnad-3h.toml --steps 5   # time + size the schedule
+.venv/bin/python -m duel52.rnad run   --config configs/rnad-fast.toml --run-dir runs/rnad-fast  # minutes
+.venv/bin/python -m duel52.rnad run   --config configs/rnad-3h.toml --run-dir runs/rnad-3h
+.venv/bin/python -m duel52.rnad run   --config configs/rnad-3h.toml --run-dir runs/rnad-3h --resume
+# ⚠️ **Run `bench` on a new machine before `run`.** `entropy_schedule_size` is counted in
+# learner steps, and steps per hour is what differs most between the laptop and a GPU; bench
+# prints the size that gives ~10 regularisation updates in the run's clock.
+# ⚠️ **`target_network_avg` must move with the schedule — the reference's 0.001 is wrong for
+# any short one.** Each regularisation update copies the target net, which covers τ of the gap
+# to the online net per step; the reference runs τ·size = 20. At τ·size = 0.05 the policy stayed
+# pinned to the random init and 200 laptop steps scored 0.525 vs random; at 5 it scored 0.990
+# (PLAN.md item 8). `check` warns below 5; bench prints a τ for its suggested size.
+# ⚠️ **A GPU run is not bit-reproducible** the way AlphaZero's Rust self-play is. Games
+# replay from their seeds, and on the CPU a resumed run equals an uninterrupted one
+# (`test_the_rnad_run_resumes_to_the_same_networks_as_an_uninterrupted_one`).
+#
+# An R-NaD checkpoint is a mixed strategy, so it is played by SAMPLING, not argmax:
+./target/release/duel52 match --a netsample:runs/rnad-3h/checkpoints/latest.d52nn \
+    --b random --games 200 --encoding-slots 21
+# `netsample:<path>` applies the reference's post-processing (drop actions under 3%, round to
+# 1/32); `netsample:<path>@raw` samples the softmax. Its checkpoints carry `value_head=linear`
+# and `learner=rnad` in the header — both keys are written ONLY for R-NaD, so AlphaZero
+# checkpoints are byte-identical — and the AlphaZero trainer refuses a linear head.
+#
+# The port is checked against the reference, not argued: py/tests/fixtures/rnad_reference.npz
+# holds outputs of OpenSpiel's rnad.py at d1dcdf5d (removed from OpenSpiel master in
+# e165bbdd); `make_rnad_reference.py` beside it regenerates them in a throwaway JAX venv.
+# `test_rnad_kuhn_poker_converges` runs the whole learner on Kuhn poker to exploitability
+# 0.007 from 0.458 — a test fixture with a known equilibrium, not a second rules engine.
 
 # The pieces, runnable on their own when something looks wrong.
 ./target/release/duel52 selfplay --checkpoint runs/first/checkpoints/best.d52nn \
@@ -651,15 +691,16 @@ where lanes and cards are numbered from 1.
 | `engine/src/encode.rs` | Observation and action tensors, and the layout hashes that pin them |
 | `engine/src/nn/` | Weights, the `.d52nn` checkpoint format, and the reference forward pass. `mlp.rs` is the flat network and dispatches to `lane.rs`, the lane-equivariant one, on `arch.kind` |
 | `engine/src/nn/lane.rs` | The lane-equivariant forward pass. Its module header carries the equations both languages implement |
-| `engine/src/agents/` | The five ladder rungs plus `netpolicy` and `netmcts`, and the evaluation in `eval.rs` |
+| `engine/src/agents/` | The five ladder rungs plus `netpolicy`, `netmcts` and `netsample` (a checkpoint's policy sampled — how an R-NaD net plays), and the evaluation in `eval.rs` |
 | `engine/src/selfplay.rs` | Self-play generation and the `.d52sp` trajectory shard |
 | `engine/src/ladder.rs`, `elo.rs` | Round robin, and the Bradley–Terry rating fit. `run_games` is the threaded, batched game loop; `GameSink` is how a second consumer gets whole games out of it without a second copy of the batching |
 | `engine/src/probe.rs` | Instrumented play — where the Phase 2 findings come from. Also `CardRecord`, the per-card life the analysis corpus is written from |
 | `engine/src/analysis.rs` | The analysis corpus: `games.csv`, `cards.csv`, `meta.json`. Writes down what happened rather than deciding what to measure |
 | `engine/tests/` | One named test per ruling, named for its rule section |
-| `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view |
+| `bindings/src/lib.rs` | PyO3 wrapper; `Game.observation()` is the filtered per-player view. `GameBatch` is many games at once for R-NaD's actor: it writes observations and legal masks into caller-owned buffers across threads, and decodes and legality-checks the actions it is handed |
 | `py/duel52/nn/` | The PyTorch model and checkpoint I/O. **Never an encoder** — see below |
 | `py/duel52/train/` | The AZ loop: replay buffer, trainer, generation driver. Gradients only |
+| `py/duel52/rnad/` | The R-NaD learner (`PLAN.md` item 8), beside `train/`: `core.py` is the reference arithmetic, `actor.py` plays a batch through `GameBatch`, `learner.py` is one step over the four networks, `loop.py` is the run. Imports `train/`'s config classes; `train/` never imports it |
 | `py/duel52/lanes.py` | `FINDINGS.md` F4.3's lane-symmetry metric, for one checkpoint. Analysis; the permutation tables it compares against come from `encode.rs` |
 | `py/duel52/analysis/` | The comparison document. `metrics.py` is the registry — **one function per question**, and that is the file to edit to add one. `stats.py` holds the deal-clustered intervals every table uses; `charts.py` is dependency-free SVG |
 
