@@ -7,13 +7,20 @@
 # Lane 128 x 3 from a random init — the trunk `lane-gen032` and `runs/sixth` use — on the
 # canonical split-deck rules, learning with the reference's R-NaD settings.
 #
-# ⚠️ **Run `bench` on the box first and set `entropy_schedule_size` from what it prints.**
-# The schedule is counted in learner steps, and a step's wall-clock cost is the thing that
-# differs most between machines. The value below is sized from the 8-core laptop's measured
-# 3.2 s per 256-game step on MPS (~3,400 steps in three hours), for ~10 regularisation
-# updates; a GPU that runs several times faster needs a proportionally larger size, or the
-# run spends its clock re-anchoring to a policy that has barely moved. `bench` prints the
-# number to use.
+# ⚠️ **Run `bench` on the box first and set `entropy_schedule_size` AND `target_network_avg`
+# from what it prints.** The schedule is counted in learner steps, and a step's wall-clock
+# cost is the thing that differs most between machines. The values below are sized from the
+# 8-core laptop's measured 3.2 s per 256-game step on MPS (~3,400 steps in three hours), for
+# ~10 regularisation updates; a GPU that runs several times faster needs a proportionally
+# larger size. `bench` prints both numbers to use.
+#
+# ⚠️ **The two move together, and getting that wrong is silent.** Each regularisation update
+# copies the *target* net, which moves `target_network_avg` of the way to the online net per
+# step. The reference pairs 0.001 with 20,000-step iterations (τ·size = 20). Shrink the
+# schedule and keep 0.001, and the regularisation policy stays pinned to the random init and
+# pulls the policy back to it every update: on the laptop, 200 steps of 128 games at
+# τ·size = 0.05 scored 0.525 against `random`; at τ·size = 5 the same run scored 0.935, and
+# 0.990 at learning rate 1e-3. `check` warns below τ·size = 5.
 
 [game]
 variant = "split"
@@ -36,10 +43,15 @@ learner_chunk = 0
 # [ASSUMED] ~10 updates in 3 h at the laptop's step rate. Re-derive with `bench` — see above.
 entropy_schedule_size = [340]
 entropy_schedule_repeats = [1]
+# τ·size = 10. The reference's 0.001 belongs to its 20,000-step iterations — see above.
+target_network_avg = 0.03
+# [ASSUMED] 5e-4, not the reference's 5e-5. The reference's rate is for runs of millions of
+# steps; in the laptop check 5e-5 had not moved the policy at all by step 200. 1e-3 learned a
+# little faster over 200 steps (0.990 against 0.935 vs `random`); 5e-4 is the choice for a run
+# twenty times longer.
+learning_rate = 5e-4
 # The reference's values, unchanged.
 eta_reward_transform = 0.2
-target_network_avg = 0.001
-learning_rate = 5e-5
 adam_b1 = 0.0
 adam_b2 = 0.999
 adam_eps = 1e-7

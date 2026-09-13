@@ -22,9 +22,12 @@ value_hidden = 128
 [rnad]
 device = "auto"
 batch_games = 32
-# Shortened from the reference's 20,000 so a smoke run crosses several updates.
-entropy_schedule_size = [10]
+# Shortened from the reference's 20,000 so a smoke run crosses two updates, with the target
+# average raised to match (τ·size = 5) — see configs/rnad-3h.toml for why the two move together.
+entropy_schedule_size = [20]
 entropy_schedule_repeats = [1]
+target_network_avg = 0.25
+learning_rate = 5e-4
 
 [run]
 hours = 0.25

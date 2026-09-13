@@ -70,10 +70,30 @@ def _describe(config: RNaDConfig) -> None:
     horizon = 5 * sum(s * n for s, n in zip(r.entropy_schedule_size, r.entropy_schedule_repeats))
     updates = [n for n in range(horizon) if schedule(n)[1]][:5]
     print(f"schedule    the regularisation policy moves after learner steps {updates} …")
+    _warn_coupling(r)
     cap = f", or {run.max_steps} steps" if run.max_steps else ""
     print(f"run         {run.hours:g} h{cap} · seed {run.seed} · log every {run.log_every} steps · save every {run.save_every_secs:g} s")
     evals = f"every {run.eval_every} steps" if run.eval_every else "at the end"
     print(f"eval        {evals}: netsample vs {', '.join(run.eval_opponents)}, {run.eval_games} games each")
+
+
+def _warn_coupling(r) -> None:
+    """How far the target net can travel in one regularisation iteration.
+
+    Each update copies the *target* net into the regularisation policy, and the target moves
+    by ``target_network_avg`` of the gap per step — so over an iteration it covers roughly
+    ``1 − exp(−τ·size)`` of the way to the online net. The reference runs at τ·size = 20.
+    Shrink the schedule without raising τ and the regularisation policy stays pinned near
+    the random initial network, pulling the policy back to it every update.
+    """
+    coupling = r.target_network_avg * min(r.entropy_schedule_size)
+    print(f"            target_network_avg × entropy_schedule_size = {coupling:g} (the reference runs at 20)")
+    if coupling < 5:
+        print(
+            "            ⚠️ the target net covers only "
+            f"{1 - np.exp(-coupling):.0%} of the way to the online net per iteration, so the "
+            "regularisation policy stays near its start — raise target_network_avg"
+        )
 
 
 def _check(args: argparse.Namespace) -> int:
@@ -132,9 +152,14 @@ def _bench(args: argparse.Namespace) -> int:
     )
     print(f"clock       {steps_per_hour:,.0f} steps/hour → ~{total:,} steps in the run's {run.hours:g} h")
     print(f"schedule    {iterations} regularisation updates at entropy_schedule_size={r.entropy_schedule_size}")
+    _warn_coupling(r)
     if total > 0:
         suggested = max(1, total // 10)
-        print(f"            for ~10 updates in {run.hours:g} h, set entropy_schedule_size = [{suggested}]")
+        tau = min(0.1, max(r.target_network_avg, 10.0 / suggested))
+        print(
+            f"            for ~10 updates in {run.hours:g} h: entropy_schedule_size = [{suggested}], "
+            f"target_network_avg = {tau:.3g} (τ·size = {tau * suggested:.0f})"
+        )
     return 0
 
 

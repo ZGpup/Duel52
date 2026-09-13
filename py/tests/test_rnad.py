@@ -415,4 +415,18 @@ def test_the_rnad_configs_load_and_check(capsys):
 
     for name in ("rnad-fast.toml", "rnad-3h.toml"):
         assert main(["check", "--config", str(REPO / "configs" / name)]) == 0
-    assert "value_head=linear" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "value_head=linear" in out
+    assert out.count("eval        ") == 2, "check stopped before printing the whole plan"
+    # Neither shipped config may have the regularisation policy pinned to its random init.
+    assert "⚠️" not in out
+
+
+def test_check_warns_when_the_target_average_cannot_follow_the_schedule(capsys):
+    from duel52.rnad.__main__ import _warn_coupling
+    from duel52.rnad.config import RNaDSettings
+
+    _warn_coupling(RNaDSettings(entropy_schedule_size=[100], target_network_avg=0.001))
+    assert "⚠️" in capsys.readouterr().out
+    _warn_coupling(RNaDSettings())  # the reference: 20,000 × 0.001
+    assert "⚠️" not in capsys.readouterr().out
