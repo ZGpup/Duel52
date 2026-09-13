@@ -1185,11 +1185,358 @@ fn replay_shard<'py>(
     Ok(d)
 }
 
+// ============================================================== batched games ==
+
+/// Resolve a game config from the same fields the CLI's flags carry, in the same order:
+/// `rules_file` **or** `variant` picks the base, then the individual overrides.
+fn config_from_flags(
+    variant: Option<&str>,
+    rules_file: Option<&str>,
+    encoding_slots: Option<usize>,
+    two_power: Option<&str>,
+    stalemate: Option<u32>,
+    stalemate_value: Option<f32>,
+) -> PyResult<GameConfig> {
+    let mut config = match (rules_file, variant) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "give either rules_file or variant, not both — the CLI refuses the same",
+            ))
+        }
+        (Some(path), None) => GameConfig::from_config_file(std::path::Path::new(path))
+            .map_err(PyValueError::new_err)?,
+        (None, v) => {
+            let v = v.unwrap_or("split");
+            GameConfig::preset(
+                Variant::parse(v)
+                    .ok_or_else(|| PyValueError::new_err(format!("unknown variant {v:?}")))?,
+            )
+        }
+    };
+    if let Some(tp) = two_power {
+        config.two_power = TwoPower::parse(tp)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown two_power {tp:?}")))?;
+    }
+    if let Some(n) = stalemate {
+        config.stalemate_quiet_plies = n;
+    }
+    if let Some(v) = stalemate_value {
+        config.stalemate_value = v;
+    }
+    if let Some(n) = encoding_slots {
+        config.encoding_slots = n;
+    }
+    config
+        .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid config: {e}")))?;
+    Ok(config)
+}
+
+/// Play every decision that has exactly one legal action, as `.d52sp` does: a forced move
+/// carries no choice, so it is not offered to the network and not recorded.
+fn advance_forced(state: &mut GameState) {
+    while !state.outcome.is_over() {
+        let legal = state.legal_actions();
+        if legal.len() != 1 {
+            break;
+        }
+        state.apply_trusted(legal[0]);
+    }
+}
+
+/// Many games at once, for an actor that evaluates its network on a batch — `PLAN.md` item 8.
+///
+/// The engine still does everything the engine does: the rules, legality, and the encoder.
+/// What this adds is only the shape. Rather than one `Game` per Python object and one
+/// observation per call, `observe` writes every waiting game's observation and legal mask
+/// into arrays the caller owns — across threads, with the GIL released — and `apply` takes
+/// one encoded action index per game, which the engine decodes and checks.
+///
+/// ```python
+/// batch = GameBatch(games=256, seed=1, encoding_slots=21, stalemate_value=0.0)
+/// obs, mask, ids, players = bytearray(...), bytearray(...), bytearray(...), bytearray(...)
+/// while not batch.done():
+///     k = batch.observe(obs, mask, ids, players)   # first k rows are filled
+///     batch.apply(ids_k.tobytes(), actions_k.tobytes())
+/// batch.returns()                                  # f32 [games, 2] on -1..1
+/// ```
+///
+/// Buffers are `bytearray`s rather than numpy arrays because the extension is built against
+/// the abi3 limited API, where PyO3's buffer protocol is not available. Wrap them with
+/// `numpy.frombuffer` once and reuse them; a numpy view also stops the bytearray being
+/// resized while `observe` holds its pointer.
+#[pyclass(name = "GameBatch", module = "duel52._engine", skip_from_py_object)]
+pub struct PyGameBatch {
+    games: Vec<GameState>,
+    /// Decisions offered and applied so far, per game. Forced moves are not counted.
+    decisions: Vec<u32>,
+    config: GameConfig,
+    threads: usize,
+}
+
+#[pymethods]
+impl PyGameBatch {
+    /// Deal `games` games, seeded `seed`, `seed + 1`, … — so a batch is reproducible from
+    /// its first seed, the way a self-play shard is.
+    #[new]
+    #[pyo3(signature = (games, seed, variant=None, rules_file=None, encoding_slots=None, two_power=None, stalemate=None, stalemate_value=None, threads=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        games: usize,
+        seed: u64,
+        variant: Option<&str>,
+        rules_file: Option<&str>,
+        encoding_slots: Option<usize>,
+        two_power: Option<&str>,
+        stalemate: Option<u32>,
+        stalemate_value: Option<f32>,
+        threads: usize,
+    ) -> PyResult<PyGameBatch> {
+        if games == 0 {
+            return Err(PyValueError::new_err("a GameBatch needs at least one game"));
+        }
+        let config = config_from_flags(
+            variant,
+            rules_file,
+            encoding_slots,
+            two_power,
+            stalemate,
+            stalemate_value,
+        )?;
+        let mut states: Vec<GameState> = (0..games as u64)
+            .map(|i| GameState::new(config.clone(), seed.wrapping_add(i)))
+            .collect();
+        states.iter_mut().for_each(advance_forced);
+        let threads = if threads == 0 {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        } else {
+            threads
+        };
+        Ok(PyGameBatch {
+            decisions: vec![0; games],
+            games: states,
+            config,
+            threads,
+        })
+    }
+
+    fn __len__(&self) -> usize {
+        self.games.len()
+    }
+
+    #[getter]
+    fn obs_dim(&self) -> usize {
+        encode::obs_dim(&self.config)
+    }
+
+    #[getter]
+    fn action_dim(&self) -> usize {
+        encode::action_dim(&self.config)
+    }
+
+    #[getter]
+    fn rules_hash(&self) -> String {
+        format!("{:016x}", self.config.rules_hash())
+    }
+
+    #[getter]
+    fn obs_layout_hash(&self) -> String {
+        format!("{:016x}", encode::obs_layout_hash(&self.config))
+    }
+
+    /// Every game is over.
+    fn done(&self) -> bool {
+        self.games.iter().all(|g| g.outcome.is_over())
+    }
+
+    /// Fill the first `k` rows for the `k` games awaiting a decision, in game order.
+    ///
+    /// `obs` is f32 `[games × obs_dim]`, `mask` u8 `[games × action_dim]` (1 = legal),
+    /// `ids` u32 `[games]` (which game each row is), `players` u8 `[games]` (who is to act,
+    /// whose point of view the row is encoded from). Returns `k`.
+    fn observe(
+        &self,
+        py: Python<'_>,
+        obs: &Bound<'_, pyo3::types::PyByteArray>,
+        mask: &Bound<'_, pyo3::types::PyByteArray>,
+        ids: &Bound<'_, pyo3::types::PyByteArray>,
+        players: &Bound<'_, pyo3::types::PyByteArray>,
+    ) -> PyResult<usize> {
+        let (od, ad) = (encode::obs_dim(&self.config), encode::action_dim(&self.config));
+        let waiting: Vec<usize> = (0..self.games.len())
+            .filter(|&g| !self.games[g].outcome.is_over())
+            .collect();
+        let k = waiting.len();
+        let need = |name: &str, len: usize, want: usize| -> PyResult<()> {
+            if len < want {
+                return Err(PyValueError::new_err(format!(
+                    "{name} holds {len} bytes, but {k} waiting games need {want}"
+                )));
+            }
+            Ok(())
+        };
+        need("obs", obs.len(), k * od * 4)?;
+        need("mask", mask.len(), k * ad)?;
+        need("ids", ids.len(), k * 4)?;
+        need("players", players.len(), k)?;
+
+        // SAFETY: nothing else runs Python code while these slices are alive — the caller's
+        // numpy views pin the bytearrays' size, and the four buffers are distinct objects.
+        let (obs_b, mask_b, ids_b, players_b) = unsafe {
+            (obs.as_bytes_mut(), mask.as_bytes_mut(), ids.as_bytes_mut(), players.as_bytes_mut())
+        };
+        for (row, &g) in waiting.iter().enumerate() {
+            ids_b[row * 4..row * 4 + 4].copy_from_slice(&(g as u32).to_le_bytes());
+            players_b[row] = self.games[g].acting_player().idx() as u8;
+        }
+        if k == 0 {
+            return Ok(0);
+        }
+
+        let games = &self.games;
+        let per = k.div_ceil(self.threads.min(k));
+        let work = |rows: &[usize], obs_rows: &mut [u8], mask_rows: &mut [u8]| {
+            let mut o = vec![0f32; od];
+            let mut m = vec![false; ad];
+            for (r, &g) in rows.iter().enumerate() {
+                let state = &games[g];
+                encode::encode_observation(state, state.acting_player(), &mut o);
+                encode::legal_mask(state, &mut m);
+                // f32 → bytes: reading any value's bytes is always valid, and every platform
+                // this project targets is little-endian, as `replay_shard` already assumes.
+                let bytes = unsafe { std::slice::from_raw_parts(o.as_ptr() as *const u8, od * 4) };
+                obs_rows[r * od * 4..(r + 1) * od * 4].copy_from_slice(bytes);
+                for (dst, &legal) in mask_rows[r * ad..(r + 1) * ad].iter_mut().zip(&m) {
+                    *dst = legal as u8;
+                }
+            }
+        };
+        py.detach(|| {
+            if per == k {
+                work(&waiting, &mut obs_b[..k * od * 4], &mut mask_b[..k * ad]);
+                return;
+            }
+            std::thread::scope(|s| {
+                let chunks = waiting
+                    .chunks(per)
+                    .zip(obs_b[..k * od * 4].chunks_mut(per * od * 4))
+                    .zip(mask_b[..k * ad].chunks_mut(per * ad));
+                for ((rows, obs_rows), mask_rows) in chunks {
+                    s.spawn(move || work(rows, obs_rows, mask_rows));
+                }
+            });
+        });
+        Ok(k)
+    }
+
+    /// Apply one encoded action index to each named game, then play out its forced moves.
+    ///
+    /// `ids` and `actions` are little-endian u32 bytes of equal length — `ndarray.tobytes()`.
+    /// Each index is decoded by the engine and refused if it is not legal, so a bad sample
+    /// raises rather than playing an illegal move. A game may appear at most once per call.
+    fn apply(&mut self, py: Python<'_>, ids: &[u8], actions: &[u8]) -> PyResult<()> {
+        if ids.len() != actions.len() || ids.len() % 4 != 0 {
+            return Err(PyValueError::new_err(
+                "ids and actions must be u32 byte strings of the same length",
+            ));
+        }
+        let n = self.games.len();
+        let mut chosen: Vec<Option<usize>> = vec![None; n];
+        for (id, action) in ids.chunks_exact(4).zip(actions.chunks_exact(4)) {
+            let g = u32::from_le_bytes([id[0], id[1], id[2], id[3]]) as usize;
+            let a = u32::from_le_bytes([action[0], action[1], action[2], action[3]]) as usize;
+            if g >= n {
+                return Err(PyIndexError::new_err(format!("game {g} out of range (0..{n})")));
+            }
+            if chosen[g].replace(a).is_some() {
+                return Err(PyValueError::new_err(format!("game {g} named twice in one apply")));
+            }
+        }
+
+        let per = n.div_ceil(self.threads.min(n));
+        let work = |base: usize,
+                    games: &mut [GameState],
+                    decisions: &mut [u32],
+                    chosen: &[Option<usize>]|
+         -> Result<(), String> {
+            for (offset, ((state, count), pick)) in
+                games.iter_mut().zip(decisions.iter_mut()).zip(chosen).enumerate()
+            {
+                let Some(index) = *pick else { continue };
+                let g = base + offset;
+                let action = encode::decode_action(index, state)
+                    .ok_or_else(|| format!("game {g}: action index {index} does not decode"))?;
+                state
+                    .apply(action)
+                    .map_err(|e| format!("game {g}: `{action}` refused: {}", e.reason))?;
+                *count += 1;
+                advance_forced(state);
+            }
+            Ok(())
+        };
+        let (games, decisions) = (&mut self.games, &mut self.decisions);
+        let result: Result<(), String> = py.detach(|| {
+            if per == n {
+                return work(0, games, decisions, &chosen);
+            }
+            std::thread::scope(|s| {
+                let handles: Vec<_> = games
+                    .chunks_mut(per)
+                    .zip(decisions.chunks_mut(per))
+                    .zip(chosen.chunks(per))
+                    .enumerate()
+                    .map(|(c, ((g, d), p))| s.spawn(move || work(c * per, g, d, p)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("a GameBatch worker panicked"))
+                    .collect::<Result<Vec<()>, String>>()
+                    .map(|_| ())
+            })
+        });
+        result.map_err(PyValueError::new_err)
+    }
+
+    /// Each game's result for `[p0, p1]`, f32 little-endian `[games × 2]` on `-1..1`.
+    ///
+    /// From `GameConfig::learning_value`, so an engine-declared stalemate is worth
+    /// `stalemate_value` to both players, exactly as AlphaZero's value targets are.
+    fn returns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let mut out = Vec::with_capacity(self.games.len() * 8);
+        for (g, state) in self.games.iter().enumerate() {
+            if !state.outcome.is_over() {
+                return Err(PyRuntimeError::new_err(format!("game {g} is still running")));
+            }
+            for p in [Player::P0, Player::P1] {
+                let v = 2.0 * self.config.learning_value(state.outcome, p) - 1.0;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Ok(pyo3::types::PyBytes::new(py, &out))
+    }
+
+    /// Each game's outcome, named as `Game.outcome` names it.
+    fn outcomes(&self) -> Vec<String> {
+        self.games.iter().map(|g| outcome_name(g.outcome)).collect()
+    }
+
+    /// Decisions offered to the actor so far, per game — forced moves excluded.
+    fn decisions(&self) -> Vec<u32> {
+        self.decisions.clone()
+    }
+
+    /// Plies (turns) played so far, per game.
+    fn plies(&self) -> Vec<u32> {
+        self.games.iter().map(|g| g.ply).collect()
+    }
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", "Rust engine for Duel 52. Imported via the `duel52` package.")?;
     m.add("VERSION", duel52_engine::VERSION)?;
     m.add_class::<PyGame>()?;
+    m.add_class::<PyGameBatch>()?;
     m.add_class::<PyAgent>()?;
     m.add_function(wrap_pyfunction!(random_play_stats, m)?)?;
     m.add_function(wrap_pyfunction!(power_reference, m)?)?;
