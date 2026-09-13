@@ -47,6 +47,7 @@ use crate::config::GameConfig;
 use crate::elo::{fit, EloTable, Pairing};
 use crate::encode::{action_dim, obs_dim};
 use crate::nn::BatchScratch;
+use crate::outcome::Outcome;
 use crate::probe::{play_instrumented, GameStats, MatchGame, MatchStats, AGENT_STREAM};
 
 /// Something that consumes finished games. One per worker.
@@ -92,11 +93,36 @@ where
     F: Fn(usize) -> S + Sync,
 {
     let games = games + (games % 2);
-    if games == 0 {
+    let all: Vec<usize> = (0..games).collect();
+    run_indexed(config, specs, first_seed, &all, threads, eval_batch, make_sink, &|_, _| {})
+}
+
+/// [`run_games`] over an arbitrary set of game numbers, with `on_finish` told about each game
+/// the moment it ends — before a batched worker has put its games back in order for the sink.
+///
+/// `games` is `0..n` for every caller except a resumed match, where it is whatever a journal
+/// did not already hold. Workers get contiguous runs of the list, so `0..n` shards exactly as
+/// [`shards`] always has and [`worker_count`] stays true.
+#[allow(clippy::too_many_arguments)]
+fn run_indexed<S, F>(
+    config: GameConfig,
+    specs: &[AgentSpec; 2],
+    first_seed: u64,
+    games: &[usize],
+    threads: usize,
+    eval_batch: usize,
+    make_sink: F,
+    on_finish: &(dyn Fn(usize, &GameStats) + Sync),
+) -> Vec<S>
+where
+    S: GameSink + Send,
+    F: Fn(usize) -> S + Sync,
+{
+    if games.is_empty() {
         return Vec::new();
     }
     let eval_batch = eval_batch.max(1);
-    let shards = shards(games, threads);
+    let shards = shards(games.len(), threads);
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = shards
@@ -104,15 +130,17 @@ where
             .enumerate()
             .map(|(w, &(lo, hi))| {
                 let make_sink = &make_sink;
+                let part = &games[lo..hi];
                 scope.spawn(move || {
                     let mut sink = make_sink(w);
                     if eval_batch > 1 {
                         play_shard_batched(
-                            config, specs, first_seed, lo, hi, eval_batch, &mut sink,
+                            config, specs, first_seed, part, eval_batch, &mut sink, on_finish,
                         );
                     } else {
-                        for g in lo..hi {
+                        for &g in part {
                             let stats = play_indexed(config, specs, first_seed, g);
+                            on_finish(g, &stats);
                             sink.take_game(g, &stats, seats(g));
                         }
                     }
@@ -178,6 +206,113 @@ pub fn run_match(
     total
 }
 
+/// [`run_match`], resumable: every game's result is appended to `journal` as it finishes, and
+/// a game already in it from an earlier attempt at the same match is not played again.
+///
+/// This is what lets a gate or a panel row survive the training loop being paused — on a
+/// 128-core box the gate alone is several minutes, and a pause used to cost all of them.
+///
+/// **What a restored game contributes is its result and its length, not its behaviour.** The
+/// score, W/L/D, the draw breakdown, the first-player score and the mean length are exactly
+/// what an uninterrupted match reports (`rule_2_a_resumed_match_scores_what_an_uninterrupted_one_does`).
+/// The per-agent behaviour lines are built from [`GameStats`], which is far too large to journal
+/// for a number the gate never reads, so they cover only the games this attempt played and the
+/// report says how many that was.
+#[allow(clippy::too_many_arguments)]
+pub fn run_match_journaled(
+    config: GameConfig,
+    a: AgentSpec,
+    b: AgentSpec,
+    first_seed: u64,
+    games: usize,
+    threads: usize,
+    eval_batch: usize,
+    journal: &std::path::Path,
+) -> Result<MatchStats, String> {
+    use crate::journal::{file_hash, Journal};
+    use std::fmt::Write as _;
+
+    let started = Instant::now();
+    let games = games + (games % 2);
+    let mut fingerprint = String::new();
+    let _ = writeln!(fingerprint, "match\nengine_version={}", crate::VERSION);
+    let _ = writeln!(fingerprint, "a={a}\nb={b}\nfirst_seed={first_seed}\ngames={games}");
+    // By contents, because the training loop's incumbent is always `best.d52nn` and a
+    // candidate that was refitted keeps its generation's file name.
+    for spec in [&a, &b] {
+        if let Some(path) = spec.checkpoint() {
+            let hash = file_hash(std::path::Path::new(path))?;
+            let _ = writeln!(fingerprint, "checkpoint={path} fnv={hash:016x}");
+        }
+    }
+    fingerprint.push_str(&config.to_config_string());
+
+    let opened = Journal::open(journal, &fingerprint)?;
+    if let Some(why) = &opened.discarded {
+        eprintln!("  match: starting {} over — {why}", journal.display());
+    }
+
+    let mut total = MatchStats::empty(config, [a.clone(), b.clone()]);
+    let mut finished = vec![false; games];
+    let mut restored: Vec<(usize, Outcome, u32)> = Vec::with_capacity(opened.restored.len());
+    for (index, payload) in &opened.restored {
+        let g = *index as usize;
+        let decoded = (g < games && payload.len() == 5)
+            .then(|| outcome_from_code(payload[0]))
+            .flatten()
+            .ok_or_else(|| {
+                format!(
+                    "journal `{}` holds a record for game {g} that does not decode — delete it \
+                     to start this match over",
+                    journal.display()
+                )
+            })?;
+        let plies = u32::from_le_bytes(payload[1..5].try_into().expect("4 bytes"));
+        finished[g] = true;
+        restored.push((g, decoded, plies));
+    }
+    // Game order, like every other path into a `MatchStats`.
+    restored.sort_by_key(|&(g, _, _)| g);
+    for &(g, outcome, plies) in &restored {
+        total.absorb_result(outcome, plies, seats(g));
+    }
+    total.restored = restored.len();
+
+    let todo: Vec<usize> = (0..games).filter(|&g| !finished[g]).collect();
+    let specs = [a, b];
+    let writer = &opened.journal;
+    let shards = run_indexed(
+        config,
+        &specs,
+        first_seed,
+        &todo,
+        threads,
+        eval_batch,
+        |_| MatchStats::empty(config, specs.clone()),
+        &|g, stats: &GameStats| {
+            let mut payload = [0u8; 5];
+            payload[0] = crate::selfplay::outcome_code(stats.outcome);
+            payload[1..].copy_from_slice(&stats.plies.to_le_bytes());
+            writer.append(g as u64, &payload);
+        },
+    );
+    for shard in &shards {
+        total.merge(shard);
+    }
+    if let Err(e) = writer.finish() {
+        eprintln!("  warning: {e} — the match is complete, but this run could not have been resumed");
+    }
+    total.elapsed_secs = started.elapsed().as_secs_f64();
+    Ok(total)
+}
+
+/// A match journal record's outcome byte, decoded. The shard's own reader takes an unknown
+/// byte as a stall, which suits a corpus from an older build; a match journal is only ever
+/// this build's, so an unknown byte here is damage and is refused.
+fn outcome_from_code(code: u8) -> Option<Outcome> {
+    (code <= crate::selfplay::MAX_OUTCOME_CODE).then(|| crate::selfplay::outcome_from_code(code))
+}
+
 /// Build both agents for one game, seated.
 ///
 /// Stream tags follow the *agent*, not the seat, so an agent consumes the same random
@@ -211,12 +346,12 @@ fn play_shard_batched<S: GameSink>(
     config: GameConfig,
     specs: &[AgentSpec; 2],
     first_seed: u64,
-    lo: usize,
-    hi: usize,
+    indices: &[usize],
     batch: usize,
     sink: &mut S,
+    on_finish: &(dyn Fn(usize, &GameStats) + Sync),
 ) {
-    let slots = crate::nn::batch_slots(hi - lo, batch);
+    let slots = crate::nn::batch_slots(indices.len(), batch);
     let (od, ad) = (obs_dim(&config), action_dim(&config));
 
     // Per slot, because a slot's observation is written when it suspends and its mask must
@@ -235,7 +370,7 @@ fn play_shard_batched<S: GameSink>(
     let mut keys: Vec<usize> = Vec::with_capacity(2);
     let mut rows: Vec<usize> = Vec::with_capacity(slots);
     let mut scratches: Vec<(usize, BatchScratch)> = Vec::new();
-    let mut next = lo;
+    let mut next = 0usize;
     // Collected rather than absorbed as they finish, then absorbed in game order.
     //
     // ⚠️ Not fussiness. `AgentBehaviour::absorb` *pushes* each game's lane and attack
@@ -244,13 +379,13 @@ fn play_shard_batched<S: GameSink>(
     // differing in its last bits between `--eval-batch 1` and anything else — a difference
     // small enough to look like nothing and large enough to make the probe tables
     // irreproducible. The gate itself reads only integers and would not have noticed.
-    let mut finished: Vec<(usize, crate::probe::GameStats)> = Vec::with_capacity(hi - lo);
+    let mut finished: Vec<(usize, GameStats)> = Vec::with_capacity(indices.len());
 
     loop {
         pending.clear();
         for slot in 0..slots {
-            if games[slot].is_none() && next < hi {
-                let g = next;
+            if games[slot].is_none() && next < indices.len() {
+                let g = indices[next];
                 next += 1;
                 let seed = first_seed + (g / 2) as u64;
                 let (first, second) = build_seated(specs, seed, seats(g));
@@ -273,7 +408,11 @@ fn play_shard_batched<S: GameSink>(
                 SearchStep::Done => {
                     let g = *g;
                     let (_, game) = games[slot].take().expect("live a line ago");
-                    finished.push((g, game.finish()));
+                    let stats = game.finish();
+                    // Now, not at the sort below: a journal that waited for the whole shard
+                    // would lose every finished game in it to a pause.
+                    on_finish(g, &stats);
+                    finished.push((g, stats));
                 }
             }
         }
@@ -281,7 +420,7 @@ fn play_shard_batched<S: GameSink>(
         if pending.is_empty() {
             // Every live game contributes a row, so no rows means no live games.
             debug_assert!(games.iter().all(|g| g.is_none()));
-            if next >= hi {
+            if next >= indices.len() {
                 break;
             }
             continue;
@@ -362,7 +501,7 @@ fn play_indexed(
     agents: &[AgentSpec; 2],
     first_seed: u64,
     g: usize,
-) -> crate::probe::GameStats {
+) -> GameStats {
     let seed = first_seed + (g / 2) as u64;
     let seats = seats(g);
 

@@ -1057,6 +1057,10 @@ pub struct MatchStats {
     pub max_side_occupancy: usize,
     pub behaviour: [AgentBehaviour; 2],
     pub elapsed_secs: f64,
+    /// Of `games`, how many were read back from a match journal rather than played by this
+    /// run (`ladder::run_match_journaled`). They count toward the result and the lengths, and
+    /// not toward `behaviour`, `unlock_plies` or `max_side_occupancy`.
+    pub restored: usize,
 }
 
 impl MatchStats {
@@ -1078,13 +1082,27 @@ impl MatchStats {
             max_side_occupancy: 0,
             behaviour: [AgentBehaviour::default(), AgentBehaviour::default()],
             elapsed_secs: 0.0,
+            restored: 0,
         }
     }
 
     /// Fold in one finished game. `seats[i]` is the agent index that played as `Player::i`.
     pub(crate) fn absorb(&mut self, stats: &GameStats, seats: [usize; 2]) {
+        self.absorb_result(stats.outcome, stats.plies, seats);
+        if let Some(ply) = stats.ply_at_unlock {
+            self.unlock_plies.push(ply);
+        }
+        self.max_side_occupancy = self.max_side_occupancy.max(stats.max_side_occupancy);
+        for p in Player::BOTH {
+            self.behaviour[seats[p.idx()]].absorb(stats, p, self.config.lanes_to_win);
+        }
+    }
+
+    /// The part of [`Self::absorb`] that needs only how a game ended and how long it took —
+    /// which is all a match journal keeps.
+    pub(crate) fn absorb_result(&mut self, outcome: Outcome, plies: u32, seats: [usize; 2]) {
         self.games += 1;
-        match stats.outcome {
+        match outcome {
             Outcome::Win(p) => self.wins[seats[p.idx()]] += 1,
             Outcome::Draw(reason) => {
                 self.draws += 1;
@@ -1098,18 +1116,11 @@ impl MatchStats {
         }
 
         self.p0_seat_games += 1;
-        let p0_score = stats.outcome.value_for(Player::P0) as f64;
+        let p0_score = outcome.value_for(Player::P0) as f64;
         self.p0_seat_score += p0_score;
         self.p0_seat_score_sq += p0_score * p0_score;
 
-        self.lengths.push(stats.plies);
-        if let Some(ply) = stats.ply_at_unlock {
-            self.unlock_plies.push(ply);
-        }
-        self.max_side_occupancy = self.max_side_occupancy.max(stats.max_side_occupancy);
-        for p in Player::BOTH {
-            self.behaviour[seats[p.idx()]].absorb(stats, p, self.config.lanes_to_win);
-        }
+        self.lengths.push(plies);
     }
 
     /// Merge another shard. Used to combine per-thread results.
@@ -1129,6 +1140,7 @@ impl MatchStats {
         self.max_side_occupancy = self.max_side_occupancy.max(other.max_side_occupancy);
         self.behaviour[0].merge(&other.behaviour[0]);
         self.behaviour[1].merge(&other.behaviour[1]);
+        self.restored += other.restored;
     }
 
     /// Score for agent 0: 1 per win, 0.5 per draw.
@@ -1200,7 +1212,8 @@ impl MatchStats {
         if self.elapsed_secs <= 0.0 {
             f64::INFINITY
         } else {
-            self.games as f64 / self.elapsed_secs
+            // Games this run played: a restored game took no time here.
+            (self.games - self.restored) as f64 / self.elapsed_secs
         }
     }
 
@@ -1235,6 +1248,15 @@ impl MatchStats {
             self.max_side_occupancy,
             self.games_per_sec(),
         ));
+        if self.restored > 0 {
+            out.push_str(&format!(
+                "  resumed: {} of the {} games were restored from a journal — the lines above \
+                 count them, the per-agent lines below cover the other {}\n",
+                self.restored,
+                self.games,
+                self.games - self.restored,
+            ));
+        }
         for i in 0..2 {
             let b = &self.behaviour[i];
             let (won, lost) = b.hand_at_unlock_by_result();

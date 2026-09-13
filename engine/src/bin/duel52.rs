@@ -173,6 +173,15 @@ OPTIONS
                                   defined up to a constant, so this is what the table is
                                   measured against.
   --a <agent> --b <agent>         the two sides of a `match`
+  --journal <file>                match and selfplay: append each game to <file> as it
+                                  finishes, and on a re-run of the same job skip the games
+                                  already in it, so a killed run resumes rather than
+                                  restarts. A journal for a different job (seed, games,
+                                  settings, ruleset or checkpoint *contents*) is started
+                                  over. The file is kept afterwards; delete it yourself.
+                                  A resumed shard is byte-identical to an uninterrupted
+                                  one; a resumed match scores identically, and its
+                                  per-agent behaviour lines cover only the games it played
   --markdown                      emit Markdown, for pasting into FINDINGS.md
 
   analyze only:
@@ -1045,7 +1054,8 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
 /// One head-to-head, reported in full. `--a` and `--b` default to the two ends of the
 /// ladder, which is the comparison worth running if you did not say.
 fn cmd_match(args: &[String]) -> Result<(), String> {
-    let opts = parse_options(args)?;
+    let (journal, args) = take_journal_flag(args)?;
+    let opts = parse_options(&args)?;
     let a = opts.agent_a.clone().unwrap_or(AgentSpec::Ismcts {
         iterations: duel52_engine::IsmctsAgent::DEFAULT_ITERATIONS,
     });
@@ -1053,9 +1063,38 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
     let games = opts.games_or(400);
     refuse_cross_ruleset(&[a.clone(), b.clone()], &opts.config)?;
 
-    let result = ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads, opts.eval_batch);
+    let result = match journal {
+        Some(path) => ladder::run_match_journaled(
+            opts.config,
+            a,
+            b,
+            opts.seed,
+            games,
+            opts.threads,
+            opts.eval_batch,
+            std::path::Path::new(&path),
+        )?,
+        None => ladder::run_match(opts.config, a, b, opts.seed, games, opts.threads, opts.eval_batch),
+    };
     print!("{}", result.report());
     Ok(())
+}
+
+/// Pull `--journal <file>` out of an argument list, for the commands that take one, so the
+/// rest can go through `parse_options` and keep its unknown-flag error.
+fn take_journal_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut journal = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--journal" {
+            journal = Some(next_value(args, &mut i, "--journal")?);
+        } else {
+            rest.push(args[i].clone());
+        }
+        i += 1;
+    }
+    Ok((journal, rest))
 }
 
 /// Self-play instrumentation, one row per agent.
@@ -3096,6 +3135,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
 
     let mut checkpoint: Option<String> = None;
     let mut out_path: Option<String> = None;
+    let mut journal: Option<String> = None;
     let mut generation = 0u32;
     let mut quiet = false;
     let mut sp = SelfPlayConfig::default();
@@ -3108,6 +3148,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--checkpoint" => checkpoint = Some(next_value(args, &mut i, "--checkpoint")?),
             "--out" => out_path = Some(next_value(args, &mut i, "--out")?),
+            "--journal" => journal = Some(next_value(args, &mut i, "--journal")?),
             "--generation" => generation = next_number(args, &mut i, "--generation")?,
             "--sims" => sp.sims = next_number(args, &mut i, "--sims")?,
             "--c-puct" => sp.c_puct = next_number(args, &mut i, "--c-puct")?,
@@ -3155,7 +3196,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
     }
 
     let out = std::path::PathBuf::from(&out_path);
-    let report = selfplay::run(
+    let report = selfplay::run_journaled(
         opts.config,
         &sp,
         std::path::Path::new(&checkpoint),
@@ -3166,6 +3207,7 @@ fn cmd_selfplay(args: &[String]) -> Result<(), String> {
         generation,
         &out,
         !quiet,
+        journal.as_deref().map(std::path::Path::new),
     )?;
     print!("{}", report.report(&out));
     if report.max_slots_seen > opts.config.encoding_slots {

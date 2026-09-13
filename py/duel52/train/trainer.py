@@ -23,8 +23,11 @@ implementation, and nothing below mentions a device by name.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -34,8 +37,15 @@ from ..nn.checkpoint import read_checkpoint, write_checkpoint
 from ..nn.model import NetConfig, build_net, lane_spec_for
 from .buffer import Generation, ReplayBuffer
 from .config import TrainConfig
+from .durable import replace_atomically
 
 __all__ = ["Trainer", "StepStats", "EvalStats", "resolve_device"]
+
+
+def _canonical(value: Any) -> Any:
+    """``value`` as it reads back from JSON — tuples as lists — so an identity written into a
+    checkpoint compares equal to the same identity rebuilt on resume."""
+    return json.loads(json.dumps(value))
 
 
 def resolve_device(name: str) -> torch.device:
@@ -211,20 +221,84 @@ class Trainer:
         rng: np.random.Generator,
         steps: int,
         generation: int = 0,
+        *,
+        checkpoint: Path | None = None,
+        save_every: float = 30.0,
+        should_stop: Callable[[], bool] | None = None,
     ) -> StepStats:
-        """Take `steps` optimisation steps over batches drawn from `buffer`."""
-        import time
+        """Take `steps` optimisation steps over batches drawn from `buffer`.
 
+        With ``checkpoint`` set the fit is **resumable**: every ``save_every`` seconds, and on
+        the last step, the weights, AdamW's moments, `rng`'s state and the running loss sums
+        are written there. A later call for the same fit picks up at the saved step, and the
+        weights it ends on are the ones an uninterrupted fit would have produced
+        (``test_a_fit_resumed_from_its_checkpoint_ends_on_the_same_weights``). A call that
+        finds a *finished* checkpoint takes no steps and restores its end state, which is how
+        the loop resumes a generation that was paused after its fit.
+
+        A checkpoint is only resumed by the same fit — same generation, step count, learning
+        rate, buffer size and ``[train]`` settings. Anything else starts over from the state
+        this trainer is already in, which on a ``--resume`` is the last committed generation's.
+
+        ``should_stop`` is polled between steps. When it says so the fit saves and raises
+        :class:`KeyboardInterrupt`, which is how a ``SIGTERM`` costs nothing here rather than up
+        to ``save_every``. The poll is deliberately between steps: stopping inside one could
+        leave ``optimizer.step`` half-applied.
+        """
         cfg = self.config.train
         self.model.train()
         stats = StepStats()
         stats.lr = self.lr_for(generation)
+        identity = _canonical(
+            {
+                "generation": generation,
+                "steps": steps,
+                "lr": stats.lr,
+                "buffer_samples": buffer.samples,
+                # Not `device`: a fit paused on CUDA may be resumed on CPU, and the numbers are
+                # the same fit either way.
+                "train": {k: v for k, v in asdict(cfg).items() if k != "device"},
+            }
+        )
+        policy_sum = value_sum = 0.0
+        start = 0
+        carried = 0.0
+
+        saved = self._load_fit(checkpoint, identity)
+        if saved is not None:
+            self.model.load_state_dict(saved["model"])
+            self.optimizer.load_state_dict(saved["optimizer"])
+            rng.bit_generator.state = json.loads(saved["rng"])
+            start = int(saved["step"])
+            policy_sum, value_sum = float(saved["policy_sum"]), float(saved["value_sum"])
+            stats.policy_first, stats.value_first = saved["policy_first"], saved["value_first"]
+            stats.policy_last, stats.value_last = saved["policy_last"], saved["value_last"]
+            stats.steps = start
+            carried = float(saved["seconds"])
+            if start < steps:
+                print(f"  train       resuming the fit at step {start:,} of {steps:,}", flush=True)
         for group in self.optimizer.param_groups:
             group["lr"] = stats.lr
-        started = time.perf_counter()
-        policy_sum = value_sum = 0.0
+        started = last_save = time.perf_counter()
 
-        for step in range(steps):
+        def save(step: int) -> None:
+            state = {
+                "identity": identity,
+                "step": step,
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "rng": json.dumps(rng.bit_generator.state),
+                "policy_sum": policy_sum,
+                "value_sum": value_sum,
+                "policy_first": stats.policy_first,
+                "value_first": stats.value_first,
+                "policy_last": stats.policy_last,
+                "value_last": stats.value_last,
+                "seconds": carried + time.perf_counter() - started,
+            }
+            replace_atomically(checkpoint, lambda tmp: torch.save(state, tmp))
+
+        for step in range(start, steps):
             batch = buffer.sample_batch(rng, cfg.batch_size)
             x, target, value, mask = self._to_device(batch)
 
@@ -255,11 +329,39 @@ class Trainer:
             stats.policy_last, stats.value_last = p, v
             stats.steps += 1
 
+            if checkpoint is None:
+                continue
+            now = time.perf_counter()
+            stopping = should_stop is not None and should_stop()
+            if stopping or step + 1 == steps or now - last_save >= save_every:
+                save(step + 1)
+                last_save = now
+            if stopping and step + 1 < steps:
+                raise KeyboardInterrupt
+
         if stats.steps:
             stats.policy_mean = policy_sum / stats.steps
             stats.value_mean = value_sum / stats.steps
-        stats.seconds = time.perf_counter() - started
+        stats.seconds = carried + time.perf_counter() - started
         return stats
+
+    def _load_fit(self, path: Path | None, identity: dict) -> dict | None:
+        """A fit checkpoint for exactly this fit, or ``None``."""
+        if path is None or not Path(path).exists():
+            return None
+        try:
+            saved = torch.load(path, map_location=self.device, weights_only=True)
+        except Exception as exc:  # a checkpoint that will not load is one to redo, not a crash
+            print(f"  train       could not read {path} ({exc}); starting this fit over", flush=True)
+            return None
+        if saved.get("identity") != identity:
+            print(
+                f"  train       {Path(path).name} is from a different fit (the buffer or [train] "
+                f"changed); starting this fit over",
+                flush=True,
+            )
+            return None
+        return saved
 
     @torch.no_grad()
     def evaluate(self, holdout: Generation) -> EvalStats:
@@ -304,9 +406,8 @@ class Trainer:
         momentum and costs a few hundred steps of re-warm. On a preemptible box that is
         paid for more than once. ``PLAN.md`` §4.2 change 5.
         """
-        path = Path(path)
-        torch.save(self.optimizer.state_dict(), path)
-        return path
+        state = self.optimizer.state_dict()
+        return replace_atomically(path, lambda tmp: torch.save(state, tmp))
 
     def load_optimizer(self, path: str | Path) -> bool:
         """Restore moments saved by :meth:`save_optimizer`. False if there is nothing to
@@ -331,7 +432,11 @@ class Trainer:
         was = next(self.model.parameters()).device
         self.model.to("cpu")
         try:
-            written = write_checkpoint(path, model=self.model, spec=self.spec)
+            # Atomically, because the loop reads a candidate back after a pause and the engine
+            # would otherwise be handed a truncated one.
+            written = replace_atomically(
+                path, lambda tmp: write_checkpoint(tmp, model=self.model, spec=self.spec)
+            )
         finally:
             self.model.to(was)
         return written

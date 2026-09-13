@@ -162,11 +162,22 @@ pub struct SelfPlayReport {
     pub max_slots_seen: usize,
     pub elapsed_secs: f64,
     pub bytes: usize,
+    /// Of `games`, how many were restored from a journal rather than played by this run. They
+    /// are in every count above; they are not in `elapsed_secs`, so the rate excludes them.
+    pub restored: usize,
 }
 
 impl SelfPlayReport {
     pub fn report(&self, path: &Path) -> String {
         let g = self.games.max(1) as f64;
+        let resumed = if self.restored == 0 {
+            String::new()
+        } else {
+            format!(
+                "  {} of the {} games were restored from a journal, not played here\n",
+                self.restored, self.games
+            )
+        };
         // The policy-target line appears only when playout cap randomisation is on, so an
         // unchanged run's output is unchanged.
         let capped = if self.policy_targets == self.samples {
@@ -181,18 +192,19 @@ impl SelfPlayReport {
         };
         format!(
             "wrote {} — {} games, {} samples, {:.1} MB\n  \
-             {:.1} games/sec · {:.1} decisions/game · P0 {:.1}% P1 {:.1}% draw {:.1}%\n{}  \
+             {:.1} games/sec · {:.1} decisions/game · P0 {:.1}% P1 {:.1}% draw {:.1}%\n{}{}  \
              widest lane side seen: {}\n",
             path.display(),
             self.games,
             self.samples,
             self.bytes as f64 / 1e6,
-            self.games as f64 / self.elapsed_secs.max(1e-9),
+            (self.games - self.restored) as f64 / self.elapsed_secs.max(1e-9),
             self.samples as f64 / g,
             100.0 * self.p0_wins as f64 / g,
             100.0 * self.p1_wins as f64 / g,
             100.0 * self.draws as f64 / g,
             capped,
+            resumed,
             self.max_slots_seen,
         )
     }
@@ -388,27 +400,30 @@ impl GameRunner {
     }
 }
 
-/// Play games `lo..hi` of a shard with up to `batch` of them in flight at once.
+/// Play the games numbered `games` of a shard with up to `batch` of them in flight at once.
 ///
 /// The speed-up this exists for is entirely in [`MlpEvaluator::eval_masked_batch`]: the lane
 /// trunk runs at ~14% of the machine's width on one position and ~85% on sixty-four, because
 /// the batch is the one dimension of the dot product that carries no dependency. Nothing
 /// about the games changes — see [`SearchInProgress`] — so the shard this writes is
 /// byte-identical to the one `batch = 1` writes.
+///
+/// `games` is a contiguous run of numbers unless a journal restored some of them, in which case
+/// it is whatever is left — see [`run_journaled`]. `on_done` sees each game the moment it ends.
+#[allow(clippy::too_many_arguments)]
 fn play_shard_batched(
     config: GameConfig,
     sp: &SelfPlayConfig,
     checkpoint: &Path,
     first_seed: u64,
-    lo: usize,
-    hi: usize,
+    games: &[usize],
     batch: usize,
-    on_done: &mut dyn FnMut(),
+    on_done: &mut dyn FnMut(&GameRecord),
 ) -> Vec<GameRecord> {
     let evaluator = crate::nn::evaluator_for(checkpoint, &config)
         .unwrap_or_else(|e| panic!("netmcts: {e}"));
     let (od, ad) = (obs_dim(&config), action_dim(&config));
-    let slots = crate::nn::batch_slots(hi - lo, batch);
+    let slots = crate::nn::batch_slots(games.len(), batch);
 
     let mut obs = vec![0.0f32; slots * od];
     let mut masks = vec![false; slots * ad];
@@ -418,19 +433,19 @@ fn play_shard_batched(
 
     let mut runners: Vec<Option<GameRunner>> = (0..slots).map(|_| None).collect();
     let mut row_slot: Vec<usize> = Vec::with_capacity(slots);
-    let mut next = lo;
-    let mut out: Vec<GameRecord> = Vec::with_capacity(hi - lo);
+    let mut next = 0usize;
+    let mut out: Vec<GameRecord> = Vec::with_capacity(games.len());
 
     loop {
         let mut rows = 0usize;
         row_slot.clear();
         for slot in 0..slots {
-            if runners[slot].is_none() && next < hi {
+            if runners[slot].is_none() && next < games.len() {
                 runners[slot] = Some(GameRunner::new(
                     config,
                     sp,
                     checkpoint,
-                    first_seed + next as u64,
+                    first_seed + games[next] as u64,
                 ));
                 next += 1;
             }
@@ -449,9 +464,10 @@ fn play_shard_batched(
                     rows += 1;
                 }
                 SearchStep::Done => {
-                    out.push(runner.take_record().expect("a finished game has a record"));
+                    let record = runner.take_record().expect("a finished game has a record");
+                    on_done(&record);
+                    out.push(record);
                     runners[slot] = None;
-                    on_done();
                 }
             }
         }
@@ -459,7 +475,7 @@ fn play_shard_batched(
         if rows == 0 {
             // Every live game contributes a row, so no rows means no live games.
             debug_assert!(runners.iter().all(|r| r.is_none()));
-            if next >= hi {
+            if next >= games.len() {
                 break;
             }
             continue;
@@ -540,6 +556,37 @@ pub fn run(
     out: &Path,
     progress: bool,
 ) -> Result<SelfPlayReport, String> {
+    run_journaled(
+        config, sp, checkpoint, first_seed, games, threads, eval_batch, generation, out, progress,
+        None,
+    )
+}
+
+/// [`run`], resumable. Every game is appended to `journal` the moment it finishes, and games
+/// already in it from an earlier attempt at the same job are not played again.
+///
+/// **The shard is byte-identical to an uninterrupted run's**, because games are independent
+/// and written in seed order whichever attempt played them — which is what makes a pause on a
+/// shared box cost the games in flight rather than the generation. See [`crate::journal`] for
+/// what counts as "the same job"; a journal for any other is discarded with a warning.
+///
+/// The journal is left in place after the shard is written. Deleting it is the caller's call:
+/// the training loop keeps it until it has recorded the generation's self-play as done, so a
+/// pause between the two costs a re-read rather than a re-play.
+#[allow(clippy::too_many_arguments)]
+pub fn run_journaled(
+    config: GameConfig,
+    sp: &SelfPlayConfig,
+    checkpoint: &Path,
+    first_seed: u64,
+    games: usize,
+    threads: usize,
+    eval_batch: usize,
+    generation: u32,
+    out: &Path,
+    progress: bool,
+    journal: Option<&Path>,
+) -> Result<SelfPlayReport, String> {
     let started = Instant::now();
     // Load once, up front, so a bad checkpoint is an error here rather than a panic inside a
     // worker thread a minute later.
@@ -547,27 +594,85 @@ pub fn run(
     let arch = evaluator.arch();
     crate::encode::reset_observed_max_slots();
 
-    let threads = threads.max(1).min(games.max(1));
-    let shards: Vec<(usize, usize)> = (0..threads)
-        .map(|t| (games * t / threads, games * (t + 1) / threads))
-        .filter(|(lo, hi)| lo < hi)
+    let header = shard_header(&config, sp, checkpoint, first_seed, games, generation, arch);
+    let config_text = config.to_config_string();
+
+    let mut records: Vec<GameRecord> = Vec::with_capacity(games);
+    let journal = match journal {
+        None => None,
+        Some(path) => {
+            // The header already names everything a game depends on except what is *in* the
+            // checkpoint, and the loop reuses one path for every generation's incumbent.
+            let fingerprint = format!(
+                "selfplay\n{header}checkpoint_fnv={:016x}\n{config_text}",
+                crate::journal::file_hash(checkpoint)?
+            );
+            let opened = crate::journal::Journal::open(path, &fingerprint)?;
+            if let Some(why) = &opened.discarded {
+                eprintln!("  self-play: starting {} over — {why}", path.display());
+            }
+            for (index, payload) in &opened.restored {
+                let mut at = 0;
+                let game = read_game(payload, &mut at)
+                    .ok()
+                    .filter(|g| at == payload.len() && g.seed == first_seed + index)
+                    .filter(|_| (*index as usize) < games)
+                    .ok_or_else(|| {
+                        format!(
+                            "journal `{}` holds a record for game {index} that does not decode \
+                             — delete it to start this self-play over",
+                            path.display()
+                        )
+                    })?;
+                records.push(GameRecord {
+                    seed: game.seed,
+                    outcome: game.outcome(),
+                    samples: game.samples,
+                });
+            }
+            Some(opened.journal)
+        }
+    };
+    let restored = records.len();
+    if progress && restored > 0 {
+        eprintln!("  self-play: {restored}/{games} games restored from the journal");
+    }
+
+    let mut finished = vec![false; games];
+    for record in &records {
+        finished[(record.seed - first_seed) as usize] = true;
+    }
+    let todo: Vec<usize> = (0..games).filter(|&g| !finished[g]).collect();
+
+    // Contiguous runs of what is left. With nothing restored this is exactly the old split of
+    // `0..games`, so an unjournaled run shards the way every earlier one did.
+    let threads = threads.max(1).min(todo.len().max(1));
+    let shards: Vec<&[usize]> = (0..threads)
+        .map(|t| &todo[todo.len() * t / threads..todo.len() * (t + 1) / threads])
+        .filter(|s| !s.is_empty())
         .collect();
 
-    let done = AtomicUsize::new(0);
+    let done = AtomicUsize::new(restored);
     let report_every = (games / 20).clamp(1, 500);
 
     let eval_batch = eval_batch.max(1);
     let results: Vec<Vec<GameRecord>> = std::thread::scope(|scope| {
         let handles: Vec<_> = shards
             .iter()
-            .map(|&(lo, hi)| {
+            .map(|&part| {
                 let done = &done;
+                let journal = journal.as_ref();
                 scope.spawn(move || {
-                    let report = |done: &AtomicUsize| {
+                    let finish = |record: &GameRecord| {
+                        if let Some(journal) = journal {
+                            let mut bytes = Vec::with_capacity(record.samples.len() * 16);
+                            encode_game(record, &mut bytes);
+                            journal.append(record.seed - first_seed, &bytes);
+                        }
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if progress && (n % report_every == 0 || n == games) {
                             let secs = started.elapsed().as_secs_f64();
-                            let rate = n as f64 / secs.max(1e-9);
+                            let rate = (n - restored) as f64 / secs.max(1e-9);
                             eprintln!(
                                 "  self-play {n}/{games} · {rate:.1} games/sec · \
                                  eta {:.0}s",
@@ -581,16 +686,16 @@ pub fn run(
                             sp,
                             checkpoint,
                             first_seed,
-                            lo,
-                            hi,
+                            part,
                             eval_batch,
-                            &mut || report(done),
+                            &mut |record: &GameRecord| finish(record),
                         );
                     }
-                    let mut out = Vec::with_capacity(hi - lo);
-                    for g in lo..hi {
-                        out.push(play_game(config, sp, checkpoint, first_seed + g as u64));
-                        report(done);
+                    let mut out = Vec::with_capacity(part.len());
+                    for &g in part {
+                        let record = play_game(config, sp, checkpoint, first_seed + g as u64);
+                        finish(&record);
+                        out.push(record);
                     }
                     out
                 })
@@ -602,7 +707,63 @@ pub fn run(
             .collect()
     });
 
-    let mut report = SelfPlayReport::default();
+    records.extend(results.into_iter().flatten());
+    // Seed order is game order, and it is what makes the bytes independent of which attempt,
+    // thread or batch slot played a game.
+    records.sort_by_key(|r| r.seed);
+    debug_assert_eq!(records.len(), games);
+
+    let mut report = SelfPlayReport {
+        restored,
+        ..SelfPlayReport::default()
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(games * 12_000);
+    bytes.extend_from_slice(SHARD_MAGIC);
+    bytes.extend_from_slice(&SHARD_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(config_text.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(config_text.as_bytes());
+
+    for record in &records {
+        report.games += 1;
+        report.samples += record.samples.len();
+        report.total_decisions += record.samples.len();
+        report.policy_targets += record.samples.iter().filter(|s| s.policy_target).count();
+        match record.outcome {
+            Outcome::Win(Player::P0) => report.p0_wins += 1,
+            Outcome::Win(Player::P1) => report.p1_wins += 1,
+            _ => report.draws += 1,
+        }
+        encode_game(record, &mut bytes);
+    }
+
+    // Written whole or not at all. The training loop treats a shard on disk as finished work,
+    // and a kill halfway through a 500 MB write would otherwise leave one that is not.
+    crate::journal::write_atomically(out, &bytes)?;
+    if let Some(journal) = &journal {
+        if let Err(e) = journal.finish() {
+            eprintln!("  warning: {e} — the shard is complete, but this run could not have been resumed");
+        }
+    }
+
+    report.bytes = bytes.len();
+    report.max_slots_seen = crate::encode::observed_max_slots();
+    report.elapsed_secs = started.elapsed().as_secs_f64();
+    Ok(report)
+}
+
+/// The shard's `key=value` header. Built before any game is played, because it doubles as the
+/// description of the job a journal is resumed against.
+fn shard_header(
+    config: &GameConfig,
+    sp: &SelfPlayConfig,
+    checkpoint: &Path,
+    first_seed: u64,
+    games: usize,
+    generation: u32,
+    arch: crate::nn::Arch,
+) -> String {
     let mut header = String::new();
     use std::fmt::Write as _;
     let _ = writeln!(header, "engine_version={}", crate::VERSION);
@@ -643,55 +804,70 @@ pub fn run(
     // rulesets in one replay buffer.
     let _ = writeln!(header, "rules_name={}", config.rules_name);
     let _ = writeln!(header, "rules_hash={:016x}", config.rules_hash());
+    header
+}
 
-    let config_text = config.to_config_string();
-    let mut bytes: Vec<u8> = Vec::with_capacity(games * 12_000);
-    bytes.extend_from_slice(SHARD_MAGIC);
-    bytes.extend_from_slice(&SHARD_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&(config_text.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(header.as_bytes());
-    bytes.extend_from_slice(config_text.as_bytes());
-
-    for record in results.iter().flatten() {
-        report.games += 1;
-        report.samples += record.samples.len();
-        report.total_decisions += record.samples.len();
-        match record.outcome {
-            Outcome::Win(Player::P0) => report.p0_wins += 1,
-            Outcome::Win(Player::P1) => report.p1_wins += 1,
-            _ => report.draws += 1,
-        }
-        bytes.extend_from_slice(&record.seed.to_le_bytes());
-        bytes.extend_from_slice(&(record.samples.len() as u32).to_le_bytes());
-        bytes.push(outcome_code(record.outcome));
-        for sample in &record.samples {
-            bytes.extend_from_slice(&sample.chosen.to_le_bytes());
-            bytes.extend_from_slice(&(sample.policy.len() as u16).to_le_bytes());
-            bytes.extend_from_slice(&sample.root_value.to_le_bytes());
-            bytes.push(u8::from(sample.policy_target));
-            if sample.policy_target {
-                report.policy_targets += 1;
-            }
-            for &(index, share) in &sample.policy {
-                bytes.extend_from_slice(&index.to_le_bytes());
-                bytes.extend_from_slice(&share.to_le_bytes());
-            }
+/// One game's bytes in a shard, and the payload of one self-play journal record — the same
+/// bytes, so there is one writer of the format and [`read_game`] is its one reader.
+fn encode_game(record: &GameRecord, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&record.seed.to_le_bytes());
+    bytes.extend_from_slice(&(record.samples.len() as u32).to_le_bytes());
+    bytes.push(outcome_code(record.outcome));
+    for sample in &record.samples {
+        bytes.extend_from_slice(&sample.chosen.to_le_bytes());
+        bytes.extend_from_slice(&(sample.policy.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&sample.root_value.to_le_bytes());
+        bytes.push(u8::from(sample.policy_target));
+        for &(index, share) in &sample.policy {
+            bytes.extend_from_slice(&index.to_le_bytes());
+            bytes.extend_from_slice(&share.to_le_bytes());
         }
     }
+}
 
-    if let Some(dir) = out.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("cannot create `{}`: {e}", dir.display()))?;
+/// Parse one game written by [`encode_game`], starting at `at` and leaving `at` after it.
+/// `Err` names the field that ran off the end.
+fn read_game(data: &[u8], at: &mut usize) -> Result<ShardGame, &'static str> {
+    fn take<'a>(data: &'a [u8], at: &mut usize, n: usize, what: &'static str) -> Result<&'a [u8], &'static str> {
+        if data.len() < *at + n {
+            return Err(what);
         }
+        let slice = &data[*at..*at + n];
+        *at += n;
+        Ok(slice)
     }
-    std::fs::write(out, &bytes).map_err(|e| format!("cannot write `{}`: {e}", out.display()))?;
 
-    report.bytes = bytes.len();
-    report.max_slots_seen = crate::encode::observed_max_slots();
-    report.elapsed_secs = started.elapsed().as_secs_f64();
-    Ok(report)
+    let seed = u64::from_le_bytes(take(data, at, 8, "game seed")?.try_into().expect("8 bytes"));
+    let count =
+        u32::from_le_bytes(take(data, at, 4, "decision count")?.try_into().expect("4 bytes")) as usize;
+    let outcome_code = take(data, at, 1, "outcome")?[0];
+    // Bounded by what the bytes could hold, so a torn count cannot reserve gigabytes.
+    let mut samples = Vec::with_capacity(count.min((data.len() - *at) / 9));
+    for _ in 0..count {
+        let chosen = u16::from_le_bytes(take(data, at, 2, "chosen")?.try_into().expect("2 bytes"));
+        let entries =
+            u16::from_le_bytes(take(data, at, 2, "entry count")?.try_into().expect("2 bytes")) as usize;
+        let root_value =
+            f32::from_le_bytes(take(data, at, 4, "root value")?.try_into().expect("4 bytes"));
+        let policy_target = take(data, at, 1, "policy target flag")?[0] != 0;
+        let mut policy = Vec::with_capacity(entries);
+        for _ in 0..entries {
+            let index = u16::from_le_bytes(take(data, at, 2, "policy index")?.try_into().expect("2"));
+            let share = f32::from_le_bytes(take(data, at, 4, "policy share")?.try_into().expect("4"));
+            policy.push((index, share));
+        }
+        samples.push(Sample {
+            chosen,
+            root_value,
+            policy,
+            policy_target,
+        });
+    }
+    Ok(ShardGame {
+        seed,
+        outcome_code,
+        samples,
+    })
 }
 
 /// How a game ended, in one byte.
@@ -701,7 +877,7 @@ pub fn run(
 /// `config.stalemate_value` to a learner while a mutual lane win — a real outcome in
 /// `game_rules.md` §7 — is worth half a point. A shard that only recorded "draw" could not
 /// tell the replay which one it was, so every stall would have trained as an honest tie.
-fn outcome_code(outcome: Outcome) -> u8 {
+pub(crate) fn outcome_code(outcome: Outcome) -> u8 {
     match outcome {
         Outcome::Win(Player::P0) => 0,
         Outcome::Win(Player::P1) => 1,
@@ -713,7 +889,10 @@ fn outcome_code(outcome: Outcome) -> u8 {
     }
 }
 
-fn outcome_from_code(code: u8) -> Outcome {
+/// The largest byte [`outcome_code`] writes.
+pub(crate) const MAX_OUTCOME_CODE: u8 = 4;
+
+pub(crate) fn outcome_from_code(code: u8) -> Outcome {
     match code {
         0 => Outcome::Win(Player::P0),
         1 => Outcome::Win(Player::P1),
@@ -860,36 +1039,9 @@ impl Shard {
 
         let mut games = Vec::new();
         while at < data.len() {
-            let seed = u64::from_le_bytes(take!(8, "game seed").try_into().expect("8 bytes"));
-            let count =
-                u32::from_le_bytes(take!(4, "decision count").try_into().expect("4 bytes")) as usize;
-            let outcome_code = take!(1, "outcome")[0];
-            let mut samples = Vec::with_capacity(count);
-            for _ in 0..count {
-                let chosen = u16::from_le_bytes(take!(2, "chosen").try_into().expect("2 bytes"));
-                let entries =
-                    u16::from_le_bytes(take!(2, "entry count").try_into().expect("2 bytes")) as usize;
-                let root_value =
-                    f32::from_le_bytes(take!(4, "root value").try_into().expect("4 bytes"));
-                let policy_target = take!(1, "policy target flag")[0] != 0;
-                let mut policy = Vec::with_capacity(entries);
-                for _ in 0..entries {
-                    let index = u16::from_le_bytes(take!(2, "policy index").try_into().expect("2"));
-                    let share = f32::from_le_bytes(take!(4, "policy share").try_into().expect("4"));
-                    policy.push((index, share));
-                }
-                samples.push(Sample {
-                    chosen,
-                    root_value,
-                    policy,
-                    policy_target,
-                });
-            }
-            games.push(ShardGame {
-                seed,
-                outcome_code,
-                samples,
-            });
+            games.push(read_game(&data, &mut at).map_err(|what| {
+                format!("{}: truncated reading {what}", path.display())
+            })?);
         }
 
         Ok(Shard {
@@ -1094,4 +1246,26 @@ pub fn replay_with(
     out.policy_target.extend_from_slice(&part.policy_target);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ladder::run_match_journaled` refuses any outcome byte above [`MAX_OUTCOME_CODE`], so a
+    /// new kind of ending that forgot to raise it would make every journaled match unreadable.
+    #[test]
+    fn every_outcome_code_round_trips_under_the_maximum() {
+        for outcome in [
+            Outcome::Win(Player::P0),
+            Outcome::Win(Player::P1),
+            Outcome::Draw(DrawReason::MutualLaneWin),
+            Outcome::Draw(DrawReason::Stalemate),
+            Outcome::Draw(DrawReason::PlyLimit),
+        ] {
+            let code = outcome_code(outcome);
+            assert!(code <= MAX_OUTCOME_CODE, "{outcome:?} is written as {code}");
+            assert_eq!(outcome_from_code(code), outcome);
+        }
+    }
 }

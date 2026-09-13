@@ -82,6 +82,7 @@ pub mod damage;
 pub mod display;
 pub mod elo;
 pub mod encode;
+pub mod journal;
 pub mod ladder;
 pub mod menu;
 pub mod nn;

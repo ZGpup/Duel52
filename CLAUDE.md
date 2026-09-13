@@ -282,6 +282,15 @@ netmcts:models/duel52-32c-24h-best.d52nn@64
 .venv/bin/python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first
 .venv/bin/python -m duel52.train run   --config configs/train-fast.toml --run-dir runs/first \
     --resume                                                      # continue after a stop
+# ⚠️ **`--resume` carries on inside the generation that was stopped, not from its start.** The
+# shared 128-core box pauses a job by killing it, and a generation there is ~32 minutes. So
+# self-play, every panel row and the gate append each game to a journal in `progress/` as it
+# finishes (`duel52 selfplay|match --journal`), the fit checkpoints every `run.save_every_secs`
+# (30), and SIGTERM/SIGHUP stop at the next safe point. A pause costs the games in flight
+# (~100 s of self-play at 128 cores) plus the buffer refill, never the generation. A resumed
+# generation is bit-for-bit the uninterrupted one — same shard bytes, same fitted weights, same
+# gate — and `loop.py`'s "Pausing" section is the design. `log.jsonl` is the commit: do not
+# delete `progress/` by hand while a generation is uncommitted.
 
 # Phase 4 — the scale-up. `check` also prints the gate's statistical power, the reference
 # panel's plan and veto power, the LR schedule and the held-out size, which is the five

@@ -131,6 +131,11 @@ def _check(args: argparse.Namespace) -> int:
         f"budget:         {config.run.generations} generations or {config.run.hours} hours, "
         f"whichever comes first"
     )
+    print(
+        f"pausing:        self-play, panel and gate games are saved as each one finishes, the fit "
+        f"every {config.run.save_every_secs:g} s;\n"
+        f"                --resume carries on inside the generation that was paused"
+    )
     schedule = config.train.lr_schedule
     print(
         "lr:             "

@@ -19,6 +19,7 @@ and present as a network that will not learn.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -280,7 +281,7 @@ def test_a_saturated_reference_row_is_trimmed_and_a_moving_one_is_not():
         TrainConfig(), gate=replace(gate, reference=["random", "greedy"], sims=256)
     )
     loop.reference_best = {"random": 1.0, "greedy": 0.89}
-    loop.play_match = lambda a, b, games: (  # noqa: ARG005
+    loop.play_match = lambda a, b, games, journal=None: (  # noqa: ARG005
         played.append((b, games)),
         MatchResult(score=1.0, ci95=0.0, wins=games, losses=0, draws=0),
     )[1]
@@ -838,3 +839,254 @@ def test_lane_augmentation_is_a_no_op_on_the_lane_equivariant_network():
         moved_loss, moved_grad = loss_for(moved_x, moved_t)
         assert moved_loss == pytest.approx(plain_loss, abs=1e-5), f"permutation {sigma}"
         assert torch.allclose(moved_grad, plain_grad, atol=1e-5), f"permutation {sigma}"
+
+
+# ==================================================================== pausing ==
+#
+# The loop runs on a shared box that pauses a job by killing it (``loop.py``, "Pausing"). The
+# engine's half — a resumed shard is byte-identical, a resumed match scores the same — is
+# tested in Rust where it is implemented. What is Python's is the fit checkpoint, the progress
+# file, the commit order, and the claim that ties them together: a generation paused anywhere
+# resumes to the generation an uninterrupted run produces.
+
+
+def test_a_progress_entry_is_only_reused_while_its_inputs_match(tmp_path):
+    """A result computed from different inputs is a different result. And recomputing a step
+    must drop what came after it, or a stale gate score outlives the candidate it scored."""
+    from duel52.train.loop import Progress
+
+    # An attempt paused before it finished anything is still an attempt.
+    path = tmp_path / "gen004.json"
+    assert not Progress(path).resumed
+    first = Progress(path)
+    assert first.resumed and first.resumes == 1 and first.done() == []
+    first.record("selfplay", {"games": 4}, {"samples": 90})
+    first.record("gate", {"candidate": "abc"}, {"wins": 3})
+
+    again = Progress(path)
+    assert again.resumed and again.resumes == 2
+    assert again.result("selfplay", {"games": 4}) == {"samples": 90}
+    assert again.result("selfplay", {"games": 6}) is None, "different inputs, different result"
+    assert again.result("gate", {"candidate": "abc"}) == {"wins": 3}
+    # Tuples and lists are the same input once they have been through JSON.
+    again.record("reference 0", {"flags": ("--variant", "split")}, 0.9)
+    assert Progress(path).result("reference 0", {"flags": ["--variant", "split"]}) == 0.9
+
+    again.record("selfplay", {"games": 6}, {"samples": 130})
+    third = Progress(path)
+    assert third.resumes == 3
+    assert third.result("selfplay", {"games": 6}) == {"samples": 130}
+    assert third.result("gate", {"candidate": "abc"}) is None, "a step after a recomputed one survived"
+    assert third.done() == ["selfplay"]
+
+
+def test_a_torn_last_log_line_is_an_uncommitted_generation_and_nothing_else_is(tmp_path):
+    from duel52.train.loop import _read_log
+
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"generation": 1}\n{"generation": 2}\n{"generation": 3, "selfp')
+    assert [r["generation"] for r in _read_log(log)] == [1, 2]
+    assert log.read_text() == '{"generation": 1}\n{"generation": 2}\n', "the torn line is cut"
+
+    log.write_text('{"generation": 1}\n{"gener\n{"generation": 3}\n')
+    with pytest.raises(json.JSONDecodeError):
+        _read_log(log)
+
+
+def test_a_setting_added_since_a_run_began_is_not_a_config_change():
+    """Otherwise every run in progress records a "config changed" on its first resume under a
+    newer build, and the record stops meaning what it says."""
+    from dataclasses import replace
+
+    from duel52.train.config import TrainConfig
+    from duel52.train.loop import _canonical, _without_new_defaults
+
+    current = TrainConfig().as_dict()
+    previous = _canonical(current)
+    del previous["run"]["save_every_secs"]
+    assert _canonical(_without_new_defaults(previous, current)) == previous
+
+    changed = TrainConfig()
+    changed = replace(changed, run=replace(changed.run, save_every_secs=5.0)).as_dict()
+    assert _canonical(_without_new_defaults(previous, changed)) != previous
+
+
+def test_a_non_positive_save_interval_is_rejected():
+    with pytest.raises(ValueError, match="save_every_secs"):
+        load_config(_toml("[run]\nsave_every_secs = 0\n"))
+
+
+@needs_engine
+def test_a_fit_resumed_from_its_checkpoint_ends_on_the_same_weights(shard, tmp_path, tmp_path_factory):
+    """The fit is the one step of a generation that is neither a set of games nor free to redo,
+    so it checkpoints. Resumed, it must land where an uninterrupted fit lands — same weights,
+    same AdamW moments, same batch RNG — or a pause changes the run."""
+    from dataclasses import replace
+
+    import torch
+
+    from duel52.nn.model import spec_for
+    from duel52.train.config import TrainConfig
+    from duel52.train.trainer import Trainer
+
+    spec = spec_for("split", 21)
+    config = TrainConfig()
+    config = replace(config, train=replace(config.train, device="cpu", batch_size=32))
+    start = _tiny_checkpoint(tmp_path_factory)
+    buffer = ReplayBuffer(max_generations=1, max_samples=10**6)
+    buffer.add(shard, 1)
+
+    plain = Trainer(config, spec, start)
+    plain_rng = np.random.default_rng(1)
+    plain_stats = plain.fit(buffer, plain_rng, steps=6, generation=3)
+
+    # Paused after the third step. `should_stop` is what a SIGTERM sets.
+    checkpoint = tmp_path / "gen003-fit.pt"
+    paused = Trainer(config, spec, start)
+    taken = []
+    original = buffer.sample_batch
+    buffer.sample_batch = lambda rng, n: (taken.append(1), original(rng, n))[1]
+    with pytest.raises(KeyboardInterrupt):
+        paused.fit(
+            buffer, np.random.default_rng(1), steps=6, generation=3,
+            checkpoint=checkpoint, save_every=1e9, should_stop=lambda: len(taken) >= 3,
+        )
+    buffer.sample_batch = original
+    assert len(taken) == 3 and checkpoint.exists()
+
+    # A fresh trainer, as after a restart, and an RNG in the wrong state to prove it is restored.
+    resumed = Trainer(config, spec, start)
+    resumed_rng = np.random.default_rng(12345)
+    stats = resumed.fit(buffer, resumed_rng, steps=6, generation=3, checkpoint=checkpoint)
+    assert stats.steps == 6
+    for a, b in zip(plain.model.parameters(), resumed.model.parameters()):
+        assert torch.equal(a, b), "a resumed fit ended on different weights"
+    assert resumed_rng.bit_generator.state == plain_rng.bit_generator.state
+    assert stats.policy_mean == plain_stats.policy_mean
+    assert stats.policy_first == plain_stats.policy_first
+    warm, cold = plain.optimizer.state_dict()["state"], resumed.optimizer.state_dict()["state"]
+    assert torch.equal(warm[0]["exp_avg_sq"], cold[0]["exp_avg_sq"])
+
+    # A finished checkpoint takes no steps and hands back the end state — which is how a
+    # generation paused after its fit gets its fitted weights back.
+    after = Trainer(config, spec, start)
+    again = after.fit(buffer, np.random.default_rng(0), steps=6, generation=3, checkpoint=checkpoint)
+    assert again.steps == 6 and again.value_mean == plain_stats.value_mean
+    assert all(torch.equal(a, b) for a, b in zip(plain.model.parameters(), after.model.parameters()))
+
+    # And a checkpoint for a different fit is not resumed.
+    other = Trainer(config, spec, start)
+    assert other.fit(buffer, np.random.default_rng(1), steps=7, generation=3, checkpoint=checkpoint).steps == 7
+
+
+def _pausing_config():
+    from dataclasses import replace
+
+    from duel52.train.config import TrainConfig
+
+    config = TrainConfig()
+    return replace(
+        config,
+        net=replace(config.net, width=32, blocks=1, value_hidden=16),
+        selfplay=replace(config.selfplay, games=4, sims=8, temperature_decisions=6),
+        train=replace(
+            config.train, device="cpu", batch_size=32, steps_per_generation=6, buffer_generations=2
+        ),
+        gate=replace(
+            config.gate, games=4, sims=8, reference=["random"], reference_games=2, min_decisive=1
+        ),
+        run=replace(
+            config.run, generations=2, seed=77, threads=2, engine=str(ENGINE), save_every_secs=1e-9
+        ),
+    )
+
+
+def _comparable(record: dict) -> dict:
+    """A log record minus what legitimately differs between two runs of the same generation."""
+    out = {k: v for k, v in record.items() if k not in ("seconds", "resumes", "checkpoint")}
+    out["selfplay"] = {k: v for k, v in record["selfplay"].items() if k != "seconds"}
+    return out
+
+
+@needs_engine
+def test_a_paused_generation_resumes_to_the_same_record(tmp_path, tmp_path_factory):
+    """**The whole feature, end to end.** One run goes straight through two generations. The
+    other is paused three times inside its second — mid-fit, at the gate, and after the decision
+    had been acted on but before the log line — and resumed from disk by a fresh process each
+    time. It must log the same generation, write the same candidate, and leave the same
+    incumbent.
+
+    The third pause is the one that is easy to get wrong: promotion has already copied the
+    candidate over ``best.d52nn``, so a resume that re-ran the gate would play the candidate
+    against itself.
+    """
+    from duel52.train.loop import TrainingLoop
+
+    config = _pausing_config()
+    start = _tiny_checkpoint(tmp_path_factory)
+
+    straight = TrainingLoop(config, tmp_path / "straight", init_from=start)
+    straight.step()
+    expected = straight.step()
+
+    run_dir = tmp_path / "paused"
+    loop = TrainingLoop(config, run_dir, init_from=start)
+    loop.step()
+
+    # 1. Mid-fit: the stop lands after the third optimiser step.
+    calls = []
+    original = loop.buffer.sample_batch
+
+    def sample_then_pause(rng, n):
+        calls.append(1)
+        if len(calls) == 3:
+            loop._stop_requested = True
+        return original(rng, n)
+
+    loop.buffer.sample_batch = sample_then_pause
+    with pytest.raises(KeyboardInterrupt):
+        loop.step()
+    assert (run_dir / "progress" / "gen002-fit.pt").exists()
+    assert len((run_dir / "log.jsonl").read_text().splitlines()) == 1
+
+    # 2. At the gate, after the panel has been recorded.
+    loop = TrainingLoop(config, run_dir, resume=True)
+    play = loop.play_match
+
+    def pause_at_the_gate(a, b, games, journal=None):
+        if journal is not None and journal.name.endswith("-gate.journal"):
+            raise KeyboardInterrupt
+        return play(a, b, games, journal=journal)
+
+    loop.play_match = pause_at_the_gate
+    with pytest.raises(KeyboardInterrupt):
+        loop.step()
+
+    # 3. After the decision was acted on — the incumbent may already be the candidate — and
+    #    before the generation's log line.
+    loop = TrainingLoop(config, run_dir, resume=True)
+
+    def pause_mid_commit(path):
+        raise KeyboardInterrupt
+
+    loop.trainer.save_optimizer = pause_mid_commit
+    with pytest.raises(KeyboardInterrupt):
+        loop.step()
+    assert "decision" in json.loads((run_dir / "progress" / "gen002.json").read_text())
+
+    loop = TrainingLoop(config, run_dir, resume=True)
+    record = loop.step()
+
+    assert record["resumes"] == 3
+    assert _comparable(record) == _comparable(expected)
+    for name in ("gen002.d52nn", "best.d52nn"):
+        assert (run_dir / "checkpoints" / name).read_bytes() == (
+            tmp_path / "straight" / "checkpoints" / name
+        ).read_bytes(), f"{name} differs from the uninterrupted run's"
+    assert len((run_dir / "log.jsonl").read_text().splitlines()) == 2
+    assert not list((run_dir / "progress").iterdir()), "a committed generation left progress behind"
+
+    # And the next resume starts from generation 2's RNG, not from the seed.
+    reloaded = TrainingLoop(config, run_dir, resume=True)
+    assert reloaded.rng.bit_generator.state == straight.rng.bit_generator.state
+    assert reloaded.refusals == straight.refusals

@@ -113,6 +113,119 @@ fn phase4_a_shard_does_not_depend_on_the_evaluation_batch() {
     }
 }
 
+/// Cut a file to `fraction` of its length — a kill, part way through the job and most likely
+/// part way through writing a record.
+fn cut(path: &Path, fraction: f64) {
+    let len = std::fs::metadata(path).expect("journal exists").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open journal")
+        .set_len((len as f64 * fraction) as u64)
+        .expect("truncate journal");
+}
+
+fn journaled(
+    checkpoint: &Path,
+    first_seed: u64,
+    games: usize,
+    threads: usize,
+    eval_batch: usize,
+    journal: &Path,
+    out: &Path,
+) -> selfplay::SelfPlayReport {
+    selfplay::run_journaled(
+        GameConfig::default(),
+        &tiny(),
+        checkpoint,
+        first_seed,
+        games,
+        threads,
+        eval_batch,
+        0,
+        out,
+        false,
+        Some(journal),
+    )
+    .expect("journaled self-play should write a shard")
+}
+
+/// **The claim that makes a pause on a shared box cost the games in flight and not the
+/// generation.** A self-play run killed part way through and run again with the same journal
+/// writes the same bytes an uninterrupted run does — so the training loop can resume a
+/// generation without the resumed shard being a different corpus.
+///
+/// The second attempt deliberately uses a different thread count and batch, since a resumed
+/// run on a box that came back smaller is the ordinary case.
+#[test]
+fn phase4_a_resumed_shard_is_byte_identical_to_an_uninterrupted_one() {
+    let plain = std::fs::read(write_shard_batched(8, 2, 3, "resume-plain")).expect("read shard");
+    let dir = std::env::temp_dir();
+    let journal = dir.join(format!("duel52-resume-{}.journal", std::process::id()));
+    let out = dir.join(format!("duel52-resume-{}.d52sp", std::process::id()));
+    let _ = std::fs::remove_file(&journal);
+
+    let first = journaled(&test_checkpoint(), 1, 8, 2, 3, &journal, &out);
+    assert_eq!(first.restored, 0);
+    assert_eq!(std::fs::read(&out).unwrap(), plain, "journaling changed the shard");
+
+    cut(&journal, 0.55);
+    std::fs::remove_file(&out).unwrap();
+    let resumed = journaled(&test_checkpoint(), 1, 8, 3, 1, &journal, &out);
+    assert!(
+        (1..8).contains(&resumed.restored),
+        "expected some but not all games back from a half journal, got {}",
+        resumed.restored
+    );
+    assert_eq!(resumed.games, 8);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        plain,
+        "a resumed shard differs from the uninterrupted one"
+    );
+
+    // The journal is whole again, so a third attempt plays nothing and writes the same file.
+    let again = journaled(&test_checkpoint(), 1, 8, 2, 3, &journal, &out);
+    assert_eq!(again.restored, 8);
+    assert_eq!(std::fs::read(&out).unwrap(), plain);
+}
+
+/// A journal must never resume the wrong job. The training loop plays every generation's
+/// self-play from the same `best.d52nn` path, so a journal keyed on the path would happily
+/// splice last generation's games into this one's shard — and nothing downstream could tell.
+#[test]
+fn phase4_a_journal_is_not_resumed_against_a_different_checkpoint_or_seed() {
+    let config = GameConfig::default();
+    let arch = duel52_engine::nn::Arch {
+        width: 24,
+        blocks: 2,
+        value_hidden: 12,
+        ..duel52_engine::nn::Arch::default_for(&config)
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let checkpoint = dir.join(format!("duel52-rewritten-{pid}.d52nn"));
+    let journal = dir.join(format!("duel52-wrongjob-{pid}.journal"));
+    let out = dir.join(format!("duel52-wrongjob-{pid}.d52sp"));
+    let _ = std::fs::remove_file(&journal);
+
+    duel52_engine::nn::Weights::random(1, arch).save(&checkpoint, &config).unwrap();
+    assert_eq!(journaled(&checkpoint, 1, 4, 2, 1, &journal, &out).restored, 0);
+    assert_eq!(journaled(&checkpoint, 1, 4, 2, 1, &journal, &out).restored, 4);
+
+    // Same path, different weights: a promotion.
+    duel52_engine::nn::Weights::random(2, arch).save(&checkpoint, &config).unwrap();
+    assert_eq!(
+        journaled(&checkpoint, 1, 4, 2, 1, &journal, &out).restored,
+        0,
+        "a journal written against other weights was resumed"
+    );
+    // The next generation's seed range.
+    assert_eq!(journaled(&checkpoint, 5, 4, 2, 1, &journal, &out).restored, 0);
+    // And a different game count is a different job too.
+    assert_eq!(journaled(&checkpoint, 5, 6, 2, 1, &journal, &out).restored, 0);
+}
+
 /// Batching must not change a game even when it is the *only* game in flight, which is the
 /// case the tail of a shard always ends in.
 #[test]

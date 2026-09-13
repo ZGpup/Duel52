@@ -1268,7 +1268,7 @@ impl LaneStructure {
 /// FNV-1a, 64-bit (Fowler–Noll–Vo, 1991). Chosen for the same reason [`crate::rng`] carries
 /// its own generator: the value has to be stable forever, and the standard library's hasher
 /// explicitly does not promise that across versions.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= b as u64;

@@ -400,6 +400,22 @@ class RunSettings:
     #: ``train check`` prints the effective number.
     eval_batch: int = 1
     engine: str = "./target/release/duel52"
+    #: **Seconds of fitting between checkpoints**, and so the most fitting a pause can cost.
+    #: The rest of a generation saves by the game and needs no setting (``loop.py``,
+    #: "Pausing"): self-play, the panel and the gate append every game to a journal the moment
+    #: it finishes.
+    #:
+    #: Why 30. A pause also loses the games in flight, and that is a floor nothing here can
+    #: lower: at 128 cores and ``eval_batch = 64`` about 8,000 self-play games are mid-search at
+    #: once, worth ~100 s of self-play. Checkpointing the fit much more often than that floor
+    #: buys nothing, and much less often makes the fit the worst place to be paused. A fit
+    #: checkpoint of a ``192 × 6`` lane net and its AdamW moments is ~14 MB and well under a
+    #: second to write, so 30 s is ~0.3% of the fit.
+    save_every_secs: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.save_every_secs <= 0:
+            raise ValueError(f"[run] save_every_secs must be positive; got {self.save_every_secs}")
 
 
 @dataclass(frozen=True)

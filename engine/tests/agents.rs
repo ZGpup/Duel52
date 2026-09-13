@@ -709,6 +709,72 @@ fn rule_2_the_ladder_is_eval_batch_independent() {
     }
 }
 
+/// A gate that was paused and resumed must promote on the same numbers an uninterrupted gate
+/// would. `run_match_journaled` restores a game's result and length and not its behaviour, so
+/// this compares everything the training loop reads and every line the report computes from
+/// the result — and the second attempt changes the thread count and the batch, which a box
+/// that came back smaller would.
+#[test]
+fn rule_2_a_resumed_match_scores_what_an_uninterrupted_one_does() {
+    let a = AgentSpec::NetMcts {
+        checkpoint: test_checkpoint(),
+        sims: 8,
+    };
+    let config = GameConfig::default();
+    let plain = ladder::run_match(config, a.clone(), AgentSpec::Greedy, 1, 12, 2, 1);
+    let journal = std::env::temp_dir().join(format!("duel52-match-{}.journal", std::process::id()));
+    let _ = std::fs::remove_file(&journal);
+
+    let same = |m: &probe::MatchStats| {
+        (
+            m.games,
+            m.wins,
+            m.draws,
+            m.draws_stalemate,
+            m.draws_mutual_lane_win,
+            m.draws_ply_limit,
+            m.score().to_bits(),
+            m.score_ci95().to_bits(),
+            m.first_player_score().to_bits(),
+            m.first_player_score_ci95().to_bits(),
+            m.mean_plies().to_bits(),
+        )
+    };
+
+    let first = ladder::run_match_journaled(config, a.clone(), AgentSpec::Greedy, 1, 12, 2, 1, &journal)
+        .expect("journaled match");
+    assert_eq!(first.restored, 0);
+    assert_eq!(same(&first), same(&plain), "journaling changed the match");
+    assert_eq!(bits(&first.behaviour[0].lane_concentration), bits(&plain.behaviour[0].lane_concentration));
+
+    // A kill part way through.
+    let len = std::fs::metadata(&journal).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&journal)
+        .unwrap()
+        .set_len(len - 30)
+        .unwrap();
+    let resumed = ladder::run_match_journaled(config, a.clone(), AgentSpec::Greedy, 1, 12, 3, 2, &journal)
+        .expect("resumed match");
+    assert!(
+        (1..12).contains(&resumed.restored),
+        "expected a partial restore, got {}",
+        resumed.restored
+    );
+    assert_eq!(same(&resumed), same(&plain), "a resumed match scored differently");
+    assert!(resumed.report().contains("restored from a journal"));
+    assert!(
+        resumed.report().contains(&format!("W{} L{} D{}", plain.wins[0], plain.wins[1], plain.draws)),
+        "the training loop parses this line"
+    );
+
+    // A different opponent is a different job, however similar the file name.
+    let other = ladder::run_match_journaled(config, a, AgentSpec::Random, 1, 12, 2, 1, &journal)
+        .expect("a different match");
+    assert_eq!(other.restored, 0);
+}
+
 /// And with only one network in the match, which is what a `random` or `greedy` panel row is:
 /// every suspended game belongs to the same batch and the opponent never suspends at all.
 #[test]
