@@ -554,7 +554,9 @@ impl SearchInProgress {
         for &index in &self.set {
             mask[index] = false;
         }
-        let value = 0.5 * (value + 1.0);
+        // Clamped because an R-NaD checkpoint's value head is linear and can leave ±1. A tanh
+        // value is already inside, and `clamp` returns it unchanged, bit for bit.
+        let value = (0.5 * (value + 1.0)).clamp(0.0, 1.0);
 
         for &action in &available {
             if self.tree[node].edge_for(action).is_some() {

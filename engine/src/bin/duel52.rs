@@ -92,6 +92,8 @@ AGENTS
   pimc[:worldsxdepth]  alpha-beta per sampled world                (default 8x1)
   ismcts[:iters]    information-set MCTS, random rollouts          (default 800)
   netpolicy:<path>  a .d52nn checkpoint played by argmax, no search
+  netsample:<path>[@raw]  its policy sampled, no search — how an R-NaD net plays;
+                  @raw skips the reference threshold-and-round post-processing
 netmcts:<path>[@sims]  net-guided ISMCTS: PUCT over the policy prior,
                   the value head in place of rollouts             (default 128)
 

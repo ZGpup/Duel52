@@ -279,6 +279,13 @@ pub struct Weights {
     pub arch: Arch,
     /// One entry per [`Arch::params`] tensor, same order.
     pub params: Vec<Vec<f32>>,
+    /// The value head's last layer is used as-is rather than squashed by `tanh`.
+    ///
+    /// `PLAN.md` item 8. R-NaD's value targets are the *regularised* game's value, which is
+    /// not bounded to ±1, and its reference value head is linear. The header carries it as
+    /// `value_head=linear`, **written only when true** — so every AlphaZero checkpoint, which
+    /// has no such line, reads back as `false` and evaluates bit-for-bit as before.
+    pub linear_value: bool,
 }
 
 impl Weights {
@@ -329,7 +336,11 @@ impl Weights {
                 v
             })
             .collect();
-        Weights { arch, params }
+        Weights {
+            arch,
+            params,
+            linear_value: false,
+        }
     }
 
     /// Read a checkpoint, checking it against `config`.
@@ -361,6 +372,14 @@ impl Weights {
 
     /// The header this build would stamp, as the checkpoint stores it.
     pub fn header_string(arch: &Arch, config: &GameConfig) -> String {
+        Weights::header_string_with(arch, false, config)
+    }
+
+    /// [`Self::header_string`] for a network whose value head may be linear.
+    ///
+    /// The `value_head` line is written only when it is `linear`, so a `tanh` checkpoint's
+    /// header is byte-identical to the one this build wrote before the key existed.
+    pub fn header_string_with(arch: &Arch, linear_value: bool, config: &GameConfig) -> String {
         let names: Vec<String> = arch.params().into_iter().map(|(n, _)| n).collect();
         let mut s = String::new();
         let _ = writeln!(s, "obs_dim={}", arch.obs_dim);
@@ -377,6 +396,9 @@ impl Weights {
             let _ = writeln!(s, "lanes={}", arch.lanes);
             let _ = writeln!(s, "lane_obs={}", arch.lane_obs);
             let _ = writeln!(s, "lane_action={}", arch.lane_action);
+        }
+        if linear_value {
+            let _ = writeln!(s, "value_head=linear");
         }
         let _ = writeln!(s, "obs_layout_hash={:016x}", obs_layout_hash(config));
         let _ = writeln!(s, "action_layout_hash={:016x}", action_layout_hash(config));
@@ -427,7 +449,7 @@ impl Weights {
     }
 
     pub fn to_bytes(&self, config: &GameConfig) -> Vec<u8> {
-        let header = Weights::header_string(&self.arch, config);
+        let header = Weights::header_string_with(&self.arch, self.linear_value, config);
         let mut out = Vec::with_capacity(16 + header.len() + 4 * self.arch.param_count());
         out.extend_from_slice(CHECKPOINT_MAGIC);
         out.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
@@ -515,6 +537,15 @@ impl Weights {
             Some((_, v)) => ArchKind::parse(v)
                 .ok_or_else(|| format!("header `arch={v}` is not one of `mlp`, `lane`"))?,
         };
+        // Optional like `arch`: absent is `tanh`, which is every AlphaZero checkpoint.
+        let linear_value = match fields.iter().find(|(k, _)| *k == "value_head") {
+            None => false,
+            Some((_, "tanh")) => false,
+            Some((_, "linear")) => true,
+            Some((_, v)) => {
+                return Err(format!("header `value_head={v}` is not one of `tanh`, `linear`"))
+            }
+        };
 
         let arch = Arch {
             obs_dim: num("obs_dim")?,
@@ -595,7 +626,11 @@ impl Weights {
             }
             params.push(tensor);
         }
-        Ok(Weights { arch, params })
+        Ok(Weights {
+            arch,
+            params,
+            linear_value,
+        })
     }
 }
 
@@ -721,6 +756,24 @@ mod tests {
         assert!(Weights::from_bytes(short, &config)
             .unwrap_err()
             .contains("payload"));
+    }
+
+    /// `PLAN.md` item 8: the key is written only for a linear head, and read back as written.
+    #[test]
+    fn a_linear_value_head_round_trips_and_a_tanh_one_writes_no_key() {
+        let config = GameConfig::default();
+        let arch =
+            Arch { width: 4, blocks: 1, value_hidden: 2, ..Arch::default_for(&config) };
+        let tanh = Weights::random(9, arch);
+        let tanh_bytes = tanh.to_bytes(&config);
+        let header = Weights::header_of(&tanh_bytes).unwrap();
+        assert!(!header.contains("value_head"), "a tanh checkpoint must not name its head");
+        assert!(!Weights::from_bytes(&tanh_bytes, &config).unwrap().linear_value);
+
+        let linear = Weights { linear_value: true, ..tanh };
+        let linear_bytes = linear.to_bytes(&config);
+        assert!(Weights::header_of(&linear_bytes).unwrap().contains("value_head=linear\n"));
+        assert_eq!(Weights::from_bytes(&linear_bytes, &config).unwrap(), linear);
     }
 
     #[test]

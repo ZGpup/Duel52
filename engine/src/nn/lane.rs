@@ -351,7 +351,12 @@ impl LaneBody {
         for (&wj, &vj) in w[i.value2_w].iter().zip(scratch.v.iter()) {
             acc += wj * vj;
         }
-        acc.tanh()
+        // An R-NaD checkpoint's head is linear (`Weights::linear_value`); every other is tanh.
+        if weights.linear_value {
+            acc
+        } else {
+            acc.tanh()
+        }
     }
 
     /// The trunk for `bs` observations at once.
@@ -526,8 +531,10 @@ impl LaneBody {
             out,
             bs,
         );
-        for x in out[..bs].iter_mut() {
-            *x = x.tanh();
+        if !weights.linear_value {
+            for x in out[..bs].iter_mut() {
+                *x = x.tanh();
+            }
         }
     }
 

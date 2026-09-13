@@ -212,7 +212,12 @@ impl MlpEvaluator {
         for (&wj, &vj) in w[i.value2_w].iter().zip(scratch.v.iter()) {
             acc += wj * vj;
         }
-        acc.tanh()
+        // An R-NaD checkpoint's head is linear (`Weights::linear_value`); every other is tanh.
+        if self.weights.linear_value {
+            acc
+        } else {
+            acc.tanh()
+        }
     }
 
     /// One row. `logits` is `action_dim` long; the value is returned.

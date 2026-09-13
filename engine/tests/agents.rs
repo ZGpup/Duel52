@@ -49,6 +49,15 @@ fn test_roster() -> Vec<AgentSpec> {
             checkpoint: test_checkpoint(),
             sims: 24,
         },
+        // `PLAN.md` item 8. Both forms: the post-processing must not read hidden state either.
+        AgentSpec::NetSample {
+            checkpoint: test_checkpoint(),
+            raw: false,
+        },
+        AgentSpec::NetSample {
+            checkpoint: test_checkpoint(),
+            raw: true,
+        },
     ]
 }
 

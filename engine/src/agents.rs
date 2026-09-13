@@ -34,6 +34,7 @@ pub mod greedy;
 pub mod ismcts;
 pub mod net_mcts;
 pub mod net_policy;
+pub mod net_sample;
 pub mod pimc;
 
 use crate::action::Action;
@@ -45,6 +46,7 @@ pub use greedy::GreedyAgent;
 pub use ismcts::IsmctsAgent;
 pub use net_mcts::{NetMctsAgent, RootNoise, SearchInProgress, SearchResult, SearchStep};
 pub use net_policy::NetPolicyAgent;
+pub use net_sample::NetSampleAgent;
 pub use pimc::PimcAgent;
 
 /// Something that picks an action.
@@ -188,6 +190,9 @@ pub enum AgentSpec {
     /// Phase 3's real rung: net-guided ISMCTS. PUCT over the policy prior, the value head in
     /// place of rollouts.
     NetMcts { checkpoint: String, sims: usize },
+    /// `PLAN.md` item 8: a checkpoint's policy sampled, no search — how an R-NaD net plays.
+    /// `raw` skips the reference post-processing; see [`net_sample`].
+    NetSample { checkpoint: String, raw: bool },
 }
 
 impl AgentSpec {
@@ -290,9 +295,26 @@ impl AgentSpec {
                 }
                 Ok(AgentSpec::NetMcts { checkpoint, sims })
             }
+            // `netsample:<path>` or `netsample:<path>@raw`. Only a literal `@raw` suffix is
+            // read as the flag, so a path containing `@` survives as it does for `netmcts`.
+            "netsample" => {
+                let budget = budget.filter(|b| !b.trim().is_empty()).ok_or_else(|| {
+                    "netsample needs a checkpoint path, e.g. \
+                     `netsample:checkpoints/rnad.d52nn`"
+                        .to_string()
+                })?;
+                let (checkpoint, raw) = match budget.strip_suffix("@raw") {
+                    Some(path) => (path.to_string(), true),
+                    None => (budget.to_string(), false),
+                };
+                if checkpoint.trim().is_empty() {
+                    return Err("netsample needs a checkpoint path before the `@raw`".to_string());
+                }
+                Ok(AgentSpec::NetSample { checkpoint, raw })
+            }
             other => Err(format!(
                 "unknown agent `{other}` — expected random, greedy, flatmc, pimc, ismcts, \
-                 netpolicy or netmcts"
+                 netpolicy, netmcts or netsample"
             )),
         }
     }
@@ -307,15 +329,18 @@ impl AgentSpec {
             AgentSpec::Ismcts { iterations } => format!("ismcts:{iterations}"),
             AgentSpec::NetPolicy { checkpoint } => format!("netpolicy:{checkpoint}"),
             AgentSpec::NetMcts { checkpoint, sims } => format!("netmcts:{checkpoint}@{sims}"),
+            AgentSpec::NetSample { checkpoint, raw } => {
+                format!("netsample:{checkpoint}{}", if *raw { "@raw" } else { "" })
+            }
         }
     }
 
     /// The checkpoint this agent plays, if it plays one.
     pub fn checkpoint(&self) -> Option<&str> {
         match self {
-            AgentSpec::NetPolicy { checkpoint } | AgentSpec::NetMcts { checkpoint, .. } => {
-                Some(checkpoint.as_str())
-            }
+            AgentSpec::NetPolicy { checkpoint }
+            | AgentSpec::NetMcts { checkpoint, .. }
+            | AgentSpec::NetSample { checkpoint, .. } => Some(checkpoint.as_str()),
             _ => None,
         }
     }
@@ -348,6 +373,10 @@ impl AgentSpec {
             // `selfplay.rs`, because a benchmark agent must play its best move.
             AgentSpec::NetMcts { checkpoint, sims } => {
                 Box::new(NetMctsAgent::derived(checkpoint, seed, stream, *sims))
+            }
+            // Seeded: it samples, one draw per decision.
+            AgentSpec::NetSample { checkpoint, raw } => {
+                Box::new(NetSampleAgent::derived(checkpoint, seed, stream, *raw))
             }
         }
     }
