@@ -103,7 +103,7 @@ cargo test                               # 417 tests: rules, determinism, inform
 # Play. Every prompt names the rule it is applying, so a disagreement is easy to point at.
 ./target/release/duel52 play --seed 1                      # you are P0 vs a random bot
 ./target/release/duel52 play --encoding-slots 21 \
-    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096  # vs the strongest agent
+    --opponent netmcts:models/duel52-32c-24h-best.d52nn@4096       # vs the strongest agent
 ./target/release/duel52 play --opponent ismcts:2000        # vs the strongest hand-written rung
 ./target/release/duel52 play --variant base --as p1        # rules-as-written, second player
 ./target/release/duel52 play --opponent human              # hotseat
@@ -492,7 +492,7 @@ current default; `train-3h-new` is Stage 1, the first config with `arch = "lane"
 randomisation, and the only one that starts **from scratch** on a laptop — it produced
 `runs/sixth`, which was never shipped because it lost to gen031 0.3175.
 
-`train-7h` is Stage 2 and produced **lane-gen032**, the current default. It warm-starts from
+`train-7h` is Stage 2 and produced **lane-gen032**, the default until the rented-core run. It warm-starts from
 `runs/sixth` and is `train-3h-new` re-sized around batched evaluation (`FINDINGS.md` F4.7):
 4,000 games a generation rather than 1,400, because at 1,400 the now-faster self-play would
 have left the gate as the majority of the clock. ⚠️ It is also the first config with
@@ -500,8 +500,17 @@ have left the gate as the majority of the clock. ⚠️ It is also the first con
 candidate which won its 294-game gate 0.605 and would otherwise have been vetoed on a noisy
 panel row (`FINDINGS.md` F4.8).
 
-`train-12h` and `train-big` are the two sizings of `PLAN.md` item 7, the rented-core run, and
-**`train-12h` is the one to reach for** — it is `train-big` at half the clock with three
+`train-24h-32c`, `train-24h-64c` and `train-24h-128c` are `PLAN.md` item 7 at three core
+counts, and **`train-24h-32c` is the one that has actually been run** — 24 hours on 32 rented
+cores, from a random init, producing `32c-24h-best` and `32c-24h-gen039`. Read
+`train-24h-128c.toml` first whichever you reach for: it carries the derivation — the measured
+cost table, the `K` argument, the Stage 1 recipe and the `TILE` warning — and the other two
+document only what moved. ⚠️ `train-24h-32c` is the sizing where **the gate genuinely fights
+the run**: a gate game costs ~10 self-play games at a `128 × 6` trunk, so the gate and panel
+shrink there in a way neither larger sizing needs.
+
+`train-12h` and `train-big` are the older two sizings of the same item, and
+**`train-12h` is the one to reach for** of those two — it is `train-big` at half the clock with three
 corrections that apply at either length, each documented against its number: a smaller
 generation (the gate is a fixed tax, so 15,000 games at 12 hours buys precision instead of
 generations), `epochs_per_generation` in place of a fixed step count (`train-big`'s 2,800 steps
@@ -510,18 +519,31 @@ are 3.0 epochs over a single random-init shard at generation 1), and a wider
 five false refusals). `RENTING.md` is how to get the box. `PLAN.md` §4.5 is the order to run
 them in.
 
-**The four shipped checkpoints are two lineages, not a menu.** `gen016 → gen022 → gen031` is
-the *flat*-trunk chain, each warm-started from the one before and measured against it at equal
-simulations: +81, then +82, for +189 end to end (`FINDINGS.md` F4.1, F4.5).
-**`lane-gen032` is a different root** — the lane-equivariant trunk shares no tensor name with
-the flat one, so `--init-from` refuses across them and its lineage began from a random init
-(`runs/sixth`, unshipped). It beats gen031 by **+167 Elo** at equal simulations, 0.7238 ± 0.044
-over 400 games (`FINDINGS.md` F4.8). The `032` continues the numbering for readability and
-**not** because it is one step past `031`.
+**The six shipped checkpoints are three roots, not a menu.** `--init-from` matches tensors by
+name *and* shape, so it refuses across all three and each began from a random init:
 
-**Play `lane-gen032`.** The other three are kept because every Phase 3 finding is measured on
-gen016 and every Phase 4 number against it, and gen031 is the agent `lane-gen032` had to beat.
-All four still load — no layout hash has moved since gen016.
+| root | trunk | what it is |
+|---|---|---|
+| `gen016 → gen022 → gen031` | flat `128 × 3` | each warm-started from the one before: +81, then +82, for +189 end to end (`FINDINGS.md` F4.1, F4.5) |
+| `lane-gen032` | lane `128 × 3` | shares no tensor *name* with the flat trunk. From `runs/sixth` (unshipped). Beats gen031 by **+167 Elo**, 0.7238 ± 0.044 over 400 games (F4.8) |
+| `32c-24h-best`, `32c-24h-gen039` | lane `128 × 6` | same names, wrong *shape*. 24 h on 32 rented cores from noise. Beats lane-gen032 by **+190 Elo**, 0.7488 ± 0.042 over 400 games |
+
+The numbering `016 → 022 → 031 → 032` is for readability and **not** because each is one step
+past the last. `32c-24h-*` is named for the box instead, because it is the first checkpoint
+here a laptop did not make.
+
+**Play `32c-24h-best`.** The others are kept because every Phase 3 finding is measured on
+gen016 and every Phase 4 number against it, gen031 is the agent `lane-gen032` had to beat, and
+`lane-gen032` is the agent `32c-24h-best` had to beat. All six still load — no layout hash has
+moved since gen016.
+
+⚠️ **`best` is not `gen039`** — different SHA-256, so the best-ever checkpoint predates the
+run's last generation, which is the ordinary case and why both ship. ⚠️ **The +190 does not
+decompose**: that run changed four times the cores *and* twice the trunk depth at once.
+⚠️ **Neither 32c checkpoint carries a rules stamp** (both predate it), so `match` and `ladder`
+warn that the ruleset it trained on cannot be verified; the layout hashes still pin the
+encoder. ⚠️ **`runs/eighth/log.jsonl` never came back from the rented box**, so generations
+played, games seen and true wall clock are not recoverable — copy it back next time.
 
 ## Architecture
 

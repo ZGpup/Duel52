@@ -23,7 +23,7 @@ when agent strength is the thing blocking a question, and right now it mostly is
 | 1. Engine and rules validation | Done |
 | 2. Hand written baselines | Done, and now retired as a benchmark |
 | 3. Neural self play loop | Done |
-| 4. Scale up | Four laptop runs done, the fourth a from scratch architecture change. The rented run is not started |
+| 4. Scale up | Done. Four laptop runs, the fourth a from scratch architecture change; then the rented run — 24 h on 32 cores, `128 × 6` from noise, **+190 Elo** and the current default |
 | 5. Extract the insight | Started early, partly banked, and now the critical path |
 | 6. Verification | Not started |
 | 7. R-NaD | Held in reserve, on a tripwire |
@@ -76,17 +76,23 @@ from a random init**, because it changed the architecture and the two share no t
 | `gen016` | flat | The loop itself, from a random init | The first strong Duel 52 player that exists |
 | `gen022` | flat | Teacher search raised from 64 to 256 simulations | +81 Elo on gen016 |
 | `gen031` | flat | Every training sample relabelled by a random lane permutation | +82 Elo on gen022 |
-| `lane-gen032` | lane | The lane symmetry built into the architecture, and 5x the games per hour from batched self play | **+167 Elo on gen031** |
+| `lane-gen032` | lane `128 x 3` | The lane symmetry built into the architecture, and 5x the games per hour from batched self play | **+167 Elo on gen031** |
+| `32c-24h-best` | lane `128 x 6` | Off the laptop: 24 hours on 32 rented cores, twice the trunk depth, from a random init | **+190 Elo on lane-gen032** |
 
-`lane-gen032` is the current default. The measurements are in `FINDINGS.md`; the provenance of
+`32c-24h-best` is the current default. The measurements are in `FINDINGS.md`; the provenance of
 each checkpoint is in `models/README.md`.
 
-**What four runs have established about the method:** the loop works, and the binding
+**What five runs have established about the method:** the loop works, and the binding
 constraint is games per hour rather than ideas. The first three gained +81, +82 and stopped on
 their own clocks. The fourth gained +167 in one sitting — not because the idea was better, but
 because batching self play's forward passes across concurrent games made 80,000 games in a
-night possible where the laptop had managed 18,200. Nothing yet says the method is near its
-ceiling; what it says is that the laptop was the ceiling.
+night possible where the laptop had managed 18,200. The fifth gained +190 by taking that same
+observation off the laptop entirely: four times the cores, and a trunk twice as deep to spend
+them on. Nothing yet says the method is near its ceiling; what it says is that the hardware has
+been the ceiling every time it was moved.
+
+⚠️ The fifth run moved **two** things at once, so its +190 is a joint effect and not evidence
+that depth was the right place to spend the cores. `FINDINGS.md` F4.9.
 
 ## What is next
 
@@ -464,8 +470,43 @@ measured table.
 
 ### 7. The from scratch run on rented cores
 
-**Status: configured and re-scoped after 6b. Not run, and still deliberately last.**
-`configs/train-big.toml` is a 24 hour from scratch run, and 6b changed what it is.
+**Status: DONE, 24 hours on 32 rented cores. It produced the current default, by the largest
+margin the project has measured.** `configs/train-24h-32c.toml` is the config that ran;
+`train-24h-64c.toml` and `train-24h-128c.toml` are the same run sized for bigger boxes and
+`train-big`/`train-12h` are the earlier drafts it superseded.
+
+| | |
+|---|---|
+| Config | `configs/train-24h-32c.toml`, `run.hours = 24.0`, `run.threads = 32`, seed `30000000` |
+| Network | lane-equivariant `128 × 6`, 604,005 parameters — **twice the depth** of every checkpoint before it |
+| Started from | a random init; `--init-from` refuses a trunk of a different shape, so `blocks = 6` *meant* from scratch |
+| Shipped | `models/duel52-32c-24h-best.d52nn` and `…-gen039.d52nn` (different files — `best` predates the last generation) |
+| Result | **0.7488 ± 0.0424 against `lane-gen032`** at equal 256 simulations, 400 games, W299 L100 D1 — **+190 Elo** |
+
+**Item 7's own question was whether rented cores produce something the laptop could not, and
+the answer is yes.** For context the whole first lineage was +189 across three runs, and the
+lane architecture's own step was +167; this is +190 in one sitting, from noise.
+
+⚠️ **Read it for what it is: the run changed two things at once.** Four times the cores *and*
+twice the trunk depth. The +190 does not decompose into a depth number and a compute number,
+and separating them costs a second 24-hour run at `128 × 3` that has not been done. The config
+itself says the fork was close — a `128 × 3` warm start from gen032 would have had 55% more
+games and a +167 head start — so "depth was the right call" is **not** what this measures.
+
+⚠️ **The run directory never came back from the box.** Generations played, generations
+promoted, positions seen and the true wall clock are in `runs/eighth/log.jsonl` on a machine
+that no longer exists, so `models/README.md` records the config's *plan* where it cannot record
+the run's record. `log.jsonl` is 20 KB. Copy it back next time — it is the whole provenance,
+and it is also the only place the value-curve question below could have been answered.
+
+**What is still open from this item.** The value head is the half that has plateaued in every
+run and the half playout cap randomisation is aimed at; 6b's value curve was the thing to look
+at hardest when this run finished, and without the log there is nothing to look at. Item 4's
+card-value table needs a value head worth trusting, so that question is now answered by
+re-running a generation locally or not at all.
+
+What follows is the reasoning as it stood before the run, kept because the sizing rules in it
+still apply to the 64- and 128-core configs.
 
 **What it now is.** A lane-equivariant `128 x N` trunk trained from a random init with playout
 cap randomisation, against a gen031 progress column. Not the flat deeper trunk this item

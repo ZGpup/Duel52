@@ -12,8 +12,8 @@ to find out is to build a player strong enough to ask.
 
 A Rust toolchain is all you need to play. The engine has zero dependencies, so the build
 resolves nothing and takes about ten seconds. The trained agent ships with the repo,
-[models/duel52-split-lane-gen032.d52nn](models/duel52-split-lane-gen032.d52nn), 1.7 MB, an
-ordinary git blob with no LFS to install.
+[models/duel52-32c-24h-best.d52nn](models/duel52-32c-24h-best.d52nn), 2.3 MB, an ordinary git
+blob with no LFS to install.
 
 ```bash
 # No Rust yet? This is the whole install. On Windows, run the rustup-init.exe from
@@ -27,7 +27,7 @@ cargo build --release
 # Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
 # size of the observation, and the checkpoint refuses to load against any other value.
 ./target/release/duel52 play --encoding-slots 21 \
-    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@8192
+    --opponent netmcts:models/duel52-32c-24h-best.d52nn@8192
 ```
 
 Every prompt names the rule it is applying, so if you think the engine is wrong you can point
@@ -88,10 +88,12 @@ There is a trained agent in the repo and you can play it.
 The AlphaZero style training loop runs end to end. There is exactly one encoder and it lives
 in Rust; a network is defined and trained in PyTorch, evaluated in Rust.
 
-Five runs have gone through it, all on the same laptop. The first three are one lineage, each
-warm started from the one before and each changing exactly one thing. The fourth started a
-**second lineage from scratch**, because it changed the network architecture and the two share
-no tensor names — there was nothing to warm start from.
+Six runs have gone through it. The first five were on the same laptop: three of them are one
+lineage, each warm started from the one before and each changing exactly one thing, and the
+fourth started a **second lineage from scratch**, because it changed the network architecture
+and the two share no tensor names — there was nothing to warm start from. The sixth is the
+first that a laptop did not run: 24 hours on 32 rented cores, from scratch again, and it
+produced the agent that is now the default.
 
 | Agent | Trunk | The one change |
 |---|---|---|
@@ -99,13 +101,23 @@ no tensor names — there was nothing to warm start from.
 | [gen022](models/duel52-split-gen022.d52nn) | flat | Teacher search raised from 64 simulations to 256 |
 | [gen031](models/duel52-split-gen031.d52nn) | flat | Every training sample relabelled by a random permutation of the three lanes |
 | — | lane | A new root. The lane symmetry built into the *architecture* rather than asked for by augmentation: the trunk runs once per lane with shared weights, so a lane preference is unrepresentable rather than merely small |
-| **[lane-gen032](models/duel52-split-lane-gen032.d52nn)** — the default | lane | 80,000 self-play games in 6.96 hours, which is ~5x what the laptop could produce before self-play's network evaluations were batched across games |
+| [lane-gen032](models/duel52-split-lane-gen032.d52nn) | lane `128 x 3` | 80,000 self-play games in 6.96 hours, which is ~5x what the laptop could produce before self-play's network evaluations were batched across games |
+| — | lane `128 x 6` | A third root. Twice the trunk depth, which `--init-from` refuses to warm start into because the shapes disagree — so from a random init again |
+| **[32c-24h-best](models/duel52-32c-24h-best.d52nn)** — the default | lane `128 x 6` | Off the laptop: 24 hours on 32 rented cores, 24,000 self-play games a generation to the laptop's 4,000 |
 
-The jump at the end is not a better idea than the ones before it; it is the same loop given
+The jump in the middle is not a better idea than the ones before it; it is the same loop given
 five times the data per hour. Batching the forward pass across concurrent games made self-play
 3.26x faster with **bit-identical** results — the batch is taken across games and never inside
 a search, so no game's search is altered and a shard is byte-for-byte what an unbatched run
 would have written. The detail is in [FINDINGS.md](FINDINGS.md) F4.7 and F4.8.
+
+The jump at the end is compute, and it is the point of having rented it: **+190 Elo over
+`lane-gen032`**, from noise, in one sitting. Depth is what the extra cores were spent on —
+in the search path the input layer walks only the observation's ~205 non-zeros and the policy
+head is masked to the legal logits, so the trunk is the whole cost, and a trunk's cost is
+linear in its blocks but quadratic in its width. ⚠️ That run changed **two** things at once,
+four times the cores and twice the depth, so the +190 does not split into a depth number and a
+compute number. Separating them costs another 24 hours and has not been done.
 
 Rated against each other at equal simulations, 400 games per pairing, with the first trained
 agent pinned at zero:
@@ -124,6 +136,18 @@ interval. Elo is not transitive across a game that is not, so where they differ,
 measurement is the one to trust about *those two agents* and the fit is the one to trust about
 the scale as a whole.
 
+⚠️ **`32c-24h-best` is not in that fit.** It is measured only head-to-head so far, against the
+agent it had to beat:
+
+| pairing, 400 games at 256 simulations each | score | record | Elo |
+|---|---:|---|---:|
+| `32c-24h-best` vs `lane-gen032` | **0.7488 ± 0.0424** | W299 L100 D1 | **+190** |
+
+Do not add +190 to `lane-gen032`'s +360 and read off +550. A Bradley–Terry fit is over the
+whole table at once, so putting this agent on the scale re-conditions every rating on it — that
+is what moved `gen022` and `gen031` by +5 and +4 when `lane-gen032` was added. The refit is a
+`ladder` run that has not been done.
+
 **gen016 is the floor of the elo system** Five hand-written agents
 (random, greedy, flat Monte Carlo, PIMC, information set MCTS) were the benchmark for two
 phases. Already at gen031 the strongest of them lost 200 games to 0, and a rung that loses
@@ -141,7 +165,7 @@ disagree, which is the only place a strategy insight can come from.
 # Play, and append the finished game to a file.
 ./target/release/duel52 play --encoding-slots 21 --seed 123 \
     --record games/mine.jsonl \
-    --opponent netmcts:models/duel52-split-lane-gen032.d52nn@4096
+    --opponent netmcts:models/duel52-32c-24h-best.d52nn@8192
 
 ./target/release/duel52 replay --record games/mine.jsonl            # what is in the file
 ./target/release/duel52 replay --record games/mine.jsonl --game 1   # walk it
@@ -179,13 +203,18 @@ per turn.
 
 [PLAN.md](PLAN.md) has the detail. In short, the next work is not a bigger training run:
 
-1. **Play and record a human series against `lane-gen032`.** The only external measurement there is.
+1. **Play and record a human series against `32c-24h-best`.** The only external measurement
+   there is.
 2. **Build a card value table.** Whether the thirteen powers are worth comparable amounts is
    the balance question, and nothing answers it yet.
 3. **First-player advantage across all three variants**, which costs a training run per
    variant because the observation layout is per-variant.
 4. **Exploitability**, so that "optimal" is a word the project is allowed to use.
-5. **The long from-scratch run on rented cores**, last, because it answers none of the above.
+
+The long from-scratch run on rented cores was fifth on this list, last because it answered
+none of the others. It has since been run — 24 hours on 32 cores — and it produced the current
+default by +190 Elo. That does not promote it back up the list: a stronger instrument still
+answers none of the four questions above, which is what the list is ordered by.
 
 ## Docs
 

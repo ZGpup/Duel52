@@ -3,6 +3,19 @@
 The operational half of `PLAN.md` item 7. `configs/train-12h.toml` says what to run; this says
 how to get a machine to run it on, for someone who has never rented one.
 
+> **Item 7 has been run since this was written: 24 hours on 32 cores, `configs/train-24h-32c.toml`,
+> which produced `models/duel52-32c-24h-best.d52nn` at +190 Elo over the previous default
+> (`FINDINGS.md` F4.9). Everything below still applies — it is about renting a box, not about
+> which config to put on it — but reach for `train-24h-32c.toml` rather than `train-12h.toml`,
+> and double the 13-hour timer to 25.**
+>
+> ⚠️ **That run skipped step 10, and it cost the entire provenance.** The checkpoints came
+> home; `runs/<name>/log.jsonl` did not, and the server is deleted. So generations played,
+> generations promoted, positions seen, the gate's scores, the panel's slope and the held-out
+> value curve are all simply gone — `models/README.md` records the config's *plan* where it
+> should record the run's *record*. Step 10 is 20 KB and two commands. **Do not treat it as
+> optional, and run its `wc -l` check before step 11.**
+
 Read the two boxes below first. Everything else is typing.
 
 > **You pay from the moment the server exists to the moment you DELETE it** — not while it is

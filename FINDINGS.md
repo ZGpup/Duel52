@@ -59,6 +59,13 @@ across two fits.
 interval, so they agree — but they are different estimators. The direct number is the better
 statement about *those two agents*; the fit is the better statement about the scale.
 
+⚠️ **`32c-24h-best` is not on this scale yet.** It is measured head-to-head only, at +190 over
+`lane-gen032` (F4.9). Do not add that to gen032's +360: a Bradley–Terry fit is over the whole
+table at once, so putting it on the scale re-conditions every rating here — which is the same
+warning as the +4/+5 above, and it will be larger, because this agent sits further from the
+anchor than any existing row. Putting it on costs a `ladder` run with five agents, ten
+pairings, and it has not been done.
+
 ```bash
 ./target/release/duel52 ladder --games 400 --seed 1 --variant split \
   --encoding-slots 21 --stalemate-value 0.0 \
@@ -306,6 +313,48 @@ about that distinction since the first flip-timing curve and should stay careful
 
 These are findings about the instrument rather than the game, kept because they decide what to
 do next.
+
+### F4.9: rented cores bought +190 Elo, and the run confounded depth with compute
+
+`configs/train-24h-32c.toml`, split, `encoding_slots = 21`, `run.seed = 30000000`, **24 hours
+on 32 rented cores**, from a random init. The network is lane-equivariant `128 × 6` — 604,005
+parameters, twice the depth of every checkpoint before it. It shipped as
+`models/duel52-32c-24h-best.d52nn` and `…-gen039.d52nn`.
+
+**The result, 400 games at equal simulations, seeds from 1:**
+
+| | score | record | Elo |
+|---|---:|---|---:|
+| `32c-24h-best@256` vs `lane-gen032@256` | **0.7488 ± 0.0424** | W299 L100 D1 | **+190** |
+
+```bash
+./target/release/duel52 match --games 400 --seed 1 --encoding-slots 21 \
+    --a netmcts:models/duel52-32c-24h-best.d52nn@256 \
+    --b netmcts:models/duel52-split-lane-gen032.d52nn@256
+```
+
+**This is the largest single jump the project has measured** — the whole flat lineage was +189
+across three runs (F4.1, F4.5) and the lane architecture's own step was +167 (F4.8). It settles
+`PLAN.md` item 7's question, which was only ever whether rented cores produce something a
+laptop could not.
+
+⚠️ **It does not settle what the depth was worth, and the run cannot be asked.** Four times the
+cores and twice the trunk depth moved together, so +190 is the *joint* effect and does not
+decompose. The config is explicit that the fork was close: a `128 × 3` warm start from gen032
+would have had 55% more games and a +167 head start, and it might have won. Reading this as
+"depth is what mattered" is exactly the inference the measurement does not support — the same
+shape of error as F4.4's, where better weights were credited with something search did.
+
+⚠️ **The run's own log never came back from the box**, so the internal diagnostics this run was
+built to produce — the held-out value MSE from generation 10, the gate's promotion rate, the
+panel's slope — were not read and cannot be. `PLAN.md` item 7 wanted the value curve looked at
+hardest of all; that did not happen. The lesson is procedural and cheap: `runs/<name>/log.jsonl`
+is 20 KB and is the entire provenance of a rented run. Copy it back with the checkpoints.
+
+**What the checkpoints still prove on their own**, since they are all that survived: the trunk
+shape and both layout hashes from the header, that generation 39 was reached, and — because
+`best` and `gen039` have different SHA-256s — that the best-ever checkpoint predates the last
+generation, which is the ordinary case at a 0.52 gate threshold.
 
 ### F4.8: the lane network passes gen031 by +167 Elo, in one seven-hour sitting
 

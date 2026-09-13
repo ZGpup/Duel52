@@ -7,8 +7,10 @@ than by quietly playing badly.
 
 Checkpoints here are tracked in git as ordinary blobs — no LFS, nothing to install. The three
 flat-trunk checkpoints are ~3.6 MB each, which is what a 949k-parameter fp32 net costs; the
-lane-equivariant one is 1.7 MB, because sharing one trunk across the three lanes *halves* the
-parameter count while making the network stronger.
+lane-equivariant `128 × 3` is 1.7 MB, because sharing one trunk across the three lanes
+*halves* the parameter count while making the network stronger. The two `128 × 6` checkpoints
+from the rented-core run are 2.3 MB: twice the depth, and still smaller than a flat net,
+because depth is linear in the blocks where width is quadratic.
 
 > **Note on the citations below.** `PLAN.md` and `FINDINGS.md` were rewritten on 2026-09-05.
 > `PLAN.md` no longer has numbered sections, so a `§4.x` reference here points at
@@ -18,29 +20,134 @@ parameter count while making the network stronger.
 
 | File | Variant | Slots | Params | Provenance |
 | --- | --- | --- | --- | --- |
-| **[duel52-split-lane-gen032.d52nn](duel52-split-lane-gen032.d52nn)** — the default | `split` | 21 | 455,013 | Phase 4 `train-7h`, warm-started from `runs/sixth`, lane-equivariant trunk |
+| **[duel52-32c-24h-best.d52nn](duel52-32c-24h-best.d52nn)** — the default | `split` | 21 | 604,005 | `train-24h-32c`, 24 h on 32 rented cores, lane-equivariant `128 × 6` **from a random init** |
+| [duel52-32c-24h-gen039.d52nn](duel52-32c-24h-gen039.d52nn) — the same run's last generation | `split` | 21 | 604,005 | As above; generation 39, kept because it is **not** the same file as `best` |
+| [duel52-split-lane-gen032.d52nn](duel52-split-lane-gen032.d52nn) — superseded | `split` | 21 | 455,013 | Phase 4 `train-7h`, warm-started from `runs/sixth`, lane-equivariant trunk |
 | [duel52-split-gen031.d52nn](duel52-split-gen031.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-3h`, warm-started from gen022, lane augmentation |
 | [duel52-split-gen022.d52nn](duel52-split-gen022.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-2h`, warm-started from gen016 |
 | [duel52-split-gen016.d52nn](duel52-split-gen016.d52nn) — superseded | `split` | 21 | 949,267 | Phase 3 `train-fast`, generation 16 |
 
-**Play `lane-gen032`.** The other three are kept as **reference points, not as second
-options**: every Phase 3 finding is measured on `gen016` and every Phase 4 number against it,
-and `gen031` is the agent `lane-gen032` had to beat. All four load into the same build — the
-layout hashes have not moved since `gen016`.
+**Play `32c-24h-best`.** The others are kept as **reference points, not as second options**:
+every Phase 3 finding is measured on `gen016` and every Phase 4 number against it, `gen031` is
+the agent `lane-gen032` had to beat, and `lane-gen032` is the agent `32c-24h-best` had to beat.
+All six load into the same build — the layout hashes have not moved since `gen016`.
 
-⚠️ **These are two lineages, not one chain.** `gen016 → gen022 → gen031` share a *flat* trunk,
-each warm-started from the one before. `lane-gen032` comes from a different root: the
-lane-equivariant architecture shares no tensor name with the flat one, so `--init-from` refuses
-across them and its lineage had to start from a random init (`runs/sixth`, unshipped, which
-lost to gen031 0.3175). The `032` continues the numbering for readability and **not** because
-it is one training step past `031`.
+⚠️ **These are three roots, not one chain.** `--init-from` matches tensors by name and shape,
+so it refuses across any two of them and each had to start from a random init:
+
+| root | trunk | why it could not warm-start from the one before |
+| --- | --- | --- |
+| `gen016 → gen022 → gen031` | flat `128 × 3` | — the first |
+| `lane-gen032` | lane `128 × 3` | the lane-equivariant architecture shares no tensor *name* with the flat one (`runs/sixth`, unshipped, which lost to gen031 0.3175) |
+| `32c-24h-best`, `32c-24h-gen039` | lane `128 × 6` | same names, wrong *shape* — six blocks against three. Taking `blocks = 6` is therefore a decision to spend the run's first generations re-learning what gen032 already knew |
+
+The numbering runs `016 → 022 → 031 → 032` for readability and **not** because each is one
+training step past the last. `32c-24h-*` breaks the pattern deliberately: it is named for the
+box that produced it, because it is the first checkpoint here that a laptop did not make.
+
+---
+
+## duel52-32c-24h-best.d52nn
+
+**The strongest Duel 52 agent that exists**, and the first one a laptop did not make. It is
+`PLAN.md` item 7 — the from-scratch run on rented cores — finally run: **24 hours on 32 cores**,
+the lane-equivariant architecture at **twice the depth** of every checkpoint before it, starting
+from a random init.
+
+**What the extra depth is for.** `lane-gen032` is `128 × 3`. This is `128 × 6`, and the choice
+of depth over width is the whole design. In the search path the input layer walks only the
+observation's ~205 non-zeros and the policy head is masked to ~21 legal logits, so **the trunk
+is the entire cost** — and a trunk's cost scales as `(B/3)·(W/128)²`. Width is the quadratic
+term. Six blocks at width 128 cost ~1.5× a `128 × 3` game; `192 × 6` would have cost 3.1× and
+bought roughly 21 generations instead of 46, which is too few policy-improvement iterations for
+a loop starting from noise however much capacity it has.
+
+**Why from scratch, when a warm start was genuinely competitive.** `--init-from` refuses a
+checkpoint whose trunk disagrees with `[net]`, so taking `blocks = 6` *means* a random init —
+and the config says plainly that at 32 cores the alternative was close: `128 × 3` warm-started
+from gen032 would have got 55% more games *and* a +167 Elo head start. The case for from
+scratch is that it is the only one of the two that produces something a laptop could not have,
+which is what item 7 exists for. The result below is that case being made good.
+
+### How it was made
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-24h-32c.toml \
+    --run-dir runs/eighth
+```
+
+| | |
+| --- | --- |
+| Config | `configs/train-24h-32c.toml` |
+| Started from | a **random init** — there was nothing with a matching trunk to start from |
+| Seed | `30000000` |
+| Variant | `split`, `two_power = bottom`, `encoding_slots = 21`, `stalemate_value = 0.0` |
+| Self-play | 24,000 games per generation at 256 simulations, playout-cap randomised to 32 for 3 decisions in 4 |
+| Gate | 512 games at 256 simulations, promote at 0.52 |
+| Fit | batch 1024, 0.5 epochs of a 4-generation buffer, LR steps at generations 21 and 39 |
+| Wall clock | **24 h on 32 cores**, `threads = 32`, `eval_batch = 64` |
+| Network | lane-equivariant, width 128, **6 blocks**, value head 128 → 604,005 parameters |
+| `obs_dim` / `action_dim` | 4290 / 2194 |
+| `obs_layout_hash` | `b1355a841a1fdc4a` |
+| `action_layout_hash` | `5169f9461d627b39` |
+| SHA-256 (`best`) | `59f1fa48b5358415adfa5a0bf348d1c3204772641c5b049211938b583e28fecf` |
+| SHA-256 (`gen039`) | `995e518098d9f26d98630400611923986cac67683041e233fa83e9e63720fdbd` |
+
+⚠️ **The run directory did not come back from the rented box, so the rows above that describe
+the *plan* are the config's and not the run's record.** What the two checkpoints themselves
+prove is the network shape, the layout hashes and that generation 39 was reached; the config
+predicted ~46 generations of 24,000 games. Generations played, generations promoted, the
+positions actually seen and the true wall clock are **not recoverable from this repo** — they
+are in `runs/eighth/log.jsonl` on a machine that no longer exists. A future rented run should
+copy `log.jsonl` back with the checkpoints; it is 20 KB and it is the whole provenance.
+
+⚠️ **`best` and `gen039` are different files** — the SHA-256s differ — so the best-ever
+checkpoint is from a generation before the last. That is the ordinary case and is why the two
+ship together: the gate promotes on a 0.52 threshold, so a run's final generation is not
+reliably its strongest. **`best` is the one to play.**
+
+⚠️ **Neither carries a rules stamp**, because both predate it. `match` and `ladder` say so on
+every run: *"carries no rules stamp, so which variant it was trained on cannot be verified."*
+The layout hashes still pin the *encoder*; what is unverifiable is the *ruleset*. Every
+checkpoint written from now on is stamped.
+
+### What it is worth
+
+400 games at equal simulations, seeds from 1, colour-paired:
+
+| opponent | score | record | Elo |
+| --- | ---: | --- | ---: |
+| `lane-gen032@256` | **0.7488 ± 0.0424** | W299 L100 D1 | **+190** |
+
+```bash
+./target/release/duel52 match --games 400 --seed 1 --encoding-slots 21 \
+    --a netmcts:models/duel52-32c-24h-best.d52nn@256 \
+    --b netmcts:models/duel52-split-lane-gen032.d52nn@256
+```
+
+**+190 Elo over the previous champion, from noise, in one sitting on a rented box** — against
++189 for the whole of the first lineage across three runs, and +167 for the lane architecture's
+own step. It is the largest single jump the project has measured.
+
+Read it for what it is, though: **this run changed two things at once.** It is four times the
+cores *and* twice the trunk depth, so the +190 does not decompose into "depth was worth X" and
+"compute was worth Y". Separating them costs a second 24-hour run at `128 × 3` and has not been
+done. What it does settle is item 7's actual question — whether rented cores produce something
+the laptop could not — and the answer is yes.
+
+⚠️ **This row and `lane-gen032`'s do not chain.** +190 over gen032, with gen032 at +167 over
+gen031, would predict +357 against gen031; that number has not been measured and should not be
+quoted. Elo is not transitive across a game that is not. A refit of the ladder with this agent
+in it would also move every existing rating, the way adding `lane-gen032` moved gen022 and
+gen031 by +4 and +5 — see `FINDINGS.md` "The scale".
 
 ---
 
 ## duel52-split-lane-gen032.d52nn
 
-**The strongest Duel 52 agent that exists**, and the first from the second lineage. Two things
-made it, and only one of them is an idea about the game.
+**Superseded by `32c-24h-best`, which beats it 0.7488 at equal simulations.** The first of the
+second lineage, and the strongest agent here until the rented-core run. Two things made it, and
+only one of them is an idea about the game.
 
 **The idea: the lane symmetry is built into the architecture rather than asked for.** Duel 52
 is invariant under all six permutations of its lanes — `game_rules.md` contains no rule that
