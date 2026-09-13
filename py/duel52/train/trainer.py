@@ -113,6 +113,14 @@ class Trainer:
         if checkpoint is not None:
             ckpt = read_checkpoint(checkpoint)
             ckpt.check_against(spec)
+            # `PLAN.md` item 8. AlphaZero fits a tanh value head against ±1 outcomes; an R-NaD
+            # checkpoint's head is linear, and loading it here would silently change the
+            # function its weights compute.
+            if ckpt.value_head != "tanh":
+                raise ValueError(
+                    f"{checkpoint} has a {ckpt.value_head} value head (learner="
+                    f"{ckpt.learner}); the AlphaZero trainer only continues tanh-headed nets"
+                )
             # The checkpoint's own `arch`, not the config's: after generation 1 the shape
             # comes from the file, which is the only thing that can be right about it.
             net_config = NetConfig(

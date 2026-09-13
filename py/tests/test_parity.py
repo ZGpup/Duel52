@@ -90,7 +90,7 @@ def _read_dump(path: Path) -> dict:
     }
 
 
-@pytest.fixture(scope="module", params=["mlp", "lane"])
+@pytest.fixture(scope="module", params=["mlp", "lane", "lane-linear"])
 def parity(request, tmp_path_factory) -> dict:
     """A checkpoint, and the Rust dump produced from it.
 
@@ -99,6 +99,9 @@ def parity(request, tmp_path_factory) -> dict:
     to get wrong: a shared per-lane matrix, a mean across lanes, and a scatter from per-lane
     outputs into the flat policy vector. Everything this file says about transcription bugs
     applies to it with more force, not less.
+
+    ``lane-linear`` is the same trunk with R-NaD's linear value head (``PLAN.md`` item 8):
+    the one place the two forward passes branch on ``value_head``.
     """
     if not BINARY.exists():
         pytest.skip(f"{BINARY} is not built — run `cargo build --release`")
@@ -140,7 +143,10 @@ def _init_checkpoint(path: Path, arch: str) -> None:
     from duel52.nn.checkpoint import write_checkpoint
 
     spec = encoding_spec()
-    config = NetConfig.from_spec(spec, width=64, blocks=3, value_hidden=32, arch=arch)
+    arch, _, head = arch.partition("-")
+    config = NetConfig.from_spec(
+        spec, width=64, blocks=3, value_hidden=32, arch=arch, value_head=head or "tanh"
+    )
     generator = torch.Generator().manual_seed(20260903)
     torch.manual_seed(20260903)
     model = build_net(config, lane_spec_for() if arch == "lane" else None)
@@ -157,6 +163,7 @@ def _torch_model(checkpoint: Path):
         blocks=ckpt.blocks,
         value_hidden=ckpt.value_hidden,
         arch=ckpt.arch,
+        value_head=ckpt.value_head,
     )
     model = build_net(config, lane_spec_for() if ckpt.arch == "lane" else None)
     model.load_tensors(ckpt.tensors)

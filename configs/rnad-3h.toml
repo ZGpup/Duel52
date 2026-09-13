@@ -1,0 +1,59 @@
+# PLAN.md item 8, Stage 3 — the first three-hour R-NaD run, on a GPU.
+#
+#   .venv/bin/python -m duel52.rnad check --config configs/rnad-3h.toml
+#   .venv/bin/python -m duel52.rnad bench --config configs/rnad-3h.toml --steps 5
+#   .venv/bin/python -m duel52.rnad run   --config configs/rnad-3h.toml --run-dir runs/rnad-3h
+#
+# Lane 128 x 3 from a random init — the trunk `lane-gen032` and `runs/sixth` use — on the
+# canonical split-deck rules, learning with the reference's R-NaD settings.
+#
+# ⚠️ **Run `bench` on the box first and set `entropy_schedule_size` from what it prints.**
+# The schedule is counted in learner steps, and a step's wall-clock cost is the thing that
+# differs most between machines. The value below is sized from the 8-core laptop's measured
+# 3.2 s per 256-game step on MPS (~3,400 steps in three hours), for ~10 regularisation
+# updates; a GPU that runs several times faster needs a proportionally larger size, or the
+# run spends its clock re-anchoring to a policy that has barely moved. `bench` prints the
+# number to use.
+
+[game]
+variant = "split"
+encoding_slots = 21
+stalemate_value = 0.0
+
+[net]
+arch = "lane"
+width = 128
+blocks = 3
+value_hidden = 128
+
+[rnad]
+# "auto" picks CUDA on a GPU box, MPS on the laptop. The whole handoff is this string.
+device = "auto"
+# The reference's batch_size. ~36,000 positions a step; fits on the 16 GB laptop and on any
+# GPU with 16 GB or more. Set learner_chunk (positions per forward pass) if it does not.
+batch_games = 256
+learner_chunk = 0
+# [ASSUMED] ~10 updates in 3 h at the laptop's step rate. Re-derive with `bench` — see above.
+entropy_schedule_size = [340]
+entropy_schedule_repeats = [1]
+# The reference's values, unchanged.
+eta_reward_transform = 0.2
+target_network_avg = 0.001
+learning_rate = 5e-5
+adam_b1 = 0.0
+adam_b2 = 0.999
+adam_eps = 1e-7
+nerd_beta = 2.0
+nerd_clip = 10000.0
+c_vtrace = 1.0
+
+[run]
+hours = 3.0
+seed = 7000000
+# Engine threads for encoding and applying a batch; 0 is every core.
+threads = 0
+log_every = 10
+eval_every = 250
+eval_games = 200
+eval_opponents = ["random", "greedy"]
+save_every_secs = 300.0

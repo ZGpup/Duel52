@@ -80,6 +80,10 @@ OPTIONAL_HEADER_KEYS = (
     "lane_action",
     "rules_name",
     "rules_hash",
+    # ``PLAN.md`` item 8. Written only for an R-NaD checkpoint, so an AlphaZero checkpoint's
+    # header is byte-identical to what it was before either existed.
+    "value_head",
+    "learner",
 )
 
 
@@ -111,6 +115,10 @@ class Checkpoint:
     #: rather than twenty-four. See :meth:`rules_note`.
     rules_name: str | None = None
     rules_hash: str | None = None
+    #: ``"tanh"`` unless the header says ``value_head=linear`` (``PLAN.md`` item 8).
+    value_head: str = "tanh"
+    #: ``"rnad"`` for a checkpoint the R-NaD learner wrote; ``None`` for AlphaZero's.
+    learner: str | None = None
 
     def rules_note(self, spec: dict[str, Any]) -> str | None:
         """A one-line warning when this checkpoint was trained on a different game, or
@@ -165,6 +173,8 @@ def _header_text(
     lane_action: int = 0,
     rules_name: str | None = None,
     rules_hash: str | None = None,
+    value_head: str = "tanh",
+    learner: str | None = None,
 ) -> str:
     """The header, in ``Weights::header_string``'s exact key order.
 
@@ -186,6 +196,14 @@ def _header_text(
     if arch == "lane":
         values |= {"lanes": lanes, "lane_obs": lane_obs, "lane_action": lane_action}
         keys += ["lanes", "lane_obs", "lane_action"]
+    # ``PLAN.md`` item 8, after the lane keys like ``Weights::header_string_with``. Both are
+    # omitted at their defaults, so an AlphaZero checkpoint's header does not change.
+    if value_head != "tanh":
+        values["value_head"] = value_head
+        keys += ["value_head"]
+    if learner is not None:
+        values["learner"] = learner
+        keys += ["learner"]
     keys += ["obs_layout_hash", "action_layout_hash"]
     # Which game this network was trained on (``MODULAR_RULES.md`` §6). Written between the
     # layout hashes and ``param_order`` to match ``Weights::header_string`` exactly — both
@@ -205,10 +223,12 @@ def write_checkpoint(
     *,
     model: Any,
     spec: dict[str, Any],
+    learner: str | None = None,
 ) -> Path:
     """Write ``model`` to ``path`` in the ``.d52nn`` format.
 
     ``spec`` is a ``duel52.encoding_spec()`` dict; its two hashes are stamped verbatim.
+    ``learner`` names the learner that trained it when that is not AlphaZero (``"rnad"``).
     """
     path = Path(path)
     param_order = model.parameter_order()
@@ -236,6 +256,8 @@ def write_checkpoint(
         lanes=getattr(model, "lanes", 0),
         lane_obs=model.lane_in.in_features if arch == "lane" else 0,
         lane_action=model.policy_lane.out_features if arch == "lane" else 0,
+        value_head=getattr(model.config, "value_head", "tanh"),
+        learner=learner,
     ).encode("utf-8")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +315,9 @@ def read_checkpoint(path: str | Path, *, arch: dict[str, int] | None = None) -> 
     lanes = int(fields.get("lanes", 0))
     lane_obs = int(fields.get("lane_obs", 0))
     lane_action = int(fields.get("lane_action", 0))
+    value_head = fields.get("value_head", "tanh")
+    if value_head not in ("tanh", "linear"):
+        raise ValueError(f"{path}: header value_head={value_head!r} is not one of 'tanh', 'linear'")
 
     param_order = fields["param_order"].split(",")
     lengths = _tensor_lengths(
@@ -334,6 +359,8 @@ def read_checkpoint(path: str | Path, *, arch: dict[str, int] | None = None) -> 
         lane_action=lane_action,
         rules_name=fields.get("rules_name"),
         rules_hash=fields.get("rules_hash"),
+        value_head=value_head,
+        learner=fields.get("learner"),
         tensors=tensors,
     )
 

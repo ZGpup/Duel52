@@ -102,6 +102,14 @@ class NetConfig:
     #: Travels in the checkpoint header as ``arch``; a checkpoint written before the key
     #: existed reads back as ``"mlp"``, which is what keeps gen016/022/031 loading.
     arch: str = "mlp"
+    #: ``"tanh"`` — every AlphaZero checkpoint — or ``"linear"``, for R-NaD (``PLAN.md`` item
+    #: 8), whose value targets are the regularised game's value and are not bounded to ±1.
+    #: Travels in the header as ``value_head``, written only when ``linear``.
+    value_head: str = "tanh"
+
+    def __post_init__(self) -> None:
+        if self.value_head not in ("tanh", "linear"):
+            raise ValueError(f"value_head must be 'tanh' or 'linear', got {self.value_head!r}")
 
     @staticmethod
     def from_spec(spec: dict[str, Any], **overrides: Any) -> NetConfig:
@@ -113,6 +121,7 @@ class NetConfig:
             blocks=overrides.get("blocks", 5),
             value_hidden=overrides.get("value_hidden", 256),
             arch=overrides.get("arch", "mlp"),
+            value_head=overrides.get("value_head", "tanh"),
         )
 
 
@@ -156,7 +165,9 @@ class Duel52Net(nn.Module):
         for block in self.blocks:
             h = block(h)
         h = self.ln_out(h)
-        value = torch.tanh(self.value2(torch.relu(self.value1(h)))).squeeze(-1)
+        value = self.value2(torch.relu(self.value1(h))).squeeze(-1)
+        if self.config.value_head == "tanh":
+            value = torch.tanh(value)
         return self.policy(h), value
 
     # ------------------------------------------------------------------ checkpoints --
@@ -399,7 +410,9 @@ class Duel52LaneNet(nn.Module):
         )
         logits.index_copy_(1, self.global_action, self.policy_glob(pooled))
 
-        value = torch.tanh(self.value2(torch.relu(self.value1(pooled)))).squeeze(-1)
+        value = self.value2(torch.relu(self.value1(pooled))).squeeze(-1)
+        if self.config.value_head == "tanh":
+            value = torch.tanh(value)
         return logits, value
 
     # ------------------------------------------------------------------ checkpoints --
