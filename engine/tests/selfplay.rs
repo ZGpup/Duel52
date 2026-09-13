@@ -697,3 +697,55 @@ fn phase4_playout_cap_randomisation_is_still_deterministic() {
         assert_eq!(a.policy, b.policy);
     }
 }
+
+/// `PLAN.md` item 8, test 1: **R-NaD is added beside AlphaZero and must not move it.**
+///
+/// A golden hash of what a small fixed-seed self-play shard *contains* — every game's seed and
+/// outcome, and every sample's chosen index, root value, visit distribution and policy-target
+/// flag, floats as raw bits. It was recorded on the commit before the first R-NaD change, so
+/// anything that R-NaD work does to the search, the forward pass, the encoder or the rules
+/// shows up here as a different number.
+///
+/// The header is deliberately left out: it records the checkpoint's temp path and the engine
+/// version, neither of which is the corpus.
+///
+/// ⚠️ Not a test to update to match new behaviour. If it fails on the `rnad` work, that work
+/// changed AlphaZero and should be reverted, not re-pinned.
+#[test]
+fn rnad_leaves_the_alphazero_shard_byte_identical() {
+    let path = write_shard(4, 1, "golden");
+    let shard = selfplay::Shard::read(&path).expect("read the golden shard back");
+
+    let mut bytes = Vec::new();
+    for game in &shard.games {
+        bytes.extend_from_slice(&game.seed.to_le_bytes());
+        bytes.push(game.outcome_code);
+        bytes.extend_from_slice(&(game.samples.len() as u32).to_le_bytes());
+        for s in &game.samples {
+            bytes.extend_from_slice(&s.chosen.to_le_bytes());
+            bytes.extend_from_slice(&s.root_value.to_bits().to_le_bytes());
+            bytes.push(s.policy_target as u8);
+            bytes.extend_from_slice(&(s.policy.len() as u32).to_le_bytes());
+            for &(index, prob) in &s.policy {
+                bytes.extend_from_slice(&index.to_le_bytes());
+                bytes.extend_from_slice(&prob.to_bits().to_le_bytes());
+            }
+        }
+    }
+    // FNV-1a, written out rather than borrowed so the hash cannot move with the engine.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in &bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    assert_eq!(shard.games.len(), 4);
+    assert_eq!(
+        hash, GOLDEN_ALPHAZERO_SHARD,
+        "the AlphaZero self-play corpus changed (hash {hash:#018x}, {} bytes of records)",
+        bytes.len()
+    );
+}
+
+/// Recorded on `rnad` before any R-NaD code, from `write_shard(4, 1, ..)`.
+const GOLDEN_ALPHAZERO_SHARD: u64 = 0x7686_26ee_f93c_668f;
