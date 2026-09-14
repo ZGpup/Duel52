@@ -1,18 +1,38 @@
-# PLAN.md item 8, Stage 3 — the first three-hour R-NaD run, on a GPU.
+# PLAN.md item 8, Stage 3 — the first three-hour R-NaD run, sized for one H100.
 #
-#   .venv/bin/python -m duel52.rnad check --config configs/rnad-3h.toml
+#   .venv/bin/python -m duel52.rnad check --config configs/rnad-3h.toml   # must say device cuda
 #   .venv/bin/python -m duel52.rnad bench --config configs/rnad-3h.toml --steps 5
 #   .venv/bin/python -m duel52.rnad run   --config configs/rnad-3h.toml --run-dir runs/rnad-3h
 #
 # Lane 128 x 3 from a random init — the trunk `lane-gen032` and `runs/sixth` use — on the
 # canonical split-deck rules, learning with the reference's R-NaD settings.
 #
-# ⚠️ **Run `bench` on the box first and set `entropy_schedule_size` AND `target_network_avg`
-# from what it prints.** The schedule is counted in learner steps, and a step's wall-clock
-# cost is the thing that differs most between machines. The values below are sized from the
-# 8-core laptop's measured 3.2 s per 256-game step on MPS (~3,400 steps in three hours), for
-# ~10 regularisation updates; a GPU that runs several times faster needs a proportionally
-# larger size. `bench` prints both numbers to use.
+# **Where a step's time goes**, measured on the 8-core laptop (MPS, 256 games, 2026-09-13),
+# because that is what decides how much a bigger GPU can buy:
+#
+#   acting    1.3 s   ~165 ticks, one per decision of the longest game. Each tick is one
+#                     network call and one round trip to the engine; the engine is 0.10 s of
+#                     the total. The rest is ~70 small operations a tick, and on a GPU their
+#                     cost is launch overhead, not arithmetic.
+#   learning  2.2 s   four forward passes and one backward over ~33,000 positions, dominated by
+#                     elementwise work on [positions × 2194] policy tensors. V-trace runs on
+#                     the CPU and is 0.02 s of it.
+#
+# An H100 speeds up neither half much. Acting pays a fixed toll per tick, and learning is
+# memory-bandwidth work that grows with the batch. The estimate for one H100 is **~1.5 s a
+# step, ~7,000 to 8,000 steps in three hours** [ASSUMED] — about twice the laptop, not ten times.
+#
+# **Why `batch_games` stays 256 on an 80 GB card.** Memory is not the limit: a 256-game step
+# peaks at 6.0 GB (measured on the CPU, where RSS counts every tensor), so 1024 would be ~22 GB.
+# But learning scales with positions, so 1024 games buys an estimated ~1.5x the games an hour for
+# ~0.4x the steps, and the schedule is counted in steps. The H100's extra steps go into longer
+# regularisation iterations instead: 800 steps each, against the laptop's 340. If `bench` shows
+# `learn` under a quarter of a step, the tick toll dominates and 512 games is close to free.
+#
+# ⚠️ **`bench` on the box is still the check, because the numbers above come from a laptop.**
+# It prints the steps three hours buy. **Between ~5,000 and ~12,000, leave this file alone** —
+# that is 6 to 15 regularisation updates, all of them fine. Outside that range, copy the
+# `entropy_schedule_size` and `target_network_avg` it prints on its last line.
 #
 # ⚠️ **The two move together, and getting that wrong is silent.** Each regularisation update
 # copies the *target* net, which moves `target_network_avg` of the way to the online net per
@@ -36,15 +56,15 @@ value_hidden = 128
 [rnad]
 # "auto" picks CUDA on a GPU box, MPS on the laptop. The whole handoff is this string.
 device = "auto"
-# The reference's batch_size. ~36,000 positions a step; fits on the 16 GB laptop and on any
-# GPU with 16 GB or more. Set learner_chunk (positions per forward pass) if it does not.
+# The reference's batch_size: ~33,000 positions a step and a 6.0 GB peak, so the whole batch
+# goes through in one forward pass. See the header for why an H100 does not change it.
 batch_games = 256
 learner_chunk = 0
-# [ASSUMED] ~10 updates in 3 h at the laptop's step rate. Re-derive with `bench` — see above.
-entropy_schedule_size = [340]
+# [ASSUMED] ~10 updates in the ~7,500 steps estimated for an H100. `bench` confirms it.
+entropy_schedule_size = [800]
 entropy_schedule_repeats = [1]
-# τ·size = 10. The reference's 0.001 belongs to its 20,000-step iterations — see above.
-target_network_avg = 0.03
+# τ·size = 10, as on the laptop. The reference's 0.001 belongs to its 20,000-step iterations.
+target_network_avg = 0.0125
 # [ASSUMED] 5e-4, not the reference's 5e-5. The reference's rate is for runs of millions of
 # steps; in the laptop check 5e-5 had not moved the policy at all by step 200. 1e-3 learned a
 # little faster over 200 steps (0.990 against 0.935 vs `random`); 5e-4 is the choice for a run
@@ -60,12 +80,16 @@ nerd_clip = 10000.0
 c_vtrace = 1.0
 
 [run]
+# Counts learner steps only. Evaluations and saves are extra wall clock, a few minutes in all.
 hours = 3.0
 seed = 7000000
 # Engine threads for encoding and applying a batch; 0 is every core.
 threads = 0
 log_every = 10
-eval_every = 250
-eval_games = 200
+# Half the schedule size, so every other evaluation lands right after a regularisation update.
+eval_every = 400
+# An evaluation is ~1 s of CPU for 200 games against both opponents, so it costs the run
+# nothing, and 1,000 games tightens a mid-range score's interval from ±0.07 to ±0.03.
+eval_games = 1000
 eval_opponents = ["random", "greedy"]
 save_every_secs = 300.0
