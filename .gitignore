@@ -47,3 +47,7 @@ venv/
 
 # macOS
 .DS_Store
+
+# Overview document
+overview.typ
+overview.pdf
