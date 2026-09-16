@@ -196,8 +196,9 @@ pub struct GameStats {
     /// The live index into `cards`. Reconcile scratch, not a result.
     live: Vec<LiveCard>,
 
-    /// Face-down cards that were killed and survived it — a death trigger firing — by
-    /// player and rank.
+    /// Death triggers that fired, by player and rank: a face-down card that was killed and
+    /// either survived it (the 3's Trap, [`FaceUpKind::Trap`]) or died setting something off
+    /// (the 4's Bomb and the 2's Blast, which leave a face-down death in the card log).
     ///
     /// Canonically this is only the 3, the one rank whose power is conditioned on staying
     /// hidden: the flip rate alone cannot say whether holding it paid, because a 3 held to
@@ -279,8 +280,9 @@ impl GameStats {
     /// [`GameStats::note_start_hands`], which this calls for P0 and which catches P1 one
     /// turn later.
     fn note_setup(&mut self, state: &GameState) {
-        // `acting` and `flipped` cannot matter: nothing is face-up yet and nothing has died.
-        self.note_cards(0, Player::P0, None, state);
+        // `acting`, `flipped` and `damaging` cannot matter: nothing is face-up yet and
+        // nothing has died.
+        self.note_cards(0, Player::P0, None, false, state);
         self.note_start_hands(state);
     }
 
@@ -308,13 +310,12 @@ impl GameStats {
     /// - **A card the index does not know** just entered play — a card played from hand, or
     ///   at setup, a base card.
     /// - **A card the index has face-down that is now face-up.** Which of §6's three ways
-    ///   it was is decided by who was acting and what they chose:
-    ///   1. **Its owner was not acting.** Then it was killed, and a death trigger fired —
-    ///      [`FaceUpKind::Trap`]. Nothing else can turn an opponent's card face-up: the 4
-    ///      only *looks*, privately, and the 5 flips its own side. And the owner cannot
-    ///      have sprung their own 3 on their own turn, because damage only ever originates
-    ///      from an attack — including the 8's Retaliate and the 10's Twinstrike — and a
-    ///      face-down card cannot attack (§4).
+    ///   it was is decided by what the action was:
+    ///   1. **The action dealt damage, or the card's owner was not acting.** Then it was
+    ///      killed, and a death trigger fired — [`FaceUpKind::Trap`]. Damage only ever
+    ///      originates from an attack, and an attack flips nothing; and nothing but damage
+    ///      can turn an opponent's card face-up, since the 4 only *looks* and the 5 flips its
+    ///      own side.
     ///   2. **Its owner was acting and named it.** An ordinary [`FaceUpKind::Chose`] flip.
     ///   3. **Its owner was acting and named something else.** A 5 or a King turned it up
     ///      from inside the resolution — [`FaceUpKind::Cascade`].
@@ -323,18 +324,22 @@ impl GameStats {
     ///   play: a Queen moves one between lanes and it keeps its id, and a face-down 3 that
     ///   is killed springs rather than dying (§6), so it is still there afterwards.
     ///
-    /// ⚠️ Case 1's reasoning is a property of the **canonical** ruleset, not of the engine.
-    /// A variant that let a player damage their own cards would misfile a self-inflicted
-    /// spring as a cascade flip. Nothing here can detect that; it is noted so the next
-    /// person to add such a power knows this classification is one of the things it breaks.
+    /// Case 1 used to read only "the owner was not acting", which is exact under the
+    /// canonical rules — there, the only damage to the acting player's own side is retaliate
+    /// and vengeance, and both land on a face-up attacker. The 2's Blast broke it: your
+    /// attack kills an enemy face-down 2, the blast comes back across the lane, and springs
+    /// **your own** face-down 3 on your own turn. Asking whether the action dealt damage
+    /// files that correctly and changes nothing for any ruleset without a blast.
     ///
     /// `flipped` is the card [`Action::Flip`] named, looked up before the apply while it was
-    /// still in the slot the action gave.
+    /// still in the slot the action gave. `damaging` is whether the action was one that
+    /// lands an attack.
     fn note_cards(
         &mut self,
         at_ply: u32,
         acting: Player,
         flipped: Option<CardId>,
+        damaging: bool,
         state: &GameState,
     ) {
         for live in &mut self.live {
@@ -349,7 +354,7 @@ impl GameStats {
                             self.live[i].face_up = true;
                             let kind = if flipped == Some(card.id) {
                                 FaceUpKind::Chose
-                            } else if p != acting {
+                            } else if damaging || p != acting {
                                 FaceUpKind::Trap
                             } else {
                                 FaceUpKind::Cascade
@@ -518,6 +523,14 @@ impl GameStats {
                     self.died_face_up_by_rank[p][r] += 1;
                 } else {
                     self.died_face_down_by_rank[p][r] += 1;
+                    // A death trigger that does not save its card — the 4's Bomb, the 2's
+                    // Blast — fires as the card dies, so it never produces `FaceUpKind::Trap`.
+                    // Every death trigger fires on any face-down death (`PowerId::
+                    // has_death_trigger`), and a face-down 3 cannot die, so this adds nothing
+                    // under the canonical rules.
+                    if state.config.power(card.rank).has_death_trigger() {
+                        self.triggers_sprung_by_rank[p][r] += 1;
+                    }
                 }
             }
         }
@@ -672,6 +685,8 @@ impl MatchGame {
             }
             _ => None,
         };
+        // A 10's attack lands on the `SplitTarget` that follows it, when it splits.
+        let damaging = matches!(action, Action::Attack { .. } | Action::SplitTarget { .. });
 
         self.stats.note_action(&self.state, action);
         self.state.apply_trusted(action);
@@ -680,7 +695,7 @@ impl MatchGame {
         self.stats
             .note_turn_ends(acting, ply_before, allowance_before, costs, &self.state);
         self.stats
-            .note_cards(ply_before, acting, flipped, &self.state);
+            .note_cards(ply_before, acting, flipped, damaging, &self.state);
         if let Some((a, b)) = paired {
             self.stats.note_paired([a, b]);
         }

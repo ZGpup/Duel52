@@ -38,6 +38,7 @@ powers.three = "trap_vengeance_one_damage"
 | `eight-on-survival.toml` | 2 | The 8 retaliates **only if it survives** the attack — the exact inverse of the rules-as-written ruling that it "fires even if that damage killed the 8". |
 | `eight-none.toml` | 2 | Ablation: the 8 does not hit back. |
 | `jack-2hp.toml` | 1 | The Jack still taunts but has 2 HP, not 3. A pure config number — no code, no new power. |
+| `two-blast-four-bomb.toml` | 2 | The 2 and 4 become face-down traps, like the 3. A 2 killed face-down deals 1 to every enemy card in its lane; a 4 killed face-down kills its killer. Both replace View and Foresight. `configs/train-mod-traps-3h.toml` is its warm start. |
 | `seven-shield.toml` | 2 ⚠️ | The 7 **shields** instead of healing: each of your cards ignores the next damage it takes. Claims reserve status flag 0. |
 | `king-any-lane.toml` | 2 ⚠️ | The King reactivates a lane **you choose**, not its own. Claims the reserve's `CHOOSE_LANE` block and a reserve phase. |
 | `two-choose.toml` | 2 ⚠️ | The 2 lets you pick bottom **or** discard, per use. Claims the reserve's `CHOOSE_OPTION` block — §10a's ruling becomes an in-game decision. |

@@ -100,6 +100,7 @@ pub enum PowerId {
     // ---- 2 ----
     TwoView,
     TwoViewChoose,
+    TwoBlast1,
     // ---- 3 ----
     ThreeTrap,
     ThreeTrapVengeance1,
@@ -107,6 +108,7 @@ pub enum PowerId {
     ThreeNone,
     // ---- 4 ----
     FourForesight,
+    FourBomb,
     // ---- 5 ----
     FiveFlip,
     // ---- 6 ----
@@ -137,11 +139,13 @@ impl PowerId {
         PowerId::AceAction,
         PowerId::TwoView,
         PowerId::TwoViewChoose,
+        PowerId::TwoBlast1,
         PowerId::ThreeTrap,
         PowerId::ThreeTrapVengeance1,
         PowerId::ThreeTrapVengeance2,
         PowerId::ThreeNone,
         PowerId::FourForesight,
+        PowerId::FourBomb,
         PowerId::FiveFlip,
         PowerId::SixFreeze,
         PowerId::SevenHealAll,
@@ -161,12 +165,12 @@ impl PowerId {
     pub const fn rank(self) -> Rank {
         match self {
             PowerId::AceAction => Rank::ACE,
-            PowerId::TwoView | PowerId::TwoViewChoose => Rank::TWO,
+            PowerId::TwoView | PowerId::TwoViewChoose | PowerId::TwoBlast1 => Rank::TWO,
             PowerId::ThreeTrap
             | PowerId::ThreeTrapVengeance1
             | PowerId::ThreeTrapVengeance2
             | PowerId::ThreeNone => Rank::THREE,
-            PowerId::FourForesight => Rank::FOUR,
+            PowerId::FourForesight | PowerId::FourBomb => Rank::FOUR,
             PowerId::FiveFlip => Rank::FIVE,
             PowerId::SixFreeze => Rank::SIX,
             PowerId::SevenHealAll | PowerId::SevenShieldAll => Rank::SEVEN,
@@ -210,11 +214,13 @@ impl PowerId {
             PowerId::AceAction => "action",
             PowerId::TwoView => "view",
             PowerId::TwoViewChoose => "view_choose",
+            PowerId::TwoBlast1 => "blast_one_damage",
             PowerId::ThreeTrap => "trap",
             PowerId::ThreeTrapVengeance1 => "trap_vengeance_one_damage",
             PowerId::ThreeTrapVengeance2 => "trap_vengeance_two_damage",
             PowerId::ThreeNone => "none",
             PowerId::FourForesight => "foresight",
+            PowerId::FourBomb => "bomb",
             PowerId::FiveFlip => "flip",
             PowerId::SixFreeze => "freeze",
             PowerId::SevenHealAll => "heal_all",
@@ -256,10 +262,12 @@ impl PowerId {
             PowerId::AceAction => "Action",
             PowerId::TwoView => "View",
             PowerId::TwoViewChoose => "View (your choice)",
+            PowerId::TwoBlast1 => "Blast",
             PowerId::ThreeTrap => "Trap",
             PowerId::ThreeTrapVengeance1 | PowerId::ThreeTrapVengeance2 => "Trap + Vengeance",
             PowerId::ThreeNone | PowerId::EightNone => "(none)",
             PowerId::FourForesight => "Foresight",
+            PowerId::FourBomb => "Bomb",
             PowerId::FiveFlip => "Flip",
             PowerId::SixFreeze => "Freeze",
             PowerId::SevenHealAll => "Heal All",
@@ -287,6 +295,9 @@ impl PowerId {
             PowerId::TwoViewChoose => {
                 "one-shot: draw 1, then give a card back — you choose bottom or discard"
             }
+            PowerId::TwoBlast1 => {
+                "if killed while FACE-DOWN, deals 1 damage to every enemy card in its lane"
+            }
             PowerId::ThreeTrap => {
                 "if killed while FACE-DOWN, returns face-up at full HP in the same lane"
             }
@@ -299,6 +310,9 @@ impl PowerId {
             PowerId::ThreeNone => "no power (ablation): dies like any other card",
             PowerId::FourForesight => {
                 "one-shot: privately look at any one face-down card on the board"
+            }
+            PowerId::FourBomb => {
+                "if killed while FACE-DOWN, the attacker that killed it dies too"
             }
             PowerId::FiveFlip => {
                 "one-shot: flip all your face-down cards in this lane (skips frozen)"
@@ -337,7 +351,9 @@ impl PowerId {
     /// True when this power does something at the moment the card is turned face-up.
     ///
     /// The complement is not "constant": [`PowerId::ThreeTrap`] is neither, because it is
-    /// conditional and fires only from `damage_card`.
+    /// conditional and fires only from `damage_card`. So are [`PowerId::TwoBlast1`] and
+    /// [`PowerId::FourBomb`], which replace a one-shot rather than adding to it — flipping
+    /// one of those does nothing, exactly as flipping a 3 does.
     pub const fn fires_on_flip(self) -> bool {
         matches!(
             self,
@@ -406,11 +422,13 @@ impl PowerId {
 
             PowerId::AceAction
             | PowerId::TwoView
+            | PowerId::TwoBlast1
             | PowerId::ThreeTrap
             | PowerId::ThreeTrapVengeance1
             | PowerId::ThreeTrapVengeance2
             | PowerId::ThreeNone
             | PowerId::FourForesight
+            | PowerId::FourBomb
             | PowerId::FiveFlip
             | PowerId::SixFreeze
             | PowerId::SevenHealAll
@@ -477,10 +495,19 @@ impl PowerId {
     /// True when this power reacts to its own card's death. Used by `apply.rs` to skip the
     /// hook entirely for the common case, and by the invariant suite to know which rulesets
     /// can produce a cascade at all.
+    ///
+    /// Every such power so far reacts only while its card is **face-down**, and the probe
+    /// relies on that: a face-down death of one of these ranks is counted as its trigger
+    /// firing (`probe.rs`, `GameStats::finish`). A trigger that fired face-up would need
+    /// that fold revisited.
     pub const fn has_death_trigger(self) -> bool {
         matches!(
             self,
-            PowerId::ThreeTrap | PowerId::ThreeTrapVengeance1 | PowerId::ThreeTrapVengeance2
+            PowerId::ThreeTrap
+                | PowerId::ThreeTrapVengeance1
+                | PowerId::ThreeTrapVengeance2
+                | PowerId::TwoBlast1
+                | PowerId::FourBomb
         )
     }
 }
@@ -513,10 +540,12 @@ pub(crate) fn on_flip(state: &mut GameState, power: PowerId, ctx: PowerCtx) {
         PowerId::KingEmpowerAnyLane => king::empower_any_lane(state, ctx),
 
         // Conditional and constant powers do nothing at the moment of the flip.
-        PowerId::ThreeTrap
+        PowerId::TwoBlast1
+        | PowerId::ThreeTrap
         | PowerId::ThreeTrapVengeance1
         | PowerId::ThreeTrapVengeance2
         | PowerId::ThreeNone
+        | PowerId::FourBomb
         | PowerId::EightRetaliate
         | PowerId::EightRetaliateOnSurvival
         | PowerId::EightNone
@@ -541,6 +570,8 @@ pub(crate) fn on_lethal_damage(
         PowerId::ThreeTrap => three::trap(state, ctx, source, 0),
         PowerId::ThreeTrapVengeance1 => three::trap(state, ctx, source, 1),
         PowerId::ThreeTrapVengeance2 => three::trap(state, ctx, source, 2),
+        PowerId::TwoBlast1 => two::blast(state, ctx, 1),
+        PowerId::FourBomb => four::bomb(state, ctx, source),
 
         PowerId::ThreeNone
         | PowerId::AceAction

@@ -49,12 +49,21 @@ pub enum DamageSource {
     },
     /// An 8's Retaliate (§6). The 8 is the source; the target is whoever attacked it.
     Retaliate { from: CardId },
-    /// A death trigger hitting back — the `trap_vengeance_*` variants of the 3.
+    /// A death trigger hitting back at whatever killed it — the `trap_vengeance_*` variants
+    /// of the 3, and the 4's Bomb.
     ///
     /// Not a rule of the canonical ruleset. It is named here rather than folded into
     /// `Attack` so that a power can tell "I was attacked" from "I was caught in a death
     /// throe", which is what keeps the cascade depth bounded (`MODULAR_RULES.md` §3).
     Vengeance { from: CardId },
+    /// A death trigger hitting every opposing card in its lane — the 2's Blast.
+    ///
+    /// Not a rule of the canonical ruleset. Unlike [`DamageSource::Vengeance`] it is not
+    /// aimed at the attacker, so it can reach a **face-down** card and set off that card's
+    /// own death trigger. Blasts therefore do chain; what bounds the chain is not this type
+    /// but the fact that every death trigger fires only face-down, once (`MODULAR_RULES.md`
+    /// §3a).
+    Blast { from: CardId },
     /// Damage with no card behind it: `testkit` positions, and anything the engine applies
     /// as bookkeeping rather than as a rule.
     Unattributed,
@@ -72,12 +81,12 @@ impl DamageSource {
 
     /// The cards that should be considered "the attacker" for a power that hits back.
     ///
-    /// One id for a lone attacker, two for a pair, none for retaliate, vengeance or
-    /// unattributed damage. **That last part is the load-bearing one**: it is what makes
-    /// the cascade finite without a depth limit. A vengeance hit is not an attack, so it
-    /// cannot provoke another vengeance, so a chain of death triggers cannot close into a
-    /// cycle. `MODULAR_RULES.md` §3a walks through why this holds for every variant
-    /// currently implemented, and what would break it.
+    /// One id for a lone attacker, two for a pair, none for retaliate, vengeance, blast or
+    /// unattributed damage. That last part is what stops a vengeance cascade: a vengeance
+    /// hit is not an attack, so it cannot provoke another vengeance. A blast is killed by
+    /// nothing in particular, so a 4's Bomb caught in one has no one to take with it.
+    /// `MODULAR_RULES.md` §3a walks through why every cascade is finite, including the blast
+    /// chains this does not stop.
     pub fn attackers(self) -> impl Iterator<Item = CardId> {
         let (a, b) = match self {
             DamageSource::Attack { attacker, partner } => (Some(attacker), partner),
@@ -93,6 +102,7 @@ impl DamageSource {
             DamageSource::Attack { attacker, .. } => Some(attacker),
             DamageSource::Retaliate { from } => Some(from),
             DamageSource::Vengeance { from } => Some(from),
+            DamageSource::Blast { from } => Some(from),
             DamageSource::Unattributed => None,
         }
     }

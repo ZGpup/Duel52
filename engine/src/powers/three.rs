@@ -33,9 +33,9 @@ use crate::state::GameState;
 ///   members are the attacker (§5) — the same reading that makes both members take
 ///   retaliate.
 ///
-/// The first of those is a property of the ruleset, not of this function. A second power
-/// that triggered on death and dealt non-attack damage would break it, and the cross-ruleset
-/// invariant suite is what would catch the result.
+/// The first of those is a property of the ruleset, not of this function. The 2's Blast
+/// ([`super::two::blast`]) is a death trigger that deals non-attack damage to face-down cards,
+/// and it does chain. `MODULAR_RULES.md` §3a has the counting argument that bounds it.
 pub(crate) fn trap(
     state: &mut GameState,
     ctx: PowerCtx,
