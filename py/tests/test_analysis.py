@@ -231,6 +231,33 @@ def test_the_document_renders_in_both_forms(tmp_path):
     assert html.count("<table") >= len(sections)
 
 
+def test_a_control_that_played_rules_it_was_not_trained_on_is_flagged(tmp_path):
+    """`analyze --allow-cross-ruleset` shares the played rules hash, so the reader merges it
+    like any other column — and nothing but `cross_ruleset` would tell a reader it is a
+    control. The header and the provenance table both have to say so."""
+    write_corpus(tmp_path / "split" / "alpha" / "s1-g8", agent="alpha", games=8)
+    control = tmp_path / "split" / "beta" / "s1-g8"
+    write_corpus(control, agent="beta", games=8)
+    meta = json.loads((control / "meta.json").read_text())
+    meta.update(trained_on="canonical/0000", cross_ruleset=True)
+    (control / "meta.json").write_text(json.dumps(meta))
+
+    corpora = corpus_mod.load_dataset(tmp_path / "split")
+    assert [c.cross_ruleset for c in corpora] == [False, True]
+    ctx = Context(dataset="split", root=tmp_path, binary=None, engine_args=[], card_value_games=0)
+    md = report.markdown(corpora, report.build(corpora, ctx), ctx)
+    header = md.split("## Contents")[0]
+    assert "trained on other rules" in header and "beta" in header
+    assert "alpha" not in header.split("trained on other rules")[1].splitlines()[0]
+    assert "⚠️ canonical/0000" in md, "the provenance row marks the control"
+
+
+def test_a_corpus_without_the_field_is_not_flagged(tmp_path):
+    corpora, ctx, sections = render(tmp_path)
+    assert not any(c.cross_ruleset for c in corpora)
+    assert "trained on other rules" not in report.markdown(corpora, sections, ctx)
+
+
 def test_every_html_table_sorts_and_every_rank_column_sorts_by_the_deck(tmp_path):
     """The HTML's sortable headers, and the one column whose text does not sort correctly.
 

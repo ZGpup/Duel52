@@ -90,13 +90,13 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 417 tests: rules, determinism, information hiding,
+cargo test                               # 439 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, the
                                          # training corpus, the modded power variants, the
                                          # cross-ruleset invariant suite, the encoder reserve
                                          # and its checkpoint bridge, and the analysis
                                          # corpus's per-card log
-.venv/bin/python -m pytest py/tests -q   # 129 tests, including the analysis reader, the
+.venv/bin/python -m pytest py/tests -q   # 139 tests, including the analysis reader, the
                                          # deal-clustered intervals every table carries, and
                                          # the proof that `nn widen` preserves the function
 
@@ -240,6 +240,20 @@ netmcts:models/duel52-split-lane-gen032.d52nn@1000 \
     --agents netmcts:models/duel52-split-gen031.d52nn@64,\
 netmcts:models/duel52-split-lane-gen032.d52nn@64,\
 netmcts:models/duel52-32c-24h-best.d52nn@64
+# A rules experiment's **control column**: the checkpoint it warm-started from, playing the
+# new rules beside the fine-tuned agent, to separate "learned the mod" from "got stronger".
+# `analyze` refuses a checkpoint trained on other rules; `--allow-cross-ruleset` makes that a
+# warning, records `cross_ruleset` in meta.json, and the document flags the column in its
+# header and provenance table. `ladder`, `match` and `probe` have no such flag, on purpose
+# (MODULAR_RULES.md §6).
+.venv/bin/python -m duel52.analysis \
+    --config configs/rules/two-blast-four-bomb.toml --dataset two-blast-four-bomb-256 \
+    --agents netmcts:models/duel52-split-lane-gen032.d52nn@256,\
+netmcts:runs/mod-traps/checkpoints/gen019.d52nn@256 \
+    --games 2000 --chunk 250 --encoding-slots 21 --eval-batch 32 --allow-cross-ruleset
+# ⚠️ Name the generation, not `best.d52nn`, even when they are the same bytes (here they
+# are). The agent name is the corpus key and the column label, so `best` reads as `best@256`
+# in the document and silently becomes a different checkpoint if the run is ever resumed.
 # Writes analysis/<variant>.md (tables) and analysis/<variant>.html (the same tables with
 # every figure inline). Both are regenerated from the corpora in seconds.
 # In the HTML every column heading **sorts** — once ascending, twice descending, a third

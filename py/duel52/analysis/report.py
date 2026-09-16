@@ -44,9 +44,18 @@ def _header_facts(corpora: Sequence[Corpus]) -> List[tuple]:
         for chunk in corpus.chunks
     )
     span = f"{seeds[0][0]}–{seeds[-1][1]}" if seeds else "—"
+    # Said in the header and not only in the provenance table, because a control column
+    # read as a same-rules result is exactly the accident the engine's refusal exists for.
+    controls = [f"{c.label} (trained on `{c.trained_on}`)" for c in corpora if c.cross_ruleset]
+    foreign = (
+        [("trained on other rules", f"⚠️ {', '.join(controls)} — a control, not a same-rules result")]
+        if controls
+        else []
+    )
     return [
         ("variant", meta["variant"]),
         ("ruleset", meta["rules_label"]),
+        *foreign,
         ("the 2's power", meta["two_power"]),
         ("lanes", f"{meta['lanes']}, {meta['lanes_to_win']} to win"),
         ("hand size", str(meta["hand_size"])),

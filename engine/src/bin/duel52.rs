@@ -173,7 +173,15 @@ OPTIONS
                                   defined up to a constant, so this is what the table is
                                   measured against.
   --a <agent> --b <agent>         the two sides of a `match`
-  --journal <file>                match and selfplay: append each game to <file> as it
+  --warm-start-gate               match only: score a checkpoint trained on other rules
+                                  with a warning instead of refusing it. The training
+                                  loop passes it for a warm-started run's gate and panel;
+                                  a result you mean to read should never need it
+  --allow-cross-ruleset           analyze and card-value only: play a checkpoint trained
+                                  on other rules, with a warning, as a deliberate control.
+                                  `meta.json` records it and the analysis document flags
+                                  the column, so the corpus cannot pass for a same-rules one
+  --journal <file>               match and selfplay: append each game to <file> as it
                                   finishes, and on a re-run of the same job skip the games
                                   already in it, so a killed run resumes rather than
                                   restarts. A journal for a different job (seed, games,
@@ -517,6 +525,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
 /// table means nothing.
 fn cmd_card_value(args: &[String]) -> Result<(), String> {
     let mut checkpoint: Option<String> = None;
+    let mut allow_cross_ruleset = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -527,6 +536,8 @@ fn cmd_card_value(args: &[String]) -> Result<(), String> {
                     .cloned()
                     .ok_or("--checkpoint needs a path")?,
             );
+        } else if args[i] == "--allow-cross-ruleset" {
+            allow_cross_ruleset = true;
         } else {
             rest.push(args[i].clone());
         }
@@ -537,12 +548,14 @@ fn cmd_card_value(args: &[String]) -> Result<(), String> {
     let positions = opts.games_or(200);
 
     // Cross-ruleset is refused here for the same reason it is on `probe`: this produces a
-    // number a human reads as a result about a card.
-    refuse_cross_ruleset(
+    // number a human reads as a result about a card. The analysis document passes
+    // `--allow-cross-ruleset` for a column whose corpus was played under it.
+    refuse_cross_ruleset_unless(
         &[AgentSpec::NetPolicy {
             checkpoint: checkpoint.clone(),
         }],
         &opts.config,
+        allow_cross_ruleset,
     )?;
 
     let evaluator =
@@ -933,49 +946,133 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
 /// to it.
 /// Refuse to measure an agent that was trained on a different game.
 ///
-/// `MODULAR_RULES.md` §6. This is the **hard error**, and it belongs on exactly the three
-/// commands whose output a human reads as a result: `ladder`, `match` and `probe`. There is
-/// no escape flag, because cross-ruleset play is not an experiment anybody wants — it is
-/// the accident that produced `PLAN.md` §5's false claim about per-variant layouts, where a
-/// split-trained checkpoint played `--variant base` at full speed and the score looked like
-/// a finding.
+/// `MODULAR_RULES.md` §6. This is the **hard error**, and it belongs on the commands whose
+/// output a human reads as a result: `ladder`, `match`, `probe`, `card-value`, `screen` and
+/// `analyze`. Cross-ruleset play is not an experiment anybody wants — it is the accident that
+/// produced `PLAN.md` §5's false claim about per-variant layouts, where a split-trained
+/// checkpoint played `--variant base` at full speed and the score looked like a finding.
 ///
 /// ⚠️ It is deliberately **not** in `Weights::load`. Generation 1 of every warm-started run
 /// is a net trained under ruleset A playing under ruleset B, and that is the mechanism that
-/// makes a rules experiment cost three hours rather than twenty-four. `selfplay` and the
-/// training loop print the mismatch and continue; only the measurement commands refuse.
+/// makes a rules experiment cost three hours rather than twenty-four.
+///
+/// ⚠️ **The training loop scores its gate and reference panel through `match`**, so a warm
+/// start into a modded ruleset used to die here before generation 1: the incumbent is the
+/// copied checkpoint, and it was trained on other rules. `match --warm-start-gate` is the
+/// one exception, and it downgrades this refusal to a warning. The loop passes it for a
+/// warm-started run and for nothing else; nobody measuring a result has a reason to.
 fn refuse_cross_ruleset(roster: &[AgentSpec], config: &GameConfig) -> Result<(), String> {
+    match cross_ruleset_mismatches(roster, config)?.first() {
+        Some(m) => Err(m.refusal(config)),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_cross_ruleset`], unless `--allow-cross-ruleset` was given, when each mismatch is a
+/// warning instead.
+///
+/// `analyze` and `card-value` only. The case it exists for is a **control column**: the
+/// checkpoint a rules experiment warm-started from, played under the new rules beside the
+/// agent trained on them, so the document separates "learned the mod" from "got stronger".
+/// That is a comparison somebody asked for, not the accident the refusal guards against, and
+/// it stays visible: `analysis.rs` writes `cross_ruleset` into `meta.json` and the document
+/// flags the column.
+fn refuse_cross_ruleset_unless(
+    roster: &[AgentSpec],
+    config: &GameConfig,
+    allow: bool,
+) -> Result<(), String> {
+    if !allow {
+        return refuse_cross_ruleset(roster, config);
+    }
+    for mismatch in cross_ruleset_mismatches(roster, config)? {
+        eprintln!("{}", mismatch.allowed_warning(config));
+    }
+    Ok(())
+}
+
+/// An agent whose checkpoint was trained on rules other than the ones being played.
+struct RulesMismatch {
+    agent: String,
+    /// `name/hash` it was stamped with, or `None` for a checkpoint that predates the stamp.
+    trained_on: Option<String>,
+}
+
+impl RulesMismatch {
+    fn refusal(&self, config: &GameConfig) -> String {
+        match &self.trained_on {
+            Some(label) => format!(
+                "{} was trained on rules {label}, but this run plays {} — a score between the \
+                 two would not mean anything, so it is refused rather than printed.\n  Train \
+                 an agent on these rules, or run the measurement under the rules the agent \
+                 was trained on.",
+                self.agent,
+                config.rules_label(),
+            ),
+            None => format!(
+                "{} predates rules stamping, so it was trained on the rules as written — but \
+                 this run plays {}, which is a modded ruleset. Refused.\n  Train an agent on \
+                 these rules first; `--init-from` warm-starts from an unstamped checkpoint, \
+                 which is exactly what it is for.",
+                self.agent,
+                config.rules_label(),
+            ),
+        }
+    }
+
+    fn gate_warning(&self, config: &GameConfig) -> String {
+        format!(
+            "warning: {} was trained on {}, not {}. Scored anyway, because --warm-start-gate \
+             says this is a training run's own gate or reference panel, where a warm-started \
+             incumbent plays rules it was not trained on until a candidate replaces it.",
+            self.agent,
+            self.trained_on.as_deref().unwrap_or("the rules as written (unstamped)"),
+            config.rules_label(),
+        )
+    }
+
+    fn allowed_warning(&self, config: &GameConfig) -> String {
+        format!(
+            "warning: {} was trained on {}, not {}. Played anyway, because \
+             --allow-cross-ruleset asks for it as a control; the corpus records this and the \
+             document flags it.",
+            self.agent,
+            self.trained_on.as_deref().unwrap_or("the rules as written (unstamped)"),
+            config.rules_label(),
+        )
+    }
+}
+
+/// Every agent in `roster` whose checkpoint was trained on a different game than `config`.
+///
+/// An unstamped checkpoint under the canonical rules is not a mismatch but cannot be
+/// verified either, and gets a warning printed here rather than a place in the list.
+fn cross_ruleset_mismatches(
+    roster: &[AgentSpec],
+    config: &GameConfig,
+) -> Result<Vec<RulesMismatch>, String> {
     let want = config.rules_hash();
+    let mut out = Vec::new();
     for spec in roster {
         let Some(path) = spec.checkpoint() else {
             continue;
         };
         let stamped = duel52_engine::nn::Weights::stamped_rules(std::path::Path::new(path))?;
         match stamped {
-            Some((name, hash)) if hash != want => {
-                return Err(format!(
-                    "{} was trained on rules {name}/{hash:016x}, but this run plays {} — a \
-                     score between the two would not mean anything, so it is refused rather \
-                     than printed.\n  Train an agent on these rules, or run the measurement \
-                     under the rules the agent was trained on.",
-                    spec.name(),
-                    config.rules_label(),
-                ));
-            }
+            Some((name, hash)) if hash != want => out.push(RulesMismatch {
+                agent: spec.name(),
+                trained_on: Some(format!("{name}/{hash:016x}")),
+            }),
             Some(_) => {}
             // An **unstamped** checkpoint carries no ruleset at all — the four shipped ones
             // predate the field. Two cases, and they deserve different answers:
             None if !config.is_canonical_rules() => {
                 // It certainly was not trained on a mod, because no mod could be expressed
                 // when it was written. This is a definite mismatch.
-                return Err(format!(
-                    "{} predates rules stamping, so it was trained on the rules as written — \
-                     but this run plays {}, which is a modded ruleset. Refused.\n  Train an \
-                     agent on these rules first; `--init-from` warm-starts from an unstamped \
-                     checkpoint, which is exactly what it is for.",
-                    spec.name(),
-                    config.rules_label(),
-                ));
+                out.push(RulesMismatch {
+                    agent: spec.name(),
+                    trained_on: None,
+                });
             }
             None => {
                 // Canonical rules, but for *which variant* is unknowable — and this is the
@@ -993,7 +1090,7 @@ fn refuse_cross_ruleset(roster: &[AgentSpec], config: &GameConfig) -> Result<(),
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn cmd_ladder(args: &[String]) -> Result<(), String> {
@@ -1055,13 +1152,23 @@ fn cmd_ladder(args: &[String]) -> Result<(), String> {
 /// ladder, which is the comparison worth running if you did not say.
 fn cmd_match(args: &[String]) -> Result<(), String> {
     let (journal, args) = take_journal_flag(args)?;
+    // Taken out here, before `parse_options`, so every other command still rejects it as an
+    // unknown option. See `refuse_cross_ruleset`.
+    let warm_start_gate = args.iter().any(|a| a == "--warm-start-gate");
+    let args: Vec<String> = args.into_iter().filter(|a| a != "--warm-start-gate").collect();
     let opts = parse_options(&args)?;
     let a = opts.agent_a.clone().unwrap_or(AgentSpec::Ismcts {
         iterations: duel52_engine::IsmctsAgent::DEFAULT_ITERATIONS,
     });
     let b = opts.agent_b.clone().unwrap_or(AgentSpec::Random);
     let games = opts.games_or(400);
-    refuse_cross_ruleset(&[a.clone(), b.clone()], &opts.config)?;
+    if warm_start_gate {
+        for mismatch in cross_ruleset_mismatches(&[a.clone(), b.clone()], &opts.config)? {
+            eprintln!("{}", mismatch.gate_warning(&opts.config));
+        }
+    } else {
+        refuse_cross_ruleset(&[a.clone(), b.clone()], &opts.config)?;
+    }
 
     let result = match journal {
         Some(path) => ladder::run_match_journaled(
@@ -1250,6 +1357,7 @@ fn cmd_analyze(args: &[String]) -> Result<(), String> {
     let mut out_dir: Option<String> = None;
     let mut dataset_override: Option<String> = None;
     let mut force = false;
+    let mut allow_cross_ruleset = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1257,6 +1365,7 @@ fn cmd_analyze(args: &[String]) -> Result<(), String> {
             "--out" => out_dir = Some(next_value(args, &mut i, "--out")?),
             "--dataset" => dataset_override = Some(next_value(args, &mut i, "--dataset")?),
             "--force" => force = true,
+            "--allow-cross-ruleset" => allow_cross_ruleset = true,
             other => rest.push(other.to_string()),
         }
         i += 1;
@@ -1264,7 +1373,7 @@ fn cmd_analyze(args: &[String]) -> Result<(), String> {
     let opts = parse_options(&rest)?;
     let roster = opts.roster();
     let games = opts.games_or(2000);
-    refuse_cross_ruleset(&roster, &opts.config)?;
+    refuse_cross_ruleset_unless(&roster, &opts.config, allow_cross_ruleset)?;
 
     let root = PathBuf::from(out_dir.unwrap_or_else(|| "analysis".to_string()));
     let dataset = match dataset_override {

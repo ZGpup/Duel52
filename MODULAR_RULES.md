@@ -90,7 +90,8 @@ damage, healing, flipping, freezing, drawing, moving, or a sub-decision that pic
 layout change. Warm-starts from the current champion.
 
 In the tree: `ThreeTrapVengeance1` (the Trap also damages its killer),
-`EightRetaliateOnSurvival`, and the `ThreeNone` / `EightNone` ablations.
+`EightRetaliateOnSurvival`, `TwoBlast1` and `FourBomb` (face-down traps on the 2 and 4), and
+the `ThreeNone` / `EightNone` ablations.
 
 **A number inside a shape gets its own name, not a config knob** — see §5a.
 
@@ -139,6 +140,16 @@ finite is `DamageSource::attackers()` returning **empty** for non-attack damage:
 damage is `Vengeance`, not `Attack`, so it cannot be retaliated against and cannot start a
 second cascade. `MAX_CASCADE = 512` is a backstop that asserts, not a mechanism anyone relies
 on.
+
+**The 2's Blast does chain, and a different argument ends it.** `TwoBlast1` hits every enemy
+card in its lane, face-down ones included, so it can spring a 3, set off a 4's Bomb, or kill
+a face-down enemy 2 whose blast comes back. `attackers()` does not stop that, because the
+blast is not aimed at an attacker. What does is a counting argument that covers every death
+trigger in the tree: each one fires only on a **face-down** card, and afterwards the card has
+left play (2, 4) or turned face-up (3). Nothing turns a card face-down again (`game_rules.md`
+§7), so each card fires at most once and a cascade is bounded by the cards on the board. A
+future death trigger that fires **face-up**, or a power that turns a card face-down, breaks
+this, and the ply-cap invariant in §8 is what would catch it.
 
 ### 3b. The 8 is the better argument for card modules than the 3 is
 
@@ -305,7 +316,7 @@ and not `encoding_slots`, which sizes a tensor rather than changing the game.
 
 | | moves when | checked by |
 |---|---|---|
-| `rules_hash` | the *game* changes | `Shard::read`, `ladder`, `match`, `probe`, `card-value`, the Python replay buffer |
+| `rules_hash` | the *game* changes | `Shard::read`, `ladder`, `match`, `probe`, `card-value`, `analyze`, the Python replay buffer |
 | `obs_layout_hash` / `action_layout_hash` | the *tensors* change | `Weights::load`, `Shard::read` |
 
 Almost every ruleset moves the first and not the second. That is exactly what makes warm
@@ -316,14 +327,31 @@ indistinguishable on shape alone**, which is why `rules_hash` has to exist as a 
 every warm-started run is legitimately cross-ruleset. It is checked wherever a cross-ruleset
 number would be read *as a result*.
 
+⚠️ **The training loop's gate and reference panel go through `duel52 match`**, and a
+warm-started incumbent is a checkpoint trained on other rules until a candidate replaces it.
+Until 2026-09-14 that meant every warm start into a modded ruleset was refused while scoring
+its baseline, before generation 1. `runs/mod-three-vengeance` holds exactly what that failure
+leaves: an incumbent byte-identical to lane-gen032, no shards and no log. `match --warm-start-gate` downgrades the refusal to a warning, and the loop passes it
+for warm-started runs only. The alternative, re-stamping the copied checkpoint with the run's
+rules, was rejected: a run that never promoted a candidate would leave an incumbent claiming
+rules it was never trained on, which is the exact failure this section exists to prevent.
+
 ⚠️ **An unstamped checkpoint cannot be judged.** The four pre-2026-09-09 checkpoints carry no
 rules stamp. Under a modded ruleset they are **refused**; under canonical they are accepted
 with a loud warning, because "probably canonical" is an inference and the whole point of the
 mechanism is not to make one.
 
-**Cross-ruleset play is a hazard, not an experiment.** There is no case in this project where
-playing an agent under rules it was not trained on answers a question, so every check above is
-a refusal or a warning rather than a mode.
+**Cross-ruleset play is a hazard by default, and an experiment only when named.** Every check
+above is a refusal or a warning rather than a mode, with one deliberate exception added on
+2026-09-14: `analyze` and `card-value` take `--allow-cross-ruleset`, for a **control column**.
+The question it answers is the one a rules experiment raises first — did the fine-tuned agent
+learn the mod, or just get stronger? — and it needs the checkpoint the run warm-started from
+playing the new rules beside it (`analysis/two-blast-four-bomb-256` is the first). It cannot
+pass for a same-rules result: `meta.json` records `trained_on` and `cross_ruleset`, the
+document's header names the control column and the provenance table marks it ⚠️, and a
+card-value run for that column inherits the permission from the corpus rather than from a
+flag someone has to remember. `ladder`, `match` and `probe` have no such flag, because a score
+between two agents on different footings is exactly the number the refusal exists to stop.
 
 ---
 

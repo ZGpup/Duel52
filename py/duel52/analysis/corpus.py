@@ -155,6 +155,19 @@ class Corpus:
         return f"{stem}{budget}"
 
     @property
+    def trained_on(self) -> Optional[str]:
+        """The ruleset the checkpoint was stamped with, ``"unstamped"``, or ``None`` for an
+        agent with no checkpoint or a corpus written before the field existed."""
+        return self.meta.get("trained_on")
+
+    @property
+    def cross_ruleset(self) -> bool:
+        """Whether this agent played rules it was not trained on — a control column, written
+        by ``duel52 analyze --allow-cross-ruleset``. Any chunk is enough: a column that is
+        partly cross-ruleset is a cross-ruleset column."""
+        return any(chunk.meta.get("cross_ruleset", False) for chunk in self.chunks)
+
+    @property
     def ranks(self) -> List[str]:
         return list(self.meta["ranks"])
 
