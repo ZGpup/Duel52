@@ -44,6 +44,9 @@ venv/
 # Working notes. Read-and-argue-with documents that nothing is held to; the tracked docs are
 # PLAN.md, FINDINGS.md, game_rules.md and README.md.
 /ALGORITHM_EXPLANATION.md
+/RENTING.md
+/MODULAR_RULES.md
+
 
 # macOS
 .DS_Store
