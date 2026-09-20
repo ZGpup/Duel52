@@ -15,8 +15,7 @@ the instrument.
 | `analysis/<variant>.md`, `.html` | The comparison document: the same measurements for every agent, side by side, with almost no prose. Regenerated in seconds from the corpora by `python -m duel52.analysis`, so it is never edited by hand. `FINDINGS.md` is where a number from it becomes a claim. |
 | `README.md` | The public front door, and where `duel52 replay` is documented. |
 | `RENTING.md` | How to rent a box and run `PLAN.md` item 7 on it, written for someone who has never rented one. Provider choice, the two ways to lose the run, and the Stage 1 measurements. |
-| `MODULAR_RULES.md` | **The rules-mod system.** Where rules live, the three tiers a change falls into, and what each costs. Read §2 before pricing any rule change and §6 before trusting any number. |
-| `configs/rules/README.md` | The ruleset registry. How to add one, and the four things to run before it earns a training run. |
+| `configs/rules/README.md` | **The rules-mod system**, and the ruleset registry. Where rules live, the three tiers a change falls into and what each costs, provenance, the encoder reserve, and the four things to run before a ruleset earns a training run. Read the tiers before pricing any rule change and "Provenance" before trusting any number. |
 | `CLAUDE.md` | This file. Commands, architecture, and the traps. |
 | `archive/` | The superseded working docs, frozen 2026-09-05 and not maintained. |
 
@@ -26,6 +25,11 @@ source comments still cite `DESIGN.md §N`; those section numbers are unchanged 
 section below, so read that first and only open the archive for the rationale behind a
 decision. `OPEN_QUESTIONS.md` was archived because it closed: every rules question raised for
 this project has been answered and ported into `game_rules.md`.
+
+⚠️ **`MODULAR_RULES.md` stopped being tracked on 2026-09-18.** Roughly 100 source comments cite
+`MODULAR_RULES.md §N`. What still binds was ported into `configs/rules/README.md` and the
+Architecture section below, and that README's "Old section numbers" table maps each `§N` to
+where it went.
 
 ## Facts that are easy to get wrong
 
@@ -90,7 +94,7 @@ Read `game_rules.md` before touching engine code. These six trip people up:
 # Build. The Cargo workspace root is the repo root; `cargo` alone works on the engine only,
 # so the everyday loop does not pay for compiling PyO3.
 cargo build --release                    # engine + the `duel52` CLI
-cargo test                               # 439 tests: rules, determinism, information hiding,
+cargo test                               # 440 tests: rules, determinism, information hiding,
                                          # the Phase 3 encoding path, the lane symmetry, the
                                          # training corpus, the modded power variants, the
                                          # cross-ruleset invariant suite, the encoder reserve
@@ -140,7 +144,7 @@ cargo test                               # 439 tests: rules, determinism, inform
 ./target/release/duel52 stats --all --games 200000 --seed 1 --markdown
 ./target/release/duel52 config configs/split.toml          # validate a config file
 
-# Rules mods (MODULAR_RULES.md). A ruleset is a file in configs/rules/ and nothing else —
+# Rules mods (configs/rules/README.md). A ruleset is a file in configs/rules/ and nothing else —
 # that directory IS the registry, and engine/tests/rulesets.rs enumerates it, so a new file
 # is covered by every structural invariant the moment it exists.
 ./target/release/duel52 config configs/rules/three-vengeance-1.toml   # resolve + rules_hash
@@ -176,7 +180,7 @@ cargo test --test rules_mods                               # the named tests for
     --run-dir runs/mod-three-vengeance --init-from models/duel52-split-lane-gen032.d52nn
 
 # ⚠️ **Three rulesets DO move it** — `seven-shield`, `king-any-lane` and `two-choose`, which
-# claim the **encoder reserve** (`MODULAR_RULES.md` §7): a per-card status flag, a new kind of
+# claim the **encoder reserve** (`configs/rules/README.md`): a per-card status flag, a new kind of
 # sub-decision, or a lane/option target. They share ONE extended layout between them, so the
 # break is paid once however many more arrive. `duel52 config <file>` prints
 # `reserve status_flags=8 phases=5` for those and nothing for the others.
@@ -245,7 +249,7 @@ netmcts:models/duel52-32c-24h-best.d52nn@64
 # `analyze` refuses a checkpoint trained on other rules; `--allow-cross-ruleset` makes that a
 # warning, records `cross_ruleset` in meta.json, and the document flags the column in its
 # header and provenance table. `ladder`, `match` and `probe` have no such flag, on purpose
-# (MODULAR_RULES.md §6).
+# (configs/rules/README.md, "Provenance").
 .venv/bin/python -m duel52.analysis \
     --config configs/rules/two-blast-four-bomb.toml --dataset two-blast-four-bomb-256 \
     --agents netmcts:models/duel52-split-lane-gen032.d52nn@256,\
@@ -585,7 +589,7 @@ There is **no `PASS` block**, and every logit is therefore something a player ch
 what makes a policy target a distribution over choices rather than a mixture of choices and
 bookkeeping.
 
-A ruleset that claims the **encoder reserve** (`MODULAR_RULES.md` §7) appends two more blocks
+A ruleset that claims the **encoder reserve** (`configs/rules/README.md`) appends two more blocks
 — `CHOOSE_LANE(side, lane)` at `2·L` and `CHOOSE_OPTION(k)` at 4 — for 1334 at `S = 16`.
 Appended, never inserted, which is what keeps the base head an exact prefix of the extended
 one and makes `nn widen` a scatter rather than a re-derivation.
@@ -639,7 +643,7 @@ clock evaluating itself. `configs/train-12h.toml` targets 55–60% and says how 
 | `MOVE` | A Queen's Move: pull an allied card from another lane into hers |
 | `PEEK` | A 4's Foresight: look privately at one face-down card, either side's |
 | `BACK` | A 2's View: bottom a card from hand (house rule) or discard it, per `two_power` |
-| `LANE` | Choose a lane. Reserve rulesets only (`MODULAR_RULES.md` §7) |
+| `LANE` | Choose a lane. Reserve rulesets only (`configs/rules/README.md`) |
 | `OPT` | Choose one of a power's options. Reserve rulesets only |
 
 Numbering (`#1`, `#2`, …) is `display.rs`'s `column_slots` order, the same order the board
@@ -705,6 +709,22 @@ Three structural points that are easy to undo by accident:
   `retaliate_mode()`. `live_power` returns `None` for a face-down card, which is `game_rules.md`
   §6's "powers are inert while face-down" made structural rather than remembered. A
   `rank == Rank::EIGHT` in `state.rs` or `apply.rs` is a bug: it silently ignores the ruleset.
+  Inside `powers/`, **no match carries a `_ =>` arm**, so a new `PowerId` variant is a compile
+  error everywhere it is not handled. And **a variant carries no data**: a number that varies
+  within a power's shape gets a second *name* (`ThreeTrapVengeance1`, `ThreeTrapVengeance2`),
+  never a config key that only applies under another key's value — `from_config_str` cannot
+  reject such a key when it is inapplicable, and an inert-but-hashed key gives two descriptions
+  of one game different `rules_hash`es.
+
+- **Damage is a FIFO queue, and a cascade is finite for two specific reasons.**
+  `enqueue_damage` / `drain_damage` in `apply.rs`, with `DamageSource` in `damage.rs`; a death
+  trigger's damage lands after everything already in flight. Recursion here dropped the second
+  of two vengeance 3s hit by one Twinstrike. Retaliation cannot chain because
+  `DamageSource::attackers()` is empty for non-attack damage. Death triggers can chain (the 2's
+  Blast does), and what bounds them is that every one fires only on a **face-down** card, which
+  then leaves play or turns face-up, and nothing turns a card face-down again. ⚠️ A death trigger
+  that fires face-up, or a power that turns a card face-down, breaks that bound; `MAX_CASCADE` is
+  a backstop, and `rulesets.rs`'s ply-cap invariant is what catches it.
 
 - **`rules_hash` is not `obs_layout_hash`, and the difference is the point.** The encoder is
   rank-agnostic, so **changing what a card does moves no layout hash** — that is what lets
@@ -713,11 +733,16 @@ Three structural points that are easy to undo by accident:
   shape alone*, which is why `rules_hash` exists. It is checked where a cross-ruleset number
   would be read as a result — `Shard::read`, `ladder`, `match`, `probe`, `card-value`, and the
   Python replay buffer — and deliberately **not** in `Weights::load`, because generation 1 of
-  every warm-started run is legitimately cross-ruleset. `MODULAR_RULES.md` §6.
+  every warm-started run is legitimately cross-ruleset. The same reason is why the loop passes
+  `match --warm-start-gate` to a warm-started run's gate and panel: the incumbent is the copied
+  checkpoint until a candidate replaces it, and without the flag every modded warm start died
+  scoring its baseline. ⚠️ **None of the six checkpoints in `models/` carries a rules stamp**, so
+  they are refused under a modded ruleset and accepted with a warning under canonical.
+  `configs/rules/README.md`, "Provenance".
 
 - **There are exactly two encoder layouts, and which one a ruleset gets is derived from its
   powers.** `GameConfig::extended_encoder()` is true when some installed power claims the
-  **encoder reserve** (`MODULAR_RULES.md` §7): a per-card status flag, one of the five spare
+  **encoder reserve** (`configs/rules/README.md`): a per-card status flag, one of the five spare
   `phase_onehot` positions, or the `CHOOSE_LANE` / `CHOOSE_OPTION` policy blocks. Everything
   the reserve adds keys off that one predicate, so:
   - **the canonical layout is byte-identical to the pre-reserve build** — `obs b1355a841a1fdc4a`
@@ -732,7 +757,11 @@ Three structural points that are easy to undo by accident:
   power but forgot to set a key would write a status nobody encodes, and the network would
   simply never learn the mechanic. `reserve_declaration_matches_what_each_power_uses` is what
   makes that unrepresentable — it requires each power's `needs_extended_encoder()` to be an
-  `==` with what the power actually uses, not merely to imply it.
+  `==` with what the power actually uses, not merely to imply it. ⚠️ The other silent failure:
+  `CHOOSE_LANE` is lane-indexed, so `encode::action_permutation` must relabel it. A table that
+  left it fixed would still be a bijection composing as S₃ and pass every structural test,
+  while the lane network routed one lane's logit through another's weights —
+  `reserve_lane_permutations_relabel_choose_lane` is the guard.
 
 - **There is exactly one encoder, and it is in Rust.** `engine/src/encode.rs` owns the
   feature layout; Python reaches it through `Game.encode_observation()` and gets its

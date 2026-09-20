@@ -543,6 +543,35 @@ fn mod_two_blast_chains_back_across_the_lane() {
     assert_eq!(damage_at(&s, 0, P1, 0), 1, "and P1's 7 took the second");
 }
 
+/// A 10 that twinstrikes a face-down 2 and a face-down 3, each one hit from dead: the 3
+/// springs, the 2 dies, and the 2's blast hits the 10. Taken in both split orders, because
+/// the two halves land one after the other through the damage queue.
+#[test]
+fn mod_two_blast_hits_a_ten_that_twinstrikes_it_alongside_a_trap() {
+    for two_first in [true, false] {
+        let mut p = Position::new(death_traps());
+        p.face_up(0, P0, Rank::TEN);
+        let (first, second) = if two_first {
+            (Rank::TWO, Rank::THREE)
+        } else {
+            (Rank::THREE, Rank::TWO)
+        };
+        p.face_down(0, P1, first);
+        p.face_down(0, P1, second);
+        p.damage(0, P1, 0, 1);
+        p.damage(0, P1, 1, 1);
+        let mut s = p.build();
+
+        go(&mut s, atk(0, 0));
+        go(&mut s, Action::SplitTarget { slot: 1 });
+
+        assert_eq!(discard_ranks(&s, P1), vec![Rank::TWO], "the 2 died (two_first = {two_first})");
+        assert_eq!(ranks_in(&s, 0, P1), vec![Rank::THREE]);
+        assert!(card_at(&s, 0, P1, 0).face_up, "the 3's Trap sprang");
+        assert_eq!(damage_at(&s, 0, P0, 0), 1, "the 2's blast hit the 10 (two_first = {two_first})");
+    }
+}
+
 /// A Bomb caught in a Blast has no killer to take with it: the 2 has already left play, and
 /// a blast is not an attack. The bystander on the 2's side is untouched.
 #[test]
