@@ -248,7 +248,7 @@ the ± is the error on the comparison between cards.
 
 Measured on `lane-gen032`, 400 positions, canonical rules: the Ace leads at **+3.50 ± 0.14**
 and the 4 trails at **−3.83 ± 0.13**, a spread of **7.33 points**. Full table in
-`MODULAR_RULES.md` §10.
+`configs/rules/README.md`, "What a card is worth".
 
 **In hand, not on the board, and the difference decides the answer.** The first implementation
 put the card face-up in a lane. Its top four came out 8, J, 10, 9 — exactly the four constant
@@ -338,7 +338,7 @@ $ ./target/release/duel52 match --a netmcts:models/duel52-split-lane-gen032.d52n
 
 The conclusion above survives — a *fair* comparison still needs a run per variant, because an
 agent trained on one variant is not the meta of another. The mechanism does not. What actually
-stops the two from being confused is `rules_hash` (`MODULAR_RULES.md` §6), added on the
+stops the two from being confused is `rules_hash` (`configs/rules/README.md`, "Provenance"), added on the
 `ruleset-configs` branch; before that there was nothing.
 
 Worth doing anyway, because the split deck variant is a house rule that the regular player

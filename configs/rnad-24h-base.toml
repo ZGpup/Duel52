@@ -1,0 +1,65 @@
+# PLAN.md item 8: R-NaD for **24 hours on one 40 GB GPU**, **base (shared-deck) rules**.
+# `run-plans/2026-09-29.md` is the operational side (slurm job 31).
+#
+#   .venv/bin/python -m duel52.rnad check --config configs/rnad-24h-base.toml
+#   .venv/bin/python -m duel52.rnad bench --config configs/rnad-24h-base.toml --steps 5
+#   .venv/bin/python -m duel52.rnad run   --config configs/rnad-24h-base.toml --run-dir runs/rnad-24h-base
+#
+# **This is `configs/rnad-24h.toml` with the game changed.** Read it, and through it
+# `rnad-3h.toml`. Three lines moved:
+#
+#   1. `rules_file = "configs/rules/base.toml"`: the shared deck, stamped `base-2026-09`.
+#   2. `encoding_slots = 34`, **not 21, and forced.** The base deck's legality bound is 34, and
+#      the encoder asserts rather than truncating. `configs/train-24h-32c-base.toml` has the
+#      argument. It matches the base-rules AlphaZero run, so their checkpoints can be put
+#      in one analysis document.
+#   3. `seed`, a block of its own.
+#
+# ## Memory at 34 slots
+#
+# `obs_dim` goes 4290 → 6864 and `action_dim` 2194 → 5509. The per-position tensors are what a
+# step holds, and learning spends its time on `[positions × action_dim]` policy tensors. So
+# expect ~2.5x the canonical run's memory: **~15–20 GB peak, inside 40 GB** [ASSUMED].
+# Learning should also be up to ~2x slower per step, so this run takes fewer steps than the
+# canonical one. `bench` prints the count. Read its projection against the header of
+# `rnad-24h.toml`: leave the schedule alone between ~20,000 and ~50,000 steps, and otherwise
+# copy the pair it suggests. If the step does not fit, set `learner_chunk = 12000`.
+# Gradients accumulate exactly, so that changes speed only.
+
+[game]
+rules_file = "configs/rules/base.toml"
+encoding_slots = 34
+stalemate_value = 0.0
+
+[net]
+arch = "lane"
+width = 128
+blocks = 6
+value_hidden = 128
+
+[rnad]
+device = "auto"
+batch_games = 256
+learner_chunk = 0
+entropy_schedule_size = [3000]
+entropy_schedule_repeats = [1]
+target_network_avg = 0.0033
+learning_rate = 5e-4
+eta_reward_transform = 0.2
+adam_b1 = 0.0
+adam_b2 = 0.999
+adam_eps = 1e-7
+nerd_beta = 2.0
+nerd_clip = 10000.0
+c_vtrace = 1.0
+
+[run]
+hours = 24.0
+# 80,000,000+: clear of rnad-24h.toml's 60M block with room for ~78,000 steps.
+seed = 80000000
+threads = 0
+log_every = 10
+eval_every = 1500
+eval_games = 1000
+eval_opponents = ["random", "greedy"]
+save_every_secs = 300.0

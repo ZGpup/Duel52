@@ -1,0 +1,82 @@
+# PLAN.md item 8: R-NaD for **24 hours on one 40 GB GPU**, canonical (split-deck) rules.
+# `run-plans/2026-09-29.md` is the operational side (slurm job 30).
+#
+#   .venv/bin/python -m duel52.rnad check --config configs/rnad-24h.toml   # must say device cuda
+#   .venv/bin/python -m duel52.rnad bench --config configs/rnad-24h.toml --steps 5
+#   .venv/bin/python -m duel52.rnad run   --config configs/rnad-24h.toml --run-dir runs/rnad-24h-canonical
+#
+# **This is `configs/rnad-3h.toml` at eight times the clock.** Read that file for every learner
+# setting. The learner settings (η, Adam, NeuRD, V-trace, the learning rate, 256 games a step)
+# are all unchanged here. **Four things moved:**
+#
+#   1. `[net].blocks` — **6, not 3.** It is the `128 x 6` trunk of `32c-24h-best` and the
+#      base-rules AlphaZero run, so an R-NaD agent and an AlphaZero agent can be compared at
+#      equal capacity. A 3-hour run could not afford it. 24 hours can. [ASSUMED]
+#   2. `entropy_schedule_size` / `target_network_avg` — re-sized to the steps 24 h buys. See
+#      `[rnad]`.
+#   3. `eval_every`, which follows the schedule.
+#   4. `[run]` — 24 h and a fresh seed block.
+#
+# ## The step-count estimate, and why `bench` still decides
+#
+# The laptop measured 3.2 s a step at `128 x 3` (1.1 s acting, 2.0 s learning, MPS).
+# `rnad-3h.toml` estimated ~1.5 s on an H100. A 40 GB card (an A100-40GB, say) has about half
+# an H100's memory bandwidth, and learning is bandwidth work. Doubling the depth roughly
+# doubles both halves: acting pays a launch toll per layer per tick, and learning pays per
+# layer per position. **Estimate ~2.5–3 s a step, so ~29,000–35,000 steps in 24 h.** [ASSUMED]
+#
+# `bench` runs at the top of the slurm job and prints the real figure. **If it projects
+# between ~20,000 and ~50,000 steps, leave this file alone**: that is 7 to 17 regularisation
+# updates, all of them fine. Outside that range, copy the `entropy_schedule_size` and
+# `target_network_avg` it prints on its last line.
+#
+# ⚠️ **The two move together.** `rnad-3h.toml` explains why. Shrinking the schedule without
+# raising the target average pins the regularisation policy to the random init.
+
+[game]
+variant = "split"
+encoding_slots = 21
+stalemate_value = 0.0
+
+[net]
+arch = "lane"
+width = 128
+# Changed from 3. See the header.
+blocks = 6
+value_hidden = 128
+
+[rnad]
+device = "auto"
+# Unchanged from rnad-3h.toml. It peaked at 6.0 GB at 128 x 3 (measured on the CPU), so this
+# is ~8 GB at 6 blocks, a fifth of the card. rnad-3h.toml explains why more games per step is
+# not the better use of a big card.
+batch_games = 256
+learner_chunk = 0
+# ~10–12 updates over the ~32,000 steps estimated above. [ASSUMED] `bench` confirms it.
+entropy_schedule_size = [3000]
+entropy_schedule_repeats = [1]
+# τ·size = 10, as in rnad-3h.toml and on the laptop.
+target_network_avg = 0.0033
+learning_rate = 5e-4
+eta_reward_transform = 0.2
+adam_b1 = 0.0
+adam_b2 = 0.999
+adam_eps = 1e-7
+nerd_beta = 2.0
+nerd_clip = 10000.0
+c_vtrace = 1.0
+
+[run]
+# Cumulative across every resume, unlike the AlphaZero loop's `hours`.
+hours = 24.0
+# A fresh block. Step n plays seeds seed + n·256, so ~35,000 steps spans 60,000,000–69,000,000.
+# The AlphaZero runs use 1M–8M, 10M, 20M, 30M, 40M (mod-traps) and 50M (base), and the base
+# R-NaD run uses 80M.
+seed = 60000000
+threads = 0
+log_every = 10
+# Half the schedule size, so every other evaluation lands right after a regularisation update.
+eval_every = 1500
+eval_games = 1000
+eval_opponents = ["random", "greedy"]
+save_every_secs = 300.0

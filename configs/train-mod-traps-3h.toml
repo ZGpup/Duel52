@@ -1,0 +1,149 @@
+# Fine-tune lane-gen032 on `two-blast-four-bomb`: the 2 and the 4 become face-down traps.
+#
+#   .venv/bin/python -m duel52.train check --config configs/train-mod-traps-3h.toml
+#   .venv/bin/python -m duel52.train run --config configs/train-mod-traps-3h.toml \
+#       --run-dir runs/mod-traps --init-from models/duel52-split-lane-gen032.d52nn
+#   # stopped? add --resume (and drop --init-from) to carry on inside the same generation
+#
+# **This is `train-mod-3h.toml` with two lines changed**: `rules_file` and the seed block.
+# The trunk, search budget, generation size, LR schedule and gate are that file's, and so is
+# the reasoning behind each. Read its header for why a rules experiment is a three-hour warm
+# start and why generation 1 is legitimately cross-ruleset. Nothing here re-derives it.
+#
+# The ruleset is Tier 2 (`MODULAR_RULES.md` §2): two named power variants and no encoder
+# change, so lane-gen032 loads as it is. Verified with `duel52 config`:
+#
+#   two-blast-four-bomb  rules e108e420b08c8675  layout: base (no reserve)
+#
+# ============================================================================
+# The question, and how to read the answer
+# ============================================================================
+#
+# **Does behaviour change?** Three measurements, each run once on the baseline and once on
+# this run's output. The baseline is lane-gen032 under canonical rules; the candidate is
+# `runs/mod-traps/checkpoints/best.d52nn` under this ruleset. Use the same flags for both.
+#
+#   1. **The analysis document**: flip timing, flip rate by rank, card fates, lane and attack
+#      shape, side by side. `analysis/split-64/` already holds lane-gen032 at 64 sims, so
+#      the candidate needs only its own corpus at the same budget. ⚠️ Name the dataset.
+#      Otherwise it defaults to the variant's name, `split`, and the reader refuses to mix
+#      rules hashes in one document.
+#
+#        .venv/bin/python -m duel52.analysis \
+#            --config configs/rules/two-blast-four-bomb.toml --dataset traps-64 \
+#            --agents netmcts:runs/mod-traps/checkpoints/best.d52nn@64 \
+#            --games 2000 --chunk 250 --encoding-slots 21 --eval-batch 32
+#
+#      Under this ruleset, the "killed face-down" fate for a 2 or a 4 means it went off. The
+#      prose in the "deaths" section still says a face-down death means the power did
+#      nothing, which is true only of the canonical rules.
+#
+#   2. **Card value**, in hand. Canonically the 2 is at −2.99 and the 4 at −3.83, the two
+#      worst cards in the game (`MODULAR_RULES.md` §10). Read the CONTROL line first.
+#
+#        ./target/release/duel52 card-value --encoding-slots 21 --games 400 \
+#            --config configs/rules/two-blast-four-bomb.toml \
+#            --checkpoint runs/mod-traps/checkpoints/best.d52nn
+#
+#   3. **`probe`**, for per-rank flip rates and death triggers per game. Keep `random` in the
+#      roster for scale.
+#
+#        ./target/release/duel52 probe --games 400 --markdown --seed 1 --encoding-slots 21 \
+#            --config configs/rules/two-blast-four-bomb.toml \
+#            --agents netmcts:runs/mod-traps/checkpoints/best.d52nn@256,random
+#
+# Predictions, written down before the run so the result can contradict them:
+#
+#   - **2s and 4s are flipped far less often.** Their value is now in staying hidden, the
+#     way a 3's is. A 2 or 4 still flipped at the canonical rate means the net has not
+#     re-learned what those ranks do.
+#   - **Fewer attacks on face-down cards**, and the ones still made come from cheap bodies
+#     rather than a Jack or a pair, because the Bomb takes the whole attacker.
+#   - **Card value for 2 and 4 rises** off the bottom of the table.
+#
+# ⚠️ **Two limits on what this can show.**
+#
+#   - **A rules change is confounded with three more hours of training.** Whatever moves
+#     between lane-gen032 and this run's output moved for both reasons. The clean control is
+#     this file with `rules_file = "configs/rules/canonical.toml"` and its own seed block,
+#     run for the same three hours. That costs another three hours and is worth it only if a
+#     change here turns out to matter.
+#   - **An unchanged behaviour is weak evidence.** The net starts out believing a 2 draws a
+#     card and a 4 peeks. Three hours may not be enough to unlearn that, so a move is a
+#     result and the absence of one is not, yet.
+
+[game]
+# The only rules line. The ruleset's own `variant` key picks the deck (it includes
+# `canonical.toml`, so: split).
+rules_file = "configs/rules/two-blast-four-bomb.toml"
+
+encoding_slots = 21               # FINDINGS.md F3.1; must match lane-gen032's header
+stalemate_value = 0.0             # FINDINGS.md F3.6
+
+[net]
+# Pinned by the warm start: lane-gen032 is lane 128 x 3, and `--init-from` refuses a
+# checkpoint whose trunk disagrees with these.
+arch = "lane"
+width = 128
+blocks = 3
+value_hidden = 128
+
+[selfplay]
+games = 2000
+sims = 256
+c_puct = 1.25
+full_search_fraction = 0.25
+cap_sims = 32
+
+dirichlet_alpha = 0.3
+dirichlet_weight = 0.25
+temperature = 1.0
+temperature_decisions = 24
+
+[train]
+device = "auto"
+batch_size = 512
+lane_augment = false              # a no-op on the lane-equivariant net
+
+epochs_per_generation = 0.9
+steps_per_generation = 600
+
+lr = 2.0e-3
+weight_decay = 1.0e-4
+value_weight = 1.0
+grad_clip = 1.0
+
+lr_schedule = [[0, 1.0], [5, 0.25], [8, 0.0625]]
+
+sample_stride = 2
+buffer_generations = 4
+buffer_samples = 700000
+holdout_samples = 8000
+
+[gate]
+games = 300
+threshold = 0.52
+min_decisive = 30
+sims = 256
+
+# No `netmcts:` row, for the reason `train-mod-3h.toml` gives: every shipped checkpoint was
+# trained on the canonical rules, and the engine refuses that comparison. `random` and
+# `greedy` play any ruleset and are here to catch a collapse, not to measure strength.
+reference = ["random", "greedy"]
+reference_games = 100
+reference_games_saturated = 40
+reference_saturated_at = 0.99
+reference_tolerance = 0.10
+max_consecutive_refusals = 5
+
+[run]
+generations = 20
+hours = 3.0
+
+# A fresh block. 1M-7M, 10M, 20M and 30M are taken by earlier configs and runs. A collision
+# would silently re-deal games a net has already trained on.
+seed = 8000000
+
+threads = 0
+eval_batch = 64
+engine = "./target/release/duel52"

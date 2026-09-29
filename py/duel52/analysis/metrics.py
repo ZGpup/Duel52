@@ -253,10 +253,12 @@ def provenance(corpora: List[Corpus], ctx: Context) -> Section:
         # Summed over chunks, so this is throughput for the whole corpus rather than for
         # whichever chunk happened to be written last.
         rate = meta["games"] / meta["elapsed_secs"] if meta["elapsed_secs"] > 0 else float("inf")
+        trained_on = corpus.trained_on or "—"
         rows.append(
             [
                 corpus.label,
                 corpus.agent,
+                f"⚠️ {trained_on}" if corpus.cross_ruleset else trained_on,
                 f"{corpus.n_games:,}",
                 f"{meta['deals']:,}",
                 f"{len(corpus.chunks)}",
@@ -270,13 +272,16 @@ def provenance(corpora: List[Corpus], ctx: Context) -> Section:
         "Corpora",
         "One agent per column, each playing **itself**. Every corpus in this document was "
         "played under the ruleset named in the header, and the reader refuses to merge two "
-        "that were not. A deal is played twice with the seats swapped, so games = 2 × deals.",
+        "that were not. *Trained on* is the ruleset the checkpoint was stamped with; ⚠️ marks "
+        "a control that played rules it was not trained on "
+        "(`duel52 analyze --allow-cross-ruleset`). A deal is played twice with the seats "
+        "swapped, so games = 2 × deals.",
         [
             Table(
-                ["model", "agent", "games", "deals", "chunks", "card rows", "games/sec",
-                 "cpu time"],
+                ["model", "agent", "trained on", "games", "deals", "chunks", "card rows",
+                 "games/sec", "cpu time"],
                 rows,
-                align=["l", "l", "r", "r", "r", "r", "r", "r"],
+                align=["l", "l", "l", "r", "r", "r", "r", "r", "r"],
             )
         ],
     )
@@ -1026,6 +1031,10 @@ def _card_value_table(corpus: Corpus, ctx: Context) -> Optional[List[List[str]]]
         "1",
         *ctx.engine_args,
     ]
+    # The corpus was played under this permission, so the value head is read under it too —
+    # otherwise the control column silently drops out of this one table.
+    if corpus.cross_ruleset:
+        command.append("--allow-cross-ruleset")
     try:
         done = subprocess.run(command, capture_output=True, text=True, timeout=3600)
     except (OSError, subprocess.TimeoutExpired):

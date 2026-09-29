@@ -26,7 +26,10 @@ cargo build --release
 
 # Play the trained agent. `--encoding-slots 21` is not optional: it is what fixes the
 # size of the observation, and the checkpoint refuses to load against any other value.
-./target/release/duel52 play --encoding-slots 21 \
+# `--config` picks the ruleset. Leaving it off also plays canonical, so it is written out
+# to make it obvious which file to swap for a mod from configs/rules/, such as
+# two-blast-four-bomb.toml.
+./target/release/duel52 play --encoding-slots 21 --config configs/rules/canonical.toml \
     --opponent netmcts:models/duel52-32c-24h-best.d52nn@8192
 ```
 

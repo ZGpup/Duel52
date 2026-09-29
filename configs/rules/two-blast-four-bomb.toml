@@ -1,0 +1,52 @@
+# The 2 and the 4 become face-down traps, like the 3.
+#
+# Canonically the 3 is the only card whose power wants to stay hidden: kill it face-down and
+# it comes back. This ruleset adds two more, each paying off a different way when an enemy
+# kills it face-down:
+#
+#   - **The 2's Blast.** It dies and deals 1 damage to every enemy card in its lane, face-up
+#     or face-down. Base cards are spared until the unlock.
+#   - **The 4's Bomb.** It dies and the attacker that killed it dies too, whatever that
+#     card's hit points. A pair loses both members.
+#
+# Both **replace** the old power rather than adding to it **[ASSUMED]**, so a flipped 2 no
+# longer draws and a flipped 4 no longer peeks. A face-up 2 or 4 is a plain 2-HP card, as a
+# face-up 3 is. `powers/two.rs` and `powers/four.rs` carry the rulings, and
+# `engine/tests/rules_mods.rs` has a named test for each (`mod_two_blast_*`, `mod_four_bomb_*`).
+#
+# Why these two cards
+#
+# They are the two weakest cards in the game. The card-value table (`MODULAR_RULES.md` §10,
+# lane-gen032, canonical rules) has them last and second-to-last in hand: the 4 at −3.83 and
+# the 2 at −2.99 win-probability points. So this is both a test of the trap idea and a way
+# to give the bottom two cards a job.
+#
+# What to watch
+#
+#   - **Attacks on face-down cards should get rarer.** Canonically one rank in thirteen is a
+#     trap. Here it is three in thirteen, and two of those three hurt the attacker. The Trap made attacking a hidden card a gamble; this makes it a gamble you can
+#     lose a card on. If competent play still attacks face-down cards as often as it did, the
+#     agent has not noticed the change.
+#   - **The flip rate for 2s and 4s should collapse** toward the 3's, since their value is
+#     now in staying hidden. The screen's "shyest" column and `probe`'s per-rank flip rates.
+#   - **Cheap attackers should do the probing.** The Bomb costs the attacker its whole body,
+#     so hitting an unknown card with a 2-HP one-shot card that has already fired costs far
+#     less than hitting it with a Jack.
+#   - **Card value for 2 and 4, in hand**, against the −2.99 and −3.83 above.
+#
+# ⚠️ Chains. The Blast is the first death trigger that can reach a **face-down** card, so it
+# can spring a 3, set off a Bomb (which then takes nobody with it) or kill an enemy 2 whose
+# blast comes back. That is finite: every death trigger fires only on a face-down card, and
+# afterwards the card is gone or face-up. `MODULAR_RULES.md` §3a has the argument.
+#
+# Tier 2 (`MODULAR_RULES.md` §2): named power variants, no layout change, so a run
+# warm-starts from lane-gen032. `configs/train-mod-traps-3h.toml` is that run.
+#
+# ⚠️ `two_power` is inert here, as under `two-choose.toml`. The 2 no longer puts a card
+# anywhere.
+
+include = "canonical.toml"
+
+rules_name = "two-blast-four-bomb"
+powers.two = "blast_one_damage"
+powers.four = "bomb"

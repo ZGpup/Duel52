@@ -32,11 +32,15 @@ fn header_fields(bytes: &[u8]) -> Vec<(String, String)> {
 /// in the rewrite of an AlphaZero checkpoint. Older checkpoints legitimately gain the keys
 /// that postdate them — `arch` (gen016/022/031 predate it) and `rules_name`/`rules_hash` —
 /// and that was already true before R-NaD; nothing else may change.
+///
+/// A checkpoint stamped with a non-canonical ruleset (`traps-32c-24h-gen063` is the first) is
+/// rewritten under **that** ruleset, resolved from `configs/rules/<rules_name>.toml`, because
+/// `to_bytes` stamps whatever config it is handed. Rewriting it under the canonical config
+/// would correctly change its stamp and prove nothing about R-NaD.
 #[test]
 fn rnad_every_shipped_checkpoint_loads_and_rewrites_unchanged() {
-    let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../models");
-    let mut config = GameConfig::default();
-    config.encoding_slots = 21;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let models = root.join("models");
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&models)
         .expect("models/ is tracked")
@@ -48,6 +52,20 @@ fn rnad_every_shipped_checkpoint_loads_and_rewrites_unchanged() {
 
     for path in &files {
         let original = std::fs::read(path).unwrap();
+        let stamped = header_fields(&original)
+            .into_iter()
+            .find(|(k, _)| k == "rules_name")
+            .map(|(_, v)| v);
+        let mut config = match stamped.as_deref() {
+            None | Some("canonical-2026-09") => GameConfig::default(),
+            Some(name) => {
+                let file = root.join("configs/rules").join(format!("{name}.toml"));
+                GameConfig::from_config_file(&file).unwrap_or_else(|e| {
+                    panic!("{} is stamped `{name}` but {} does not load: {e}", path.display(), file.display())
+                })
+            }
+        };
+        config.encoding_slots = 21;
         let weights = Weights::load(path, &config)
             .unwrap_or_else(|e| panic!("a shipped checkpoint no longer loads: {e}"));
         assert!(!weights.linear_value, "{} is an AlphaZero net", path.display());

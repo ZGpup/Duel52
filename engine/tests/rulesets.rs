@@ -132,7 +132,8 @@ fn every_registered_ruleset_is_valid_and_distinct() {
         if let Some((_, other)) = by_hash.iter().find(|(oh, _)| *oh == h) {
             // The three shipped variants are also reachable through the registry files, so a
             // file that resolves to exactly `variant:split` is expected rather than a bug.
-            let expected_alias = name == "rules/canonical" && other == "variant:split";
+            let expected_alias = (name == "rules/canonical" && other == "variant:split")
+                || (name == "rules/base" && other == "variant:base");
             assert!(
                 expected_alias,
                 "{name} and {other} hash to the same ruleset ({h:016x}) — they describe the \

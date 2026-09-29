@@ -333,6 +333,15 @@ class TrainingLoop:
         self.spec = spec_for(
             config.game.variant, config.game.encoding_slots, config.game.rules_file
         )
+        #: Whether the incumbent began as another run's checkpoint. If so it may have been
+        #: trained on other rules, which ``duel52 match`` refuses unless told this is a
+        #: gate — see :meth:`play_match`. On ``--resume`` the answer is in the recorded config.
+        recorded = run_dir / "train.toml.used"
+        self.warm_started = init_from is not None or (
+            resume
+            and recorded.exists()
+            and json.loads(recorded.read_text()).get("init_from") is not None
+        )
         self.rng = np.random.default_rng(config.run.seed)
         #: The six lane relabellings, or ``None``. Built once from the engine — never in
         #: Python (``CLAUDE.md``: one encoder, and a permutation table is a reading of it).
@@ -699,6 +708,13 @@ class TrainingLoop:
         args = self._engine_args("match", "--a", a, "--b", b, "--games", str(games), "--seed", "1")
         if journal is not None:
             args += ["--journal", str(journal)]
+        if self.warm_started:
+            # A warm start into another ruleset makes the incumbent a checkpoint trained on
+            # other rules until a candidate replaces it, and `match` refuses to score one of
+            # those. Here it is the loop's own gate and panel, not a result anyone reads, so
+            # say so. Candidates are always stamped with this run's rules, which is why only a
+            # warm-started run needs it. `MODULAR_RULES.md` §6.
+            args += ["--warm-start-gate"]
         result = self._run_engine(args, capture_stderr=True)
         if result.returncode != 0:
             raise RuntimeError(f"match failed: {result.stderr.strip() or result.stdout.strip()}")

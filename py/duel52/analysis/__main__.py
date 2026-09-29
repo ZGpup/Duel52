@@ -81,6 +81,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--force", action="store_true", help="replay chunks that already exist"
     )
     parser.add_argument(
+        "--allow-cross-ruleset", action="store_true",
+        help="play a checkpoint trained on other rules, as a control column — the one a "
+        "rules experiment warm-started from, say. The engine refuses it otherwise; with this "
+        "it warns, meta.json records it, and the document flags the column",
+    )
+    parser.add_argument(
         "--render-only", action="store_true",
         help="render without playing anything, even though --agents was given. `--agents` "
         "also fixes the column order, so this is how you re-render an existing document in "
@@ -137,6 +143,8 @@ def extract(args: argparse.Namespace) -> int:
             command += ["--dataset", args.dataset]
         if args.force:
             command.append("--force")
+        if args.allow_cross_ruleset:
+            command.append("--allow-cross-ruleset")
         print(f"\n── chunk {index + 1}/{len(starts)}: {size:,} games from seed {seed}",
               flush=True)
         done = subprocess.run(command)

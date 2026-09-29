@@ -404,6 +404,23 @@ fn write_meta(
     field("rules_hash", quote(&format!("{:016x}", config.rules_hash())));
     field("rules_label", quote(&config.rules_label()));
     field("config_summary", quote(&config.summary()));
+    // What the checkpoint says it was trained on, and whether that is a different game from
+    // the one played here. `rules_hash` above is the *played* ruleset; a corpus written under
+    // `analyze --allow-cross-ruleset` differs from it, and the document flags the column. An
+    // unstamped checkpoint predates every mod, so it is cross-ruleset exactly on a mod — the
+    // same rule `refuse_cross_ruleset` applies.
+    let (trained_on, cross_ruleset) = match spec.checkpoint() {
+        None => ("null".to_string(), false),
+        Some(path) => match crate::nn::Weights::stamped_rules(Path::new(path))? {
+            Some((name, hash)) => (
+                quote(&format!("{name}/{hash:016x}")),
+                hash != config.rules_hash(),
+            ),
+            None => (quote("unstamped"), !config.is_canonical_rules()),
+        },
+    };
+    field("trained_on", trained_on);
+    field("cross_ruleset", cross_ruleset.to_string());
     field("lanes", config.lanes.to_string());
     field("lanes_to_win", config.lanes_to_win.to_string());
     field("hand_size", config.hand_size.to_string());

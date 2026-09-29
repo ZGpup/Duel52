@@ -432,6 +432,54 @@ def test_a_warm_start_refuses_a_checkpoint_the_config_disagrees_with(tmp_path_fa
     assert loop.best.read_bytes() == checkpoint.read_bytes()
 
 
+@needs_engine
+@pytest.mark.parametrize("stamped", [True, False], ids=["stamped-canonical", "unstamped"])
+def test_a_warm_started_run_can_score_an_incumbent_trained_on_other_rules(
+    tmp_path_factory, stamped
+):
+    """``duel52 match`` refuses a checkpoint trained on other rules (``MODULAR_RULES.md`` §6),
+    and the loop scores its gate and reference panel through ``match``. So a warm start into
+    a modded ruleset used to die scoring its baseline, before generation 1 — the incumbent is
+    the copied checkpoint. Every shipped model is unstamped, which was the case that failed.
+
+    A run that was not warm-started still gets the refusal: its candidates are all stamped
+    with its own rules, so a mismatch there would be a bug worth stopping on."""
+    from dataclasses import replace
+
+    from duel52.nn.checkpoint import write_checkpoint
+    from duel52.nn.model import Duel52Net, NetConfig, spec_for
+    from duel52.train.config import TrainConfig
+    from duel52.train.loop import TrainingLoop
+
+    spec = spec_for("split", 21)  # canonical-2026-09
+    if not stamped:
+        spec = {k: v for k, v in spec.items() if k not in ("rules_name", "rules_hash")}
+    checkpoint = tmp_path_factory.mktemp("ckpt") / "incumbent.d52nn"
+    model = Duel52Net(NetConfig(spec["obs_dim"], spec["action_dim"], width=32, blocks=1, value_hidden=16))
+    write_checkpoint(checkpoint, model=model, spec=spec)
+
+    config = TrainConfig()
+    rules = str(REPO / "configs" / "rules" / "two-blast-four-bomb.toml")
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.config = replace(
+        config,
+        game=replace(config.game, rules_file=rules, encoding_slots=21),
+        run=replace(config.run, threads=1),
+    )
+    loop.engine = ENGINE
+    loop._stop_requested = False
+    loop._child = None
+    a = f"netmcts:{checkpoint}@2"
+
+    loop.warm_started = False
+    with pytest.raises(RuntimeError, match="[Rr]efused"):
+        loop.play_match(a, "random", 2)
+
+    loop.warm_started = True
+    result = loop.play_match(a, "random", 2)
+    assert result.wins + result.losses + result.draws == 2
+
+
 # ============================================================= end to end, small ==
 
 

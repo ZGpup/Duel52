@@ -20,12 +20,16 @@
 use std::collections::HashSet;
 
 use duel52_engine::analysis;
+use duel52_engine::powers::PowerId;
 use duel52_engine::probe::{play_spec_game, FaceUpKind, GameStats};
 use duel52_engine::{AgentSpec, GameConfig, Player, Rank, Variant};
 
 /// A spread of finished games, cheap enough for the `opt-level = 1` test profile.
 fn sample_games(variant: Variant, count: u64) -> Vec<GameStats> {
-    let config = GameConfig::preset(variant);
+    sample_games_under(GameConfig::preset(variant), count)
+}
+
+fn sample_games_under(config: GameConfig, count: u64) -> Vec<GameStats> {
     (1..=count)
         .map(|seed| play_spec_game(config, seed, AgentSpec::Random, AgentSpec::Random))
         .collect()
@@ -117,10 +121,24 @@ fn analysis_a_cards_life_is_consistent() {
 
 /// The per-rank counters are a fold over the log, so they cannot disagree with it — this is
 /// what pins them to it rather than to a second tally.
+///
+/// Played under the three presets and under `two-blast-four-bomb`'s powers, because the 2's
+/// Blast and the 4's Bomb are the death triggers that fire by *dying* face-down rather than
+/// by springing face-up, and the fold counts those two ways differently.
 #[test]
 fn analysis_the_rank_counters_are_the_card_log_folded() {
-    for variant in [Variant::Base, Variant::SplitDeck, Variant::MirroredRemoval] {
-        for stats in sample_games(variant, 12) {
+    let mut death_traps = GameConfig::preset(Variant::SplitDeck);
+    death_traps.powers[Rank::TWO.index()] = PowerId::TwoBlast1;
+    death_traps.powers[Rank::FOUR.index()] = PowerId::FourBomb;
+    let configs = [
+        (Variant::Base.to_string(), GameConfig::preset(Variant::Base)),
+        (Variant::SplitDeck.to_string(), GameConfig::preset(Variant::SplitDeck)),
+        (Variant::MirroredRemoval.to_string(), GameConfig::preset(Variant::MirroredRemoval)),
+        ("two-blast-four-bomb".to_string(), death_traps),
+    ];
+    let mut detonations = 0u32;
+    for (variant, config) in configs {
+        for stats in sample_games_under(config, 12) {
             let mut chose = [[0u32; Rank::COUNT]; 2];
             let mut cascade = [[0u32; Rank::COUNT]; 2];
             let mut trap = [[0u32; Rank::COUNT]; 2];
@@ -137,7 +155,13 @@ fn analysis_the_rank_counters_are_the_card_log_folded() {
                 }
                 match card.death_ply {
                     Some(_) if card.died_face_up => died_up[p][r] += 1,
-                    Some(_) => died_down[p][r] += 1,
+                    Some(_) => {
+                        died_down[p][r] += 1;
+                        if config.power(card.rank).has_death_trigger() {
+                            trap[p][r] += 1;
+                            detonations += 1;
+                        }
+                    }
                     None => {
                         if card.face_up_ply.is_none() {
                             down_at_end[p][r] += 1;
@@ -158,6 +182,10 @@ fn analysis_the_rank_counters_are_the_card_log_folded() {
             }
         }
     }
+    assert!(
+        detonations > 0,
+        "no 2 or 4 died face-down in the sample, so the fold's second arm compared nothing"
+    );
 }
 
 /// A card is flipped, killed hidden, or still hidden at the end — and it is exactly one of
@@ -454,5 +482,65 @@ fn analysis_meta_names_the_ruleset() {
     assert!(meta.contains(&format!("\"rules_hash\": \"{:016x}\"", config.rules_hash())));
     assert!(meta.contains("\"agent\": \"random\""));
     assert!(meta.contains(&format!("\"schema\": {}", analysis::SCHEMA)));
+    // No checkpoint, so nothing to have been trained on and nothing to mismatch.
+    assert!(meta.contains("\"trained_on\": null"));
+    assert!(meta.contains("\"cross_ruleset\": false"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A corpus played under `analyze --allow-cross-ruleset` cannot pass for a same-rules one.
+///
+/// `rules_hash` is the ruleset the games were *played* under. For a control column — the
+/// checkpoint a rules experiment warm-started from, playing the new rules — that is not the
+/// ruleset it was trained on, and without `trained_on` and `cross_ruleset` nothing in the
+/// three files would say so. The document keys its warning off `cross_ruleset`.
+#[test]
+fn analysis_meta_says_when_a_checkpoint_plays_rules_it_was_not_trained_on() {
+    let canonical = GameConfig {
+        encoding_slots: 21,
+        ..GameConfig::preset(Variant::SplitDeck)
+    };
+    let ruleset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the engine crate has a parent directory")
+        .join("configs/rules/three-vengeance-1.toml");
+    let modded = GameConfig {
+        encoding_slots: 21,
+        ..GameConfig::from_config_file(&ruleset).expect("the ruleset loads")
+    };
+    assert_ne!(canonical.rules_hash(), modded.rules_hash(), "the test compares nothing");
+
+    let arch = duel52_engine::nn::Arch {
+        width: 24,
+        blocks: 2,
+        value_hidden: 12,
+        ..duel52_engine::nn::Arch::default_for(&canonical)
+    };
+    let checkpoint = std::env::temp_dir().join(format!(
+        "duel52-analysis-cross-ruleset-{}.d52nn",
+        std::process::id()
+    ));
+    duel52_engine::nn::Weights::random(20260914, arch)
+        .save(&checkpoint, &canonical)
+        .expect("write the test checkpoint");
+    let spec = AgentSpec::NetPolicy {
+        checkpoint: checkpoint.to_string_lossy().into_owned(),
+    };
+
+    for (config, tag, cross) in [(canonical, "same", false), (modded, "cross", true)] {
+        let dir = std::env::temp_dir().join(format!("duel52-analysis-meta-{tag}-ruleset"));
+        let _ = std::fs::remove_dir_all(&dir);
+        analysis::extract(config, spec.clone(), 1, 2, 1, 1, &dir).expect("the corpus is written");
+        let meta = std::fs::read_to_string(dir.join("meta.json")).expect("meta.json");
+        assert!(
+            meta.contains(&format!("\"trained_on\": \"{}\"", canonical.rules_label())),
+            "{tag}: the stamp is recorded as it is in the checkpoint\n{meta}",
+        );
+        assert!(
+            meta.contains(&format!("\"cross_ruleset\": {cross}")),
+            "{tag}: cross_ruleset should be {cross}\n{meta}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = std::fs::remove_file(&checkpoint);
 }
