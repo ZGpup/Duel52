@@ -1,17 +1,19 @@
 #!/bin/bash
-# Build the engine and the Python extension ON A COMPUTE NODE, then run the test suites.
+# Build the engine and the Python extension ON A 32-CORE CPU NODE, then run the test suites.
+# Submit from the MAIN checkout, and wait for "build OK" at the end of its log before
+# submitting jobs 10–20.
 #
-# Submit it twice: once from the main checkout onto a 32-core CPU node, and once from the
-# `rnad` checkout onto a GPU node. It builds with `-C target-cpu=native`, which is worth 20–40%
-# of self-play throughput (`configs/train-24h-128c.toml`). But a native binary can die with
-# "illegal instruction" on an older CPU, which is why each checkout is built on the kind of
-# node that will run it. If the CPU nodes are a mix of generations, set PORTABLE=1
+# It builds with `-C target-cpu=native`, which is worth 20–40% of self-play throughput
+# (`configs/train-24h-128c.toml`). But a native binary can die with "illegal instruction" on an
+# older CPU, which is why the build runs on the kind of node that will run the jobs, not on the
+# login node. If the CPU nodes are a mix of generations, set PORTABLE=1
 # (`sbatch --export=ALL,PORTABLE=1 ...`) and pay the 20–40% rather than risk a crash.
+# `00-build-gpu.sbatch` is the same thing for the `rnad` checkout on a GPU node.
 #
 # Needs no internet if the setup steps (`cargo fetch`, the pip installs) were done on the
 # login node first.
 #
-#SBATCH --job-name=d52-build
+#SBATCH --job-name=d52-build-cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32

@@ -19,10 +19,12 @@ cd "$SLURM_SUBMIT_DIR" && source run-plans/2026-09-29/slurm/lib.sh
 banner
 
 GAMES=${GAMES:-12288}
+# Rendered at the end; see 10-analysis-best-canonical.sbatch for what card-value measures.
+CARD_VALUE_GAMES=${CARD_VALUE_GAMES:-2000}
 
 exec .venv/bin/python -m duel52.analysis \
     --dataset split-4096 \
     --agents netmcts:models/duel52-split-lane-gen032.d52nn@4096 \
     --games "$GAMES" --chunk 1024 --seed 1 \
     --threads 32 --eval-batch 32 --encoding-slots 21 \
-    --card-value-games 0
+    --card-value-games "$CARD_VALUE_GAMES"

@@ -23,11 +23,19 @@ banner
 GAMES=${GAMES:-6144}
 
 # --chunk 1024 = 32 threads x 32 in flight, so the eval batch is never clamped (CLAUDE.md,
-# "Size the chunk so the batch is not clamped"). --card-value-games 0: the document is rendered
-# on the laptop at the end, so this job renders nothing expensive.
+# "Size the chunk so the batch is not clamped").
+#
+# --card-value-games: after the last chunk, the document is rendered, and `duel52 card-value`
+# runs once per checkpoint in the dataset. It swaps each rank into a fixed position's hand and
+# reads the value head. It uses its own positions and no search, so it does not depend on this
+# corpus or on @4096, and it takes minutes, not hours. 2,000 positions rather than the default
+# 400 roughly halves its error bars. The laptop render must pass the same number, or it
+# recomputes at 400.
+CARD_VALUE_GAMES=${CARD_VALUE_GAMES:-2000}
+
 exec .venv/bin/python -m duel52.analysis \
     --dataset split-4096 \
     --agents netmcts:models/duel52-32c-24h-best.d52nn@4096 \
     --games "$GAMES" --chunk 1024 --seed 1 \
     --threads 32 --eval-batch 32 --encoding-slots 21 \
-    --card-value-games 0
+    --card-value-games "$CARD_VALUE_GAMES"
