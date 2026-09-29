@@ -22,6 +22,7 @@ because depth is linear in the blocks where width is quadratic.
 | --- | --- | --- | --- | --- |
 | **[duel52-32c-24h-best.d52nn](duel52-32c-24h-best.d52nn)** — the default | `split` | 21 | 604,005 | `train-24h-32c`, 24 h on 32 rented cores, lane-equivariant `128 × 6` **from a random init** |
 | [duel52-32c-24h-gen039.d52nn](duel52-32c-24h-gen039.d52nn) — the same run's last generation | `split` | 21 | 604,005 | As above; generation 39, kept because it is **not** the same file as `best` |
+| [duel52-traps-32c-24h-gen063.d52nn](duel52-traps-32c-24h-gen063.d52nn) — **`two-blast-four-bomb` rules** | `split` | 21 | 604,005 | `train-24h-32c-mod-traps`, 24 h on 32 cores, lane `128 × 6` from a random init. **Not a canonical-rules agent** |
 | [duel52-split-lane-gen032.d52nn](duel52-split-lane-gen032.d52nn) — superseded | `split` | 21 | 455,013 | Phase 4 `train-7h`, warm-started from `runs/sixth`, lane-equivariant trunk |
 | [duel52-split-gen031.d52nn](duel52-split-gen031.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-3h`, warm-started from gen022, lane augmentation |
 | [duel52-split-gen022.d52nn](duel52-split-gen022.d52nn) — superseded | `split` | 21 | 949,267 | Phase 4 `train-2h`, warm-started from gen016 |
@@ -140,6 +141,61 @@ gen031, would predict +357 against gen031; that number has not been measured and
 quoted. Elo is not transitive across a game that is not. A refit of the ladder with this agent
 in it would also move every existing rating, the way adding `lane-gen032` moved gen022 and
 gen031 by +4 and +5 — see `FINDINGS.md` "The scale".
+
+---
+
+## duel52-traps-32c-24h-gen063.d52nn
+
+**The `two-blast-four-bomb` agent** (`configs/rules/two-blast-four-bomb.toml`): the 2 and the 4
+become face-down traps. A 2 killed face-down deals 1 to every enemy card in its lane, and a 4
+killed face-down kills its killer. It is `train-24h-32c.toml` with the ruleset swapped. It uses
+the same trunk, generation size and clock, and it also starts from a random init, so nothing
+it does with a 2 or a 4 comes from having learned the canonical cards first.
+
+⚠️ **It plays a different game from every other file here.** It carries a rules stamp
+(`two-blast-four-bomb/e108e420b08c8675`), so `match`, `ladder` and `probe` refuse it under the
+canonical rules. `analyze` and `card-value` accept it only with `--allow-cross-ruleset`, and
+the document flags that column. Its layout hashes are the canonical ones, because the ruleset
+claims no encoder reserve.
+
+### How it was made
+
+```bash
+.venv/bin/python -m duel52.train run --config configs/train-24h-32c-mod-traps.toml \
+    --run-dir runs/mod-traps-32c
+```
+
+| | |
+| --- | --- |
+| Config | `configs/train-24h-32c-mod-traps.toml` |
+| Started from | a **random init** |
+| Seed | `40000000` (self-play seeds 40,000,000–41,535,999) |
+| Rules | `two-blast-four-bomb/e108e420b08c8675`, `split`, `two_power = bottom`, `encoding_slots = 21`, `stalemate_value = 0.0` |
+| Self-play | 24,000 games per generation at 256 simulations, playout-cap randomised to 32 for 3 decisions in 4 |
+| Gate | 512 games at 256 simulations, promote at **0.50**. The panel is `random` and `greedy` only |
+| Generations | **63**, 43 promoted. Never more than 2 refusals in a row |
+| Games | 1,512,000 self-play games, ~200M positions (stride 2) |
+| Wall clock | ~25.4 h on 32 cores (the sum of per-generation times in `log.jsonl`) |
+| Network | lane-equivariant, width 128, 6 blocks, value head 128 → 604,005 parameters |
+| `obs_layout_hash` / `action_layout_hash` | `b1355a841a1fdc4a` / `5169f9461d627b39` |
+| SHA-256 | `4b945de60be49af6a3ad21c01612463cad9f83c242d4497f07e00e49a5aa2aee` |
+
+**`best` and `gen063` are the same file** (same SHA-256), so the last generation is also the
+best-ever, which is expected at a 0.50 threshold. It ships under the generation's name, per
+`CLAUDE.md`: the file name is the agent name and the corpus key, and `best` would silently mean
+another checkpoint if the run were ever resumed.
+
+The gate's decisive score fell steadily: 0.98 at generation 1, 0.60 at 9, 0.53 at 25, 0.51 at
+41, 0.50 at 57, and 0.528 ± 0.043 at 63. That is the convergence curve the config predicted. Both
+panel rows sat at 1.000 from early on and say nothing past that point. Its `log.jsonl` is in
+`runs/mod-traps-32c/`, unlike `runs/eighth`'s.
+
+### What it is worth
+
+**Not measured yet.** No other agent plays these rules, so there is no strength number. The
+comparison it exists for is the analysis document, planned in `run-plans/2026-09-29.md`: the
+same agent against `32c-24h-best` at 4096 simulations, first under canonical rules and then
+under its own.
 
 ---
 

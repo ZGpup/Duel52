@@ -45,6 +45,7 @@ powers.three = "trap_vengeance_one_damage"
 | File | Tier | What changes |
 |---|---|---|
 | `canonical.toml` | — | The rules as written plus the house 2. The baseline every other file is a diff against. |
+| `base.toml` | 1 | The **shared-deck** game (`game_rules.md` §2) under its own `rules_name`. It hashes identically to the `variant:base` preset, which `rulesets.rs` accepts as an alias; the file exists so a run's stamp does not say `canonical-2026-09`. ⚠️ Train it at `encoding_slots = 34`, not 21. `configs/train-24h-32c-base.toml` is its run. |
 | `three-vengeance-1.toml` | 2 | The 3 also deals 1 damage to the card that killed it. The worked example the mod system was designed around. |
 | `three-vengeance-2.toml` | 2 | The same, for 2 damage. Exists to show that a number inside a shape is a **second name**, not a config knob. |
 | `three-none.toml` | 2 | Ablation: the 3 has no Trap at all. What is the Trap worth? |

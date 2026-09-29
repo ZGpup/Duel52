@@ -38,6 +38,8 @@ venv/
 
 # Logs and profiling
 *.log
+# slurm stdout/stderr from run-plans/*/slurm/*.sbatch
+/slurm-logs/
 /wandb/
 /tensorboard/
 

@@ -1,0 +1,23 @@
+# The **base (shared-deck) game**: canonical in every rule except the deck.
+#
+# Both players draw from one 52-card deck, the rules-as-written setup (`game_rules.md` §2),
+# instead of §9a's split red/black decks. Everything else is canonical, including the
+# house-rule 2 (§10a), so a card bottomed by the 2 goes into the *shared* pile and may come
+# back to the opponent.
+#
+# **Why this file exists beside `configs/base.toml`.** That file is the `base` variant preset,
+# written out. It lives beside `split.toml` and `mirrored.toml`, and the `variant:base`
+# registry entry in `engine/tests/rulesets.rs` already covers it. Its problem is the label: the
+# preset carries `rules_name = canonical-2026-09`, so a checkpoint trained with
+# `--variant base` would be stamped `canonical-2026-09/<the base hash>`. This file gives the
+# same game its own name, so a training run's shards and checkpoints say which game they are.
+# It hashes identically to `variant:base`, which `rulesets.rs` expects as an alias.
+#
+# ⚠️ **Train at `encoding_slots = 34`, not 21.** The base preset's legality bound
+# (`max_slots_per_side`) is 34, not the split deck's 21. At 21 the encoder can assert mid-run,
+# and because everything is seeded, a resumed run would hit the same assert again.
+# `configs/train-24h-32c-base.toml` has the argument.
+
+include = "canonical.toml"
+rules_name = "base-2026-09"
+variant = "base"

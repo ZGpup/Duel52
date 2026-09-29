@@ -546,6 +546,14 @@ name *and* shape, so it refuses across all three and each began from a random in
 | `lane-gen032` | lane `128 × 3` | shares no tensor *name* with the flat trunk. From `runs/sixth` (unshipped). Beats gen031 by **+167 Elo**, 0.7238 ± 0.044 over 400 games (F4.8) |
 | `32c-24h-best`, `32c-24h-gen039` | lane `128 × 6` | same names, wrong *shape*. 24 h on 32 rented cores from noise. Beats lane-gen032 by **+190 Elo**, 0.7488 ± 0.042 over 400 games |
 
+A seventh file, **`traps-32c-24h-gen063`**, is not one of these roots. It plays another game:
+`train-24h-32c-mod-traps`, the `two-blast-four-bomb` ruleset, 63 generations from noise. It has
+the same trunk as `32c-24h-best` and carries a rules stamp, so it is refused under canonical
+rules except by `analyze` / `card-value --allow-cross-ruleset`. `models/README.md` has its
+provenance. `train-24h-32c-base` is the same recipe on the shared-deck `configs/rules/base.toml`,
+at `encoding_slots = 34` (that deck's legality bound), and `run-plans/` holds the dated plans
+for runs on a friend's slurm cluster.
+
 The numbering `016 → 022 → 031 → 032` is for readability and **not** because each is one step
 past the last. `32c-24h-*` is named for the box instead, because it is the first checkpoint
 here a laptop did not make.
