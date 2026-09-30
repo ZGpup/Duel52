@@ -3223,8 +3223,8 @@ Combat quick reference:
      face-down card can be learned by attacking it. Face-up, a card has 2 HP, or 3 for the
      Jack. Flipping a damaged Jack raises its ceiling; the damage stays.
   * A pair costs one action, deals 2 damage to ONE target, and both members spend their
-     attack. Rank powers still apply: a pair of 9s deals 4 to a Jack, a pair of 10s is
-     forced to split 1+1.
+     attack. Rank powers still apply: a pair of 9s deals 4 to a Jack, and a pair of 10s
+     deals 2 to EACH of two targets — both 10s twinstrike.
   * Attacking a face-up 8 costs you 1 damage — unless you are a 9.
   * A face-up Jack must die before anything else in his lane can be attacked.
   * A 10 hits two cards for 1 each. A face-up 9 refuses the spread; a lone Jack's taunt

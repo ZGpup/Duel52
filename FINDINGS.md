@@ -725,6 +725,17 @@ whole hand-written ladder and two training runs. Removing it deleted the strateg
 outright and shifted the policy head from 1325 to 1324 logits, which invalidated every
 checkpoint written before that date.
 
+**A pair of 10s was played wrong until 2026-09-29, and every shipped agent learned that
+game.** The engine split a 10-pair's attack 1 + 1 across two targets, so pairing two 10s bought
+exactly what one lone 10 attacking does, for an extra action. The owner's ruling is that each
+member twinstrikes both targets, so each takes 2 and one action kills two fresh cards. Every
+checkpoint in `models/` and every number in this file was trained or measured under the old
+rule, where pairing 10s was a strict loss. They had every reason to learn to avoid it, and
+no way to learn what it is worth now. The rule change moves no layout hash and no
+`rules_hash`, because what changed is the engine's reading of the rules and not a config key.
+That means nothing refuses an old checkpoint, and a recorded game that contains a 10-pair
+split no longer reproduces its own outcome.
+
 **The greedy agent was quietly cheating, and search had nothing to do with it.** Applying a
 candidate action to the real state to score it reveals ranks, because flipping your own base
 card or killing a face-down card into the public discard are both observable. The guard that

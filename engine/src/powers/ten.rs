@@ -9,10 +9,10 @@
 //!
 //! Two rulings that are easy to get backwards:
 //!
-//! - A **pair** of 10s splits its 2 as 1 + 1 rather than doubling to 4 (§6).
-//! - When the split is blocked, §5's "damage is never lost" promise applies to the *pair* —
-//!   a pair of 10s consolidates to the full 2 on one card, but a lone 10's second point was
-//!   the twinstrike bonus and goes away with it.
+//! - A **pair** of 10s deals 2 to **each** target: both members twinstrike both targets
+//!   (§5, reversed on 2026-09-29 from the old 1 + 1 split, which made pairing 10s a loss).
+//! - When the split is blocked, both members hit the one card, so a pair of 10s deals 2 to
+//!   it, but a lone 10's second point was the twinstrike bonus and goes away with it.
 //!
 //! ⚠️ A 10 that split **across lanes** would still be Tier 2: `CHOOSE_SLOT` spans every lane
 //! already and `Phase::SplitTarget` already exists, so the change is a wider candidate list

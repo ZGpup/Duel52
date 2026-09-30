@@ -796,27 +796,51 @@ fn rule_5_a_non_nine_pair_takes_retaliate_on_both_members() {
     assert_eq!(damage_at(&s, 0, P0, 1), 1);
 }
 
-/// §5: "A pair of **10s** twinstrikes: the pair's 2 damage is **split 1 + 1 across two
-/// targets**, not doubled."
+/// §5: "A pair of **10s** twinstrikes with **both** members: each 10 hits **both** chosen
+/// targets, so **each target takes 2** — one action kills two fresh cards."
 #[test]
-fn rule_5_a_pair_of_tens_splits_one_and_one() {
+fn rule_5_a_pair_of_tens_deals_two_to_each_target() {
     let mut p = Position::empty();
     p.face_up(0, P0, Rank::TEN);
     p.face_up(0, P0, Rank::TEN);
     p.pair(0, P0, 0, 1);
     p.face_up(0, P1, Rank::SEVEN);
-    p.face_up(0, P1, Rank::EIGHT); // an 8 so we can also check retaliate below
+    p.face_up(0, P1, Rank::SIX);
+    p.face_up(0, P1, Rank::FIVE);
+    // Something else to do, so the turn is not skipped the moment the pair has attacked.
+    p.face_up(1, P0, Rank::SEVEN);
+    p.face_up(1, P1, Rank::SEVEN);
+    let mut s = p.build();
+    let before = s.actions_remaining;
+
+    go(&mut s, atk(0, 0));
+    go(&mut s, Action::SplitTarget { slot: 1 });
+    assert_eq!(s.actions_remaining, before - 1, "one action for the whole pair attack");
+    assert_eq!(occupancy(&s, 0, P1), 1, "2 + 2 kills both fresh targets");
+    let mut dead = discard_ranks(&s, P1);
+    dead.sort();
+    let mut expected = vec![Rank::SEVEN, Rank::SIX];
+    expected.sort();
+    assert_eq!(dead, expected);
+    assert_eq!(damage_at(&s, 0, P1, 0), 0, "the untargeted 5 is untouched");
+}
+
+/// The same ruling against an 8: each member attacked it, so each takes its retaliate (§5).
+#[test]
+fn rule_5_a_pair_of_tens_twinstriking_an_eight_takes_retaliate_on_both_members() {
+    let mut p = Position::empty();
+    p.face_up(0, P0, Rank::TEN);
+    p.face_up(0, P0, Rank::TEN);
+    p.pair(0, P0, 0, 1);
+    p.face_up(0, P1, Rank::SEVEN);
+    p.face_up(0, P1, Rank::EIGHT);
     let mut s = p.build();
 
     go(&mut s, atk(0, 0));
     go(&mut s, Action::SplitTarget { slot: 1 });
-    assert_eq!(damage_at(&s, 0, P1, 0), 1);
-    assert_eq!(damage_at(&s, 0, P1, 1), 1);
-    assert_eq!(
-        occupancy(&s, 0, P1),
-        2,
-        "1 + 1 across two fresh cards kills nothing — the cost of pairing 10s"
-    );
+    assert_eq!(occupancy(&s, 0, P1), 0, "2 each kills the 7 and the 8");
+    assert_eq!(damage_at(&s, 0, P0, 0), 1, "retaliate fires even when the 8 dies");
+    assert_eq!(damage_at(&s, 0, P0, 1), 1);
 }
 
 /// §5: "**Damage is never lost** — whenever the split cannot happen, because it is blocked
@@ -869,11 +893,11 @@ fn rule_5_a_pair_of_tens_consolidates_to_two_against_a_lone_defender() {
     assert_eq!(occupancy(&s, 0, P1), 0, "2 damage, so the 7 dies");
 }
 
-/// The intersection of two rulings: a **pair of 10s against two Jacks**. §5 forces the
-/// pair's 2 to split 1 + 1, and §8 says taunt has already confined both halves to Jacks
-/// with nothing to leak past — so it is 1 to each Jack, and the third card is untouched.
+/// The intersection of two rulings: a **pair of 10s against two Jacks**. §5 has each 10
+/// hit both targets, and §8 says taunt has already confined both halves to Jacks with
+/// nothing to leak past — so it is 2 to each Jack, and the third card is untouched.
 #[test]
-fn rule_5_a_pair_of_tens_against_two_jacks_deals_one_to_each() {
+fn rule_5_a_pair_of_tens_against_two_jacks_deals_two_to_each() {
     let mut p = Position::empty();
     p.face_up(0, P0, Rank::TEN);
     p.face_up(0, P0, Rank::TEN);
@@ -890,8 +914,8 @@ fn rule_5_a_pair_of_tens_against_two_jacks_deals_one_to_each() {
         "the second half is confined to the other Jack"
     );
     go(&mut s, Action::SplitTarget { slot: 1 });
-    assert_eq!(damage_at(&s, 0, P1, 0), 1);
-    assert_eq!(damage_at(&s, 0, P1, 1), 1);
+    assert_eq!(damage_at(&s, 0, P1, 0), 2);
+    assert_eq!(damage_at(&s, 0, P1, 1), 2);
     assert_eq!(damage_at(&s, 0, P1, 2), 0, "nothing leaked past the taunt");
 }
 
