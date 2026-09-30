@@ -169,8 +169,8 @@ impl GameState {
     /// - A **9** deals double to a Jack — 2 alone, 4 as a pair, which one-shots a 3-HP Jack.
     /// - A **10** twinstrikes. If a split is available the engine asks for the second target
     ///   first and lands both halves together; see [`GameState::do_split_target`]. If the
-    ///   split is blocked, a lone 10 deals its plain 1 while a **pair** of 10s consolidates
-    ///   to the full 2, because §5 says a 10-pair never loses raw damage.
+    ///   split is blocked, a lone 10 deals its plain 1 while a **pair** of 10s deals 2 —
+    ///   each member's 1 lands on the single card (§5).
     fn do_attack(&mut self, lane: usize, attacker_slot: usize, target_slot: usize) {
         let me = self.to_move;
         let opponent = me.other();
@@ -198,9 +198,9 @@ impl GameState {
                 return;
             }
             // Split blocked (a live 9 or a lone Jack) or nothing else in the lane.
-            // §5: "Damage is never lost — whenever the split cannot happen ... the full 2
-            // lands on that single card." That promise is about the *pair*; a lone 10's
-            // second point of damage was the twinstrike bonus, so it goes away with it.
+            // §5: whenever the split cannot happen, both members of a *pair* hit the single
+            // card, for 2. A lone 10's second point of damage was the twinstrike bonus, so
+            // it goes away with it.
             let damage = if is_pair {
                 self.config.pair_attack_damage
             } else {
@@ -215,11 +215,15 @@ impl GameState {
         self.resolve_attack(attackers, &[(primary, damage)], source);
     }
 
-    /// The second half of a 10's twinstrike: 1 damage to each of the two targets.
+    /// The second half of a 10's twinstrike: every attacker hits each of the two targets.
     ///
-    /// A lone 10 therefore deals 1 + 1 (its bonus is the extra body), and a pair of 10s
-    /// splits its 2 as 1 + 1 rather than doubling to 4 — §6: "A pair of 10s twinstrikes:
-    /// the pair's 2 damage is split 1 + 1 across two targets, not doubled."
+    /// A lone 10 therefore deals 1 + 1 (its bonus is the extra body). A pair of 10s is two
+    /// 10s attacking together, and **each** of them twinstrikes both targets, so each target
+    /// takes 2 — one action kills two fresh cards. §5: "A pair of 10s twinstrikes: each
+    /// member hits both targets, so each takes 2."
+    ///
+    /// This reversed the earlier 1 + 1 ruling on 2026-09-29, which made pairing 10s strictly
+    /// worse than attacking with them separately (two actions for the same 1 + 1 twice).
     fn do_split_target(&mut self, slot: usize) {
         let Some(Pending::SplitTarget {
             lane,
@@ -232,12 +236,17 @@ impl GameState {
         };
         let opponent = self.to_move.other();
         let secondary = self.lanes[lane as usize].side(opponent)[slot].id;
-        let half = self.config.twinstrike_split_damage;
+        // One `twinstrike_split_damage` per attacking 10, on each target.
+        let per_target = self.config.twinstrike_split_damage * attackers.len() as u8;
         let source = DamageSource::Attack {
             attacker: attackers[0],
             partner: attackers.get(1).copied(),
         };
-        self.resolve_attack(attackers, &[(primary, half), (secondary, half)], source);
+        self.resolve_attack(
+            attackers,
+            &[(primary, per_target), (secondary, per_target)],
+            source,
+        );
     }
 
     /// Land an attack: spend the attackers' budget, apply every hit, then resolve retaliate.

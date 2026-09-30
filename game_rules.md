@@ -161,8 +161,9 @@ There is **no hand-size limit**. **[RULING]**
   Both members must be face-up. **[RULING]**
 - Declaring a pair costs 1 action. **[RAW]**
 - A pair attacks together as a **single action** dealing **2 damage to one target**. You
-  **may not choose to split** the damage. **[RAW]** (A pair of 10s is forced to split it by
-  twinstrike — see the modifier rules below. That is the power acting, not a choice.)
+  **may not choose to split** the damage. **[RAW]** (A pair of 10s is the exception: each
+  member twinstrikes, so the pair hits two targets — see the modifier rules below. That is
+  the power acting, not a choice.)
 - **Pairs must attack together** — a paired card cannot attack alone. **[RAW]** A pair attack
   is one attack for **both** members' once-per-turn budget, so a pair may not attack if either
   member has already attacked this turn. **[RULING]** You therefore cannot squeeze extra
@@ -178,13 +179,13 @@ There is **no hand-size limit**. **[RULING]**
   split deck gives each player exactly two of each rank. Three same-rank cards do not form a
   bigger group; the third stays unpaired and attacks alone. **[RULING]**
 - Rank-based attack modifiers **do** apply to a pair attack. **[RULING]**
-  - A pair of **10s** twinstrikes: the pair's 2 damage is **split 1 + 1 across two targets**,
-    not doubled. **Damage is never lost** — whenever the split cannot happen, because it is
-    blocked (a 9, or a lone Jack, §6) or because the lane holds only one legal target, the
-    full **2** lands on that single card. **[RULING]** A 10-pair therefore never loses raw
-    damage — but the *forced* spread can still be worse than concentration: 1 + 1 across two
-    fresh cards kills nothing, where a consolidated 2 kills one outright. Pairing 10s is a
-    commitment to chip damage.
+  - A pair of **10s** twinstrikes with **both** members: each 10 hits **both** chosen
+    targets, so **each target takes 2** — one action kills two fresh cards. **[RULING]**
+    (2026-09-29, owner. This reverses the earlier "split 1 + 1, not doubled" ruling, which
+    made a 10-pair strictly worse than its two 10s attacking separately: two actions for
+    1 + 1 twice, against one action for 1 + 1 once.) Whenever the split cannot happen,
+    because it is blocked (a 9, or a lone Jack, §6) or because the lane holds only one legal
+    target, both 10s hit that single card, for **2**. **[RULING]**
   - A pair of **9s** deals **4 damage to a Jack** (the 9's doubling applies to the pair's 2),
     which one-shots a 3-HP Jack. Against anything else it is the normal 2. **[RULING]**
   - A pair of **9s** attacking an **8** takes **no** retaliate damage — each member is
@@ -227,7 +228,7 @@ active while the card is face-up.
 | **7** | Heal All | one-shot | **Heal all your damaged cards 2 HP**, in all lanes, face-up and face-down. **[RAW]** Includes base cards **once the draw pile is empty**. **[RULING]** Healing is capped at the card's maximum HP — a Jack on 1 HP heals to 3, not 5. **[RULING]** |
 | **8** | Retaliate | constant | Any card that attacks this 8 **takes 1 damage** — except a 9. **[RAW]** A pair attacking an 8: both members take 1. **[RULING]** Retaliate fires **even when the attack kills the 8**. **[RULING]** |
 | **9** | Nimble | constant | Cannot be frozen by a 6. Takes no damage when attacking an 8. Blocks a 10's twinstrike from splitting (see 10). **Deals 2 damage to Jacks** — to *face-up* Jacks; a face-down card is a blank 2-HP card with no Taunt to punish, so a 9 deals it the ordinary 1 (§5). **[RAW]** + **[RULING]** |
-| **10** | Twinstrike | constant | When attacking, deals **1 damage each to two cards** in the opposing lane. **If an intended target is a 9 or a Jack, only that card is damaged** — both block the split, but for different reasons. **[RULING]** With **two Jacks**, taunt already confines both halves to Jacks, nothing can leak past, and the 10 deals **1 to each**. With **two 9s** it is still **1 to one 9** — Nimble dodges the spread personally, not positionally. **[RULING]** A pair of 10s splits the pair's 2 as 1 + 1, and keeps it whole at 2 whenever it cannot split (§5). **[RULING]** |
+| **10** | Twinstrike | constant | When attacking, deals **1 damage each to two cards** in the opposing lane. **If an intended target is a 9 or a Jack, only that card is damaged** — both block the split, but for different reasons. **[RULING]** With **two Jacks**, taunt already confines both halves to Jacks, nothing can leak past, and the 10 deals **1 to each**. With **two 9s** it is still **1 to one 9** — Nimble dodges the spread personally, not positionally. **[RULING]** A pair of 10s deals **2 to each** of its two targets — each member twinstrikes both — and 2 to the single card whenever it cannot split (§5). **[RULING]** |
 | **J** | Taunt | constant | **Must be killed before any other card in his lane can be attacked.** Has **3 HP** — face-up. Face-down he is a blank 2-HP card with no taunt (§5), so both halves of the Jack arrive on the flip together. **[RAW]** + **[RULING]** With two Jacks in a lane, the attacker chooses which one to hit. **[RULING]** |
 | **Q** | Move | one-shot | **Move one allied card from another lane into the Queen's lane**, face-down or face-up. The moved card **keeps its damage**, does **not** reactivate its one-shot power, keeps constant powers, and **may attack after the move** if it has not already attacked this turn. **[RAW]** + **[RULING]** Can move a base card **once the draw pile is empty**; a moved base card **becomes a normal card** (§3). **[RULING]** Moving a paired card breaks the pair. **[RULING]** A card may be moved into a lane a Queen was herself just moved into — no restriction. **[RULING]** |
 | **K** | Empower | one-shot | **All your face-up cards in this lane reactivate their powers.** Does **not** affect other Kings. Does **not** affect constant powers (8, 9, 10, J). **[RAW]** |
